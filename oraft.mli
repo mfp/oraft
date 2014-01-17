@@ -51,6 +51,7 @@ sig
 
   type 'a action =
       [ `Apply of index
+      | `Become_candidate
       | `Become_follower
       | `Become_leader
       | `Redirect of rep_id option * 'a

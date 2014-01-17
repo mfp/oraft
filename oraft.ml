@@ -171,6 +171,7 @@ struct
 
   type 'a action =
       [ `Apply of index
+      | `Become_candidate
       | `Become_follower
       | `Become_leader
       | `Reset_election_timeout
@@ -388,7 +389,7 @@ let election_timeout s = match s.state with
                             last_log_term = term_;
                           } in
       let sends       = broadcast s msg in
-        (s, (`Reset_election_timeout :: sends))
+        (s, (`Become_candidate :: `Reset_election_timeout :: sends))
 
 let heartbeat_timeout s = match s.state with
     Follower | Candidate -> (s, [])
