@@ -1,0 +1,17 @@
+USE_OCAMLFIND  = true
+BYTE_ENABLED   = true
+NATIVE_ENABLED = true
+
+OCAMLFLAGS = -w +a-4-6-9-27..29-30-32..99 -warn-error +a-4-6-9-18-27-28-29..99
+
+OCAMLPACKS[] =
+   batteries
+
+if $(not $(OCAMLFIND_EXISTS))
+   eprintln(This project requires ocamlfind, but is was not found.)
+   eprintln(You need to install ocamlfind and run "omake --configure".)
+   exit 1
+
+.DEFAULT: $(OCamlLibrary oraft, oraft)
+
+# vim: set expandtab:
