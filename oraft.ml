@@ -3,170 +3,184 @@ module Map    = BatMap
 module List   = BatList
 module Option = BatOption
 
-type term   = Int64.t
-type index  = Int64.t
-type rep_id = string
-
-type status = Leader | Follower | Candidate
-
-module IM = Map.Make(struct
-                       type t = index
-                       let compare = compare
-                     end)
-
-module REPID = struct type t = rep_id let compare = String.compare end
-module RM = Map.Make(REPID)
-module RS = Set.Make(REPID)
-
-let maybe_nf f x = try Some (f x) with Not_found -> None
-
-module LOG : sig
-  type 'a t
-
-  val empty       : init_index:index -> init_term:term -> 'a t
-  val to_list     : 'a t -> (index * 'a * term) list
-  val append      : term:term -> 'a -> 'a t -> 'a t
-  val last_index  : 'a t -> (term * index)
-  val get         : 'a t -> index -> ('a * term) option
-  val append_many : (index * ('a * term)) list -> 'a t -> 'a t
-  val get_range   : from_inclusive:index -> to_inclusive:index -> 'a t ->
-                    (index * ('a * term)) list
-  val get_term    : index -> 'a t -> term option
-end =
+module Kernel =
 struct
-  type 'a t =
+  type status = Leader | Follower | Candidate
+  type term   = Int64.t
+  type index  = Int64.t
+  type rep_id = string
+
+  module IM = Map.Make(struct
+                         type t = index
+                         let compare = compare
+                       end)
+
+  module REPID = struct type t = rep_id let compare = String.compare end
+  module RM = Map.Make(REPID)
+  module RS = Set.Make(REPID)
+
+  let maybe_nf f x = try Some (f x) with Not_found -> None
+
+  module LOG : sig
+    type 'a t
+
+    val empty       : init_index:index -> init_term:term -> 'a t
+    val to_list     : 'a t -> (index * 'a * term) list
+    val append      : term:term -> 'a -> 'a t -> 'a t
+    val last_index  : 'a t -> (term * index)
+    val get         : 'a t -> index -> ('a * term) option
+    val append_many : (index * ('a * term)) list -> 'a t -> 'a t
+    val get_range   : from_inclusive:index -> to_inclusive:index -> 'a t ->
+                      (index * ('a * term)) list
+    val get_term    : index -> 'a t -> term option
+  end =
+  struct
+    type 'a t =
+        {
+          idx     : index;
+          term    : term;
+          entries : ('a * term) IM.t;
+        }
+
+    let empty ~init_index:idx ~init_term:term =
+      { idx; term; entries = IM.empty; }
+
+    let to_list t =
+      IM.bindings t.entries |> List.map (fun (i, (x, t)) -> (i, x, t))
+
+    let append ~term x t =
+      let idx = Int64.succ t.idx in
+        { t with idx; entries = IM.add idx (x, term) t.entries; }
+
+    let last_index t =
+      match maybe_nf IM.max_binding t.entries with
+          Some (index, (_, term)) -> (term, index)
+        | None -> (t.term, t.idx)
+
+    let get t idx =
+      try
+        Some (IM.find idx t.entries)
+      with Not_found -> None
+
+    let append_many l t = match l with
+        [] -> t
+      | l ->
+          let nonconflicting =
+            try
+              let idx, term =
+                List.find
+                  (fun (idx, (_, term)) ->
+                     match get t idx with
+                         Some (_, term') when term <> term' -> true
+                       | _ -> false)
+                  l in
+              let entries, _, _ = IM.split idx t.entries in
+                entries
+            with Not_found ->
+              t.entries
+          in
+            let entries = List.fold_left
+                            (fun m (idx, (x, term)) -> IM.add idx (x, term) m)
+                            nonconflicting l in
+            (* entries is not empty since l <> [] *)
+            let (idx, (_, term)) = IM.max_binding t.entries in
+              { idx; term; entries; }
+
+    let get_range ~from_inclusive ~to_inclusive t =
+      let _, _, post = IM.split (Int64.pred from_inclusive) t.entries in
+      let pre, _, _  = IM.split (Int64.succ to_inclusive) post in
+        IM.bindings pre
+
+    let get_term idx t =
+      try
+        Some (snd (IM.find idx t.entries))
+      with Not_found ->
+        if idx = t.idx then Some t.term else None
+  end
+
+  type 'a state =
       {
-        idx     : index;
-        term    : term;
-        entries : ('a * term) IM.t;
+        (* persistent *)
+        current_term : term;
+        voted_for    : rep_id option;
+        log          : 'a LOG.t;
+        id           : rep_id;
+
+        (* volatile *)
+        state        : status;
+        commit_index : index;
+        last_applied : index;
+
+        peers     : rep_id array;
+        leader_id : rep_id option;
+
+        (* volatile on leaders *)
+        next_index  : index RM.t;
+        match_index : index RM.t;
+
+        votes : RS.t;
       }
 
-  let empty ~init_index:idx ~init_term:term =
-    { idx; term; entries = IM.empty; }
+  type 'a message =
+      Request_vote of request_vote
+    | Vote_result of vote_result
+    | Append_entries of 'a append_entries
+    | Append_result of append_result
 
-  let to_list t =
-    IM.bindings t.entries |> List.map (fun (i, (x, t)) -> (i, x, t))
+  and request_vote =
+      {
+        term : term;
+        candidate_id : rep_id;
+        last_log_index : index;
+        last_log_term : term;
+      }
 
-  let append ~term x t =
-    let idx = Int64.succ t.idx in
-      { t with idx; entries = IM.add idx (x, term) t.entries; }
-
-  let last_index t =
-    match maybe_nf IM.max_binding t.entries with
-        Some (index, (_, term)) -> (term, index)
-      | None -> (t.term, t.idx)
-
-  let get t idx =
-    try
-      Some (IM.find idx t.entries)
-    with Not_found -> None
-
-  let append_many l t = match l with
-      [] -> t
-    | l ->
-        let nonconflicting =
-          try
-            let idx, term =
-              List.find
-                (fun (idx, (_, term)) ->
-                   match get t idx with
-                       Some (_, term') when term <> term' -> true
-                     | _ -> false)
-                l in
-            let entries, _, _ = IM.split idx t.entries in
-              entries
-          with Not_found ->
-            t.entries
-        in
-          let entries = List.fold_left
-                          (fun m (idx, (x, term)) -> IM.add idx (x, term) m)
-                          nonconflicting l in
-          (* entries is not empty since l <> [] *)
-          let (idx, (_, term)) = IM.max_binding t.entries in
-            { idx; term; entries; }
-
-  let get_range ~from_inclusive ~to_inclusive t =
-    let _, _, post = IM.split (Int64.pred from_inclusive) t.entries in
-    let pre, _, _  = IM.split (Int64.succ to_inclusive) post in
-      IM.bindings pre
-
-  let get_term idx t =
-    try
-      Some (snd (IM.find idx t.entries))
-    with Not_found ->
-      if idx = t.idx then Some t.term else None
-end
-
-type 'a state =
-    {
-      (* persistent *)
-      current_term : term;
-      voted_for    : rep_id option;
-      log          : 'a LOG.t;
-      id           : rep_id;
-
-      (* volatile *)
-      state        : status;
-      commit_index : index;
-      last_applied : index;
-
-      peers     : rep_id array;
-      leader_id : rep_id option;
-
-      (* volatile on leaders *)
-      next_index  : index RM.t;
-      match_index : index RM.t;
-
-      votes : RS.t;
-    }
-
-type 'a message =
-    Request_vote of request_vote
-  | Vote_result of vote_result
-  | Append_entries of 'a append_entries
-  | Append_result of append_result
-
-and request_vote =
+  and vote_result =
     {
       term : term;
-      candidate_id : rep_id;
-      last_log_index : index;
-      last_log_term : term;
+      vote_granted : bool;
     }
 
-and vote_result =
-  {
-    term : term;
-    vote_granted : bool;
-  }
+  and 'a append_entries =
+    {
+      term : term;
+      leader_id : rep_id;
+      prev_log_index : index;
+      prev_log_term : term;
+      entries : (index * ('a * term)) list;
+      leader_commit : index;
+    }
 
-and 'a append_entries =
-  {
-    term : term;
-    leader_id : rep_id;
-    prev_log_index : index;
-    prev_log_term : term;
-    entries : (index * ('a * term)) list;
-    leader_commit : index;
-  }
+  and append_result =
+    {
+      term : term;
+      success : bool;
 
-and append_result =
-  {
-    term : term;
-    success : bool;
+      (* extra information relative to the fields on the RAFT paper *)
 
-    (* extra information relative to the fields on the RAFT paper *)
+      (* index of log entry immediately preceding new ones in AppendEntries msg
+       * this responds to; used for fast next_index rollback by the Leader
+       * and allows to receive result of concurrent AppendEntries out-of-order
+       * *)
+      prev_log_index : index;
+      (* index of last log entry included in the msg this responds to;
+       * used by the Leader to update match_index, allowing to receive results
+       * of concurrent Append_entries request out-of-order *)
+      last_log_index : index;
+    }
 
-    (* index of log entry immediately preceding new ones in AppendEntries msg
-     * this responds to; used for fast next_index rollback by the Leader
-     * and allows to receive result of concurrent AppendEntries out-of-order
-     * *)
-    prev_log_index : index;
-    (* index of last log entry included in the msg this responds to;
-     * used by the Leader to update match_index, allowing to receive results
-     * of concurrent Append_entries request out-of-order *)
-    last_log_index : index;
-  }
+  type 'a action =
+      [ `Apply of index
+      | `Become_follower
+      | `Become_leader
+      | `Reset_election_timeout
+      | `Reset_heartbeat
+      | `Redirect of rep_id option * 'a
+      | `Send of rep_id * 'a message
+      ]
+end
+
+include Kernel
 
 let quorum s = Array.length s.peers / 2 + 1
 
@@ -398,3 +412,15 @@ let client_command x s = match s.state with
                       | l -> `Reset_heartbeat :: actions in
       let s       = { s with log; } in
         (s, actions)
+
+module Types = Kernel
+
+module Core =
+struct
+  include Types
+
+  let receive_msg       = receive_msg
+  let election_timeout  = election_timeout
+  let heartbeat_timeout = heartbeat_timeout
+  let client_command    = client_command
+end
