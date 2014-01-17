@@ -50,7 +50,7 @@ sig
   }
 
   type 'a action =
-      [ `Apply of index
+      [ `Apply of 'a
       | `Become_candidate
       | `Become_follower
       | `Become_leader

@@ -1,3 +1,5 @@
+open Printf
+open Lwt
 
 module Map    = BatMap
 module List   = BatList
@@ -9,6 +11,7 @@ struct
   type term   = Int64.t
   type index  = Int64.t
   type rep_id = string
+  type 'a result = [`OK of 'a | `Error of exn]
 
   module IM = Map.Make(struct
                          type t = index
@@ -170,7 +173,7 @@ struct
     }
 
   type 'a action =
-      [ `Apply of index
+      [ `Apply of 'a
       | `Become_candidate
       | `Become_follower
       | `Become_leader
@@ -212,7 +215,7 @@ let try_commit s = match s.state with
     Follower | Candidate -> (s, [])
   | Leader ->
       let s       = {s with last_applied = s.commit_index } in
-      let actions = List.map (fun (x, _) -> `Apply x)
+      let actions = List.map (fun (_, (x, _)) -> `Apply x)
                       (LOG.get_range
                          ~from_inclusive:(Int64.succ s.commit_index)
                          ~to_inclusive:s.commit_index
@@ -424,4 +427,222 @@ struct
   let election_timeout  = election_timeout
   let heartbeat_timeout = heartbeat_timeout
   let client_command    = client_command
+end
+
+module type LWTIO =
+sig
+  type address
+  type op
+  type connection
+
+  val connect : address -> connection option Lwt.t
+  val accept  : unit -> (address * connection) Lwt.t
+  val send    : connection -> (Int64.t * op) message -> bool Lwt.t
+  val receive : connection -> (Int64.t * op) message option Lwt.t
+  val abort   : connection -> unit Lwt.t
+end
+
+module type PROC =
+sig
+  type op
+  type resp
+
+  val execute : op -> resp result Lwt.t
+end
+
+module Lwt_server
+  (PROC : PROC)
+  (IO : LWTIO with type op = PROC.op) =
+struct
+  module S    = Set.Make(String)
+  module CMDM = Map.Make(Int64)
+
+  type req_id = Int64.t
+
+  type server =
+      {
+        peers                     : IO.address RM.t;
+        election_period           : float;
+        heartbeat_period          : float;
+        mutable next_req_id       : req_id;
+        mutable conns             : IO.connection RM.t;
+        mutable state             : (req_id * PROC.op) state;
+        mutable running           : bool;
+        mutable msg_threads       : th_res Lwt.t list;
+        mutable election_timeout  : th_res Lwt.t;
+        mutable heartbeat         : th_res Lwt.t;
+        mutable abort             : th_res Lwt.t * th_res Lwt.u;
+        mutable get_client_cmd    : th_res Lwt.t;
+        push_client_cmd           : (req_id * PROC.op) -> unit;
+        client_cmd_stream         : (req_id * PROC.op) Lwt_stream.t;
+        mutable pending_cmds      : (cmd_res Lwt.t * cmd_res Lwt.u) CMDM.t;
+      }
+
+  and th_res =
+      Message of rep_id * (req_id * PROC.op) message
+    | Client_command of req_id * PROC.op
+    | Abort
+    | Election_timeout
+    | Heartbeat_timeout
+
+  and cmd_res =
+      Redirect of rep_id option
+    | Executed of PROC.resp result
+
+  let make
+        ?(election_period = 2.)
+        ?(heartbeat_period = election_period /. 2.)
+        state peers =
+    let stream, push      = Lwt_stream.create () in
+    let push x            = push (Some x) in
+    let election_timeout  = match state.Core.state with
+                              | Follower | Candidate ->
+                                  Lwt_unix.sleep election_period >>
+                                  return Election_timeout
+                              | Leader -> fst (Lwt.wait ()) in
+    let heartbeat = match state.Core.state with
+                              | Follower | Candidate -> fst (Lwt.wait ())
+                              | Leader ->
+                                  Lwt_unix.sleep heartbeat_period >>
+                                  return Heartbeat_timeout
+    in
+      { peers;
+        heartbeat_period;
+        election_period;
+        state;
+        election_timeout;
+        heartbeat;
+        next_req_id       = 42L;
+        conns             = RM.empty;
+        running           = true;
+        msg_threads       = [];
+        abort             = Lwt.task ();
+        get_client_cmd    = (match_lwt Lwt_stream.get stream with
+                               | None -> fst (Lwt.wait ())
+                               | Some (req_id, op) ->
+                                   return (Client_command (req_id, op)));
+        push_client_cmd   = push;
+        client_cmd_stream = stream;
+        pending_cmds      = CMDM.empty;
+      }
+
+  let abort t =
+    t.running <- false;
+    try (Lwt.wakeup (snd t.abort) Abort) with _ -> ()
+
+  let lookup_address t peer_id =
+    maybe_nf (RM.find peer_id) t.peers
+
+  let connect_and_get_msgs t (peer, addr) =
+    let rec make_thread = function
+        0 -> Lwt_unix.sleep 5. >> make_thread 5
+      | n ->
+          match_lwt IO.connect addr with
+            | None -> Lwt_unix.sleep 0.1 >> make_thread (n - 1)
+            | Some conn ->
+                t.conns <- RM.add peer conn t.conns;
+                match_lwt IO.receive conn with
+                    None -> Lwt_unix.sleep 0.1 >> make_thread 5
+                  | Some msg -> return (Message (peer, msg))
+    in
+      make_thread 5
+
+  let exec_action t : _ action -> unit Lwt.t = function
+    | `Reset_election_timeout ->
+        t.election_timeout <- (Lwt_unix.sleep t.election_period >>
+                               return Election_timeout);
+        return ()
+    | `Reset_heartbeat ->
+        t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period >>
+                               return Heartbeat_timeout);
+        return ()
+    | `Become_candidate
+    | `Become_follower ->
+        t.heartbeat <- fst (Lwt.wait ());
+        t.election_timeout <- (Lwt_unix.sleep t.election_period >>
+                               return Election_timeout);
+        return ()
+    | `Become_leader ->
+        t.election_timeout  <- fst (Lwt.wait ());
+        t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period >>
+                                return Heartbeat_timeout);
+        return ()
+    | `Apply (req_id, op) ->
+        (* TODO: allow to run this in parallel with rest RAFT algorithm.
+         * Must make sure that Apply actions are not reordered. *)
+        lwt resp = try_lwt PROC.execute op
+                   with exn -> return (`Error exn)
+        in begin
+          try_lwt
+            let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
+              Lwt.wakeup_later u (Executed resp);
+              return ()
+          with _ -> return ()
+        end
+    | `Redirect (rep_id, (req_id, _)) -> begin
+        try_lwt
+          let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
+            Lwt.wakeup_later u (Redirect rep_id);
+            return ()
+        with _ -> return ()
+      end
+    | `Send (rep_id, msg) ->
+        (* we allow to run this in parallel with rest RAFT algorithm.
+         * It's OK to reorder sends. *)
+        (* TODO: limit the number of msgs in outboung queue.
+         * Drop after the nth? *)
+        ignore begin try_lwt
+          lwt _ = IO.send (RM.find rep_id t.conns) msg in
+            return ()
+        with _ ->
+          (* cannot send -- partition *)
+          return ()
+        end;
+        return ()
+
+  let exec_actions t l = Lwt_list.iter_s (exec_action t) l
+
+  let rec run t =
+    if not t.running then return ()
+    else
+      let must_recon = Array.to_list t.state.peers |>
+                       List.filter_map
+                         (fun peer -> lookup_address t peer |>
+                                      Option.map (fun addr -> (peer, addr))) |>
+                       List.filter
+                         (fun (peer, _) -> not (RM.mem peer t.conns)) in
+      let new_ths    = List.map (connect_and_get_msgs t) must_recon in
+        t.msg_threads <- new_ths @ t.msg_threads;
+
+        match_lwt
+          Lwt.choose
+            ([ t.election_timeout;
+               fst t.abort;
+               t.get_client_cmd;
+               t.heartbeat;
+             ] @
+             t.msg_threads)
+        with
+          | Abort -> t.running <- false; return ()
+          | Client_command (req_id, op) ->
+              let state, actions = Core.client_command (req_id, op) t.state in
+                t.state <- state;
+                exec_actions t actions >>
+                run t
+          | Message (rep_id, msg) ->
+              let state, actions = Core.receive_msg t.state rep_id msg in
+                t.state <- state;
+                exec_actions t actions >>
+                run t
+          | Election_timeout ->
+              let state, actions = Core.election_timeout t.state in
+                t.state <- state;
+                exec_actions t actions >>
+                run t
+          | Heartbeat_timeout ->
+              let state, actions = Core.heartbeat_timeout t.state in
+                t.state <- state;
+                exec_actions t actions >>
+                run t
+
 end
