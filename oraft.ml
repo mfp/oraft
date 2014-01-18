@@ -7,10 +7,12 @@ module Option = BatOption
 
 module Kernel =
 struct
-  type status = Leader | Follower | Candidate
-  type term   = Int64.t
-  type index  = Int64.t
-  type rep_id = string
+  type status    = Leader | Follower | Candidate
+  type term      = Int64.t
+  type index     = Int64.t
+  type rep_id    = string
+  type client_id = string
+  type req_id    = client_id * Int64.t
   type 'a result = [`OK of 'a | `Error of exn]
 
   module IM = Map.Make(struct
@@ -175,7 +177,7 @@ struct
   type 'a action =
       [ `Apply of 'a
       | `Become_candidate
-      | `Become_follower
+      | `Become_follower of rep_id option
       | `Become_leader
       | `Reset_election_timeout
       | `Reset_heartbeat
@@ -264,10 +266,10 @@ let receive_msg s peer = function
       let s = { s with current_term = term; state = Follower; } in
         match s.voted_for with
             Some candidate when candidate <> candidate_id ->
-              (s, [`Become_follower; `Send (peer, vote_result s false)])
+              (s, [`Become_follower None; `Send (peer, vote_result s false)])
           | Some _ | None ->
               let s = { s with voted_for = Some candidate_id; } in
-                (s, [`Become_follower; `Send (peer, vote_result s true)])
+                (s, [`Become_follower None; `Send (peer, vote_result s true)])
     end
   | Request_vote { term; candidate_id; last_log_index; last_log_term; } -> begin
       match s.voted_for with
@@ -292,11 +294,16 @@ let receive_msg s peer = function
          * its current term to the larger value. If a candidate or leader
          * discovers that its term is out of date, it immediately reverts to
          * follower state." *)
-        let actions, s =
+        let s, actions =
           if term > s.current_term then
-            ([`Become_follower], { s with current_term = term; state = Follower })
+            let s = { s with current_term = term;
+                             state        = Follower;
+                             leader_id    = Some peer;
+                    }
+            in
+              (s, [`Become_follower (Some peer)])
           else
-            ([`Reset_election_timeout], s)
+            (s, [`Reset_election_timeout])
         in
           match LOG.get s.log prev_log_index with
               None -> (s, (`Send (peer, append_result s 0L 0L false) :: actions))
@@ -319,7 +326,7 @@ let receive_msg s peer = function
       (s, [])
   | Vote_result { term; _ } when term > s.current_term ->
       let s = { s with current_term = term; state = Follower } in
-        (s, [`Become_follower])
+        (s, [`Become_follower None])
   | Vote_result { term; vote_granted; } when s.state <> Candidate ->
       (s, [])
   | Vote_result { term; vote_granted; } ->
@@ -349,7 +356,7 @@ let receive_msg s peer = function
       (s, [])
   | Append_result { term; _ } when term > s.current_term ->
       let s = { s with current_term = term; state = Follower; } in
-        (s, [`Become_follower])
+        (s, [`Become_follower None])
   | Append_result { term; success; prev_log_index; last_log_index; } ->
       if success then begin
         let next_index  = RM.modify peer
@@ -437,8 +444,8 @@ sig
 
   val connect : address -> connection option Lwt.t
   val accept  : unit -> (address * connection) Lwt.t
-  val send    : connection -> (Int64.t * op) message -> bool Lwt.t
-  val receive : connection -> (Int64.t * op) message option Lwt.t
+  val send    : connection -> (req_id * op) message -> bool Lwt.t
+  val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
 end
 
@@ -455,16 +462,17 @@ module Lwt_server
   (IO : LWTIO with type op = PROC.op) =
 struct
   module S    = Set.Make(String)
-  module CMDM = Map.Make(Int64)
-
-  type req_id = Int64.t
+  module CMDM = Map.Make(struct
+                           type t = req_id
+                           let compare = compare
+                         end)
 
   type server =
       {
         peers                     : IO.address RM.t;
         election_period           : float;
         heartbeat_period          : float;
-        mutable next_req_id       : req_id;
+        mutable next_req_id       : Int64.t;
         mutable conns             : IO.connection RM.t;
         mutable state             : (req_id * PROC.op) state;
         mutable running           : bool;
@@ -476,6 +484,7 @@ struct
         push_client_cmd           : (req_id * PROC.op) -> unit;
         client_cmd_stream         : (req_id * PROC.op) Lwt_stream.t;
         mutable pending_cmds      : (cmd_res Lwt.t * cmd_res Lwt.u) CMDM.t;
+        leader_signal             : unit Lwt_condition.t;
       }
 
   and th_res =
@@ -524,6 +533,7 @@ struct
         push_client_cmd   = push;
         client_cmd_stream = stream;
         pending_cmds      = CMDM.empty;
+        leader_signal     = Lwt_condition.create ();
       }
 
   let abort t =
@@ -557,12 +567,19 @@ struct
                                return Heartbeat_timeout);
         return ()
     | `Become_candidate
-    | `Become_follower ->
+    | `Become_follower None ->
+        t.heartbeat <- fst (Lwt.wait ());
+        t.election_timeout <- (Lwt_unix.sleep t.election_period >>
+                               return Election_timeout);
+        return ()
+    | `Become_follower (Some _) ->
+        Lwt_condition.broadcast t.leader_signal ();
         t.heartbeat <- fst (Lwt.wait ());
         t.election_timeout <- (Lwt_unix.sleep t.election_period >>
                                return Election_timeout);
         return ()
     | `Become_leader ->
+        Lwt_condition.broadcast t.leader_signal ();
         t.election_timeout  <- fst (Lwt.wait ());
         t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period >>
                                 return Heartbeat_timeout);
@@ -644,5 +661,44 @@ struct
                 t.state <- state;
                 exec_actions t actions >>
                 run t
+
+  let gen_req_id t =
+    let id = t.next_req_id in
+      t.next_req_id <- Int64.succ id;
+      (t.state.id, id)
+
+  let rec execute t cmd =
+    match t.state.state, t.state.leader_id with
+      | Follower, Some leader_id -> begin
+          match maybe_nf (RM.find leader_id) t.peers with
+              Some address -> return (`Redirect (leader_id, address))
+            | None ->
+                (* redirect to a random server, hoping it knows better *)
+                try_lwt
+                  let leader_id, address =
+                    RM.bindings t.peers |>
+                    Array.of_list |>
+                    (fun x -> if x = [||] then failwith "empty"; x) |>
+                    (fun a -> a.(Random.int (Array.length a)))
+                  in
+                    return (`Redirect_randomized (leader_id, address))
+                with _ ->
+                  return `Retry_later
+        end
+      | Candidate, _ | Follower, _ ->
+          (* await leader, retry *)
+          Lwt_condition.wait t.leader_signal >>
+          execute t cmd
+      | Leader, _ ->
+          let req_id = gen_req_id t in
+          let task   = Lwt.task () in
+            t.pending_cmds <- CMDM.add req_id task t.pending_cmds;
+            t.push_client_cmd (req_id, cmd);
+            match_lwt fst task with
+                Executed (`OK _ as res) -> return res
+              | Executed (`Error exn) ->
+                  return (`Error (Printexc.to_string exn))
+              | Redirect _ ->
+                  execute t cmd
 
 end

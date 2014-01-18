@@ -52,7 +52,7 @@ sig
   type 'a action =
       [ `Apply of 'a
       | `Become_candidate
-      | `Become_follower
+      | `Become_follower of rep_id option
       | `Become_leader
       | `Redirect of rep_id option * 'a
       | `Reset_election_timeout
