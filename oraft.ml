@@ -557,33 +557,27 @@ struct
     in
       make_thread 5
 
-  let exec_action t : _ action -> unit Lwt.t = function
+  let rec exec_action t : _ action -> unit Lwt.t = function
     | `Reset_election_timeout ->
         t.election_timeout <- (Lwt_unix.sleep t.election_period >>
                                return Election_timeout);
         return ()
     | `Reset_heartbeat ->
         t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period >>
-                               return Heartbeat_timeout);
+                        return Heartbeat_timeout);
         return ()
     | `Become_candidate
     | `Become_follower None ->
         t.heartbeat <- fst (Lwt.wait ());
-        t.election_timeout <- (Lwt_unix.sleep t.election_period >>
-                               return Election_timeout);
-        return ()
+        exec_action t `Reset_election_timeout
     | `Become_follower (Some _) ->
         Lwt_condition.broadcast t.leader_signal ();
         t.heartbeat <- fst (Lwt.wait ());
-        t.election_timeout <- (Lwt_unix.sleep t.election_period >>
-                               return Election_timeout);
-        return ()
+        exec_action t `Reset_election_timeout
     | `Become_leader ->
         Lwt_condition.broadcast t.leader_signal ();
         t.election_timeout  <- fst (Lwt.wait ());
-        t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period >>
-                                return Heartbeat_timeout);
-        return ()
+        exec_action t `Reset_heartbeat
     | `Apply (req_id, op) ->
         (* TODO: allow to run this in parallel with rest RAFT algorithm.
          * Must make sure that Apply actions are not reordered. *)
