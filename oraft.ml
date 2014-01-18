@@ -469,22 +469,22 @@ struct
 
   type server =
       {
-        peers                     : IO.address RM.t;
-        election_period           : float;
-        heartbeat_period          : float;
-        mutable next_req_id       : Int64.t;
-        mutable conns             : IO.connection RM.t;
-        mutable state             : (req_id * PROC.op) state;
-        mutable running           : bool;
-        mutable msg_threads       : th_res Lwt.t list;
-        mutable election_timeout  : th_res Lwt.t;
-        mutable heartbeat         : th_res Lwt.t;
-        mutable abort             : th_res Lwt.t * th_res Lwt.u;
-        mutable get_client_cmd    : th_res Lwt.t;
-        push_client_cmd           : (req_id * PROC.op) -> unit;
-        client_cmd_stream         : (req_id * PROC.op) Lwt_stream.t;
-        mutable pending_cmds      : (cmd_res Lwt.t * cmd_res Lwt.u) CMDM.t;
-        leader_signal             : unit Lwt_condition.t;
+        peers                    : IO.address RM.t;
+        election_period          : float;
+        heartbeat_period         : float;
+        mutable next_req_id      : Int64.t;
+        mutable conns            : IO.connection RM.t;
+        mutable state            : (req_id * PROC.op) state;
+        mutable running          : bool;
+        mutable msg_threads      : th_res Lwt.t list;
+        mutable election_timeout : th_res Lwt.t;
+        mutable heartbeat        : th_res Lwt.t;
+        mutable abort            : th_res Lwt.t * th_res Lwt.u;
+        mutable get_cmd          : th_res Lwt.t;
+        push_cmd                 : (req_id * PROC.op) -> unit;
+        cmd_stream               : (req_id * PROC.op) Lwt_stream.t;
+        mutable pending_cmds     : (cmd_res Lwt.t * cmd_res Lwt.u) CMDM.t;
+        leader_signal            : unit Lwt_condition.t;
       }
 
   and th_res =
@@ -516,7 +516,7 @@ struct
                                   Lwt_unix.sleep election_period >>
                                   return Election_timeout
                               | Leader -> fst (Lwt.wait ()) in
-    let heartbeat = match state.Core.state with
+    let heartbeat         = match state.Core.state with
                               | Follower | Candidate -> fst (Lwt.wait ())
                               | Leader ->
                                   Lwt_unix.sleep heartbeat_period >>
@@ -528,21 +528,21 @@ struct
         state;
         election_timeout;
         heartbeat;
-        peers             = List.fold_left
-                              (fun m (k, v) -> RM.add k v m) RM.empty peers;
-        next_req_id       = 42L;
-        conns             = RM.empty;
-        running           = true;
-        msg_threads       = [];
-        abort             = Lwt.task ();
-        get_client_cmd    = (match_lwt Lwt_stream.get stream with
-                               | None -> fst (Lwt.wait ())
-                               | Some (req_id, op) ->
-                                   return (Client_command (req_id, op)));
-        push_client_cmd   = push;
-        client_cmd_stream = stream;
-        pending_cmds      = CMDM.empty;
-        leader_signal     = Lwt_condition.create ();
+        peers         = List.fold_left
+                          (fun m (k, v) -> RM.add k v m) RM.empty peers;
+        next_req_id   = 42L;
+        conns         = RM.empty;
+        running       = true;
+        msg_threads   = [];
+        abort         = Lwt.task ();
+        get_cmd       = (match_lwt Lwt_stream.get stream with
+                           | None -> fst (Lwt.wait ())
+                           | Some (req_id, op) ->
+                               return (Client_command (req_id, op)));
+        push_cmd      = push;
+        cmd_stream    = stream;
+        pending_cmds  = CMDM.empty;
+        leader_signal = Lwt_condition.create ();
       }
 
   let abort t =
@@ -638,7 +638,7 @@ struct
           Lwt.choose
             ([ t.election_timeout;
                fst t.abort;
-               t.get_client_cmd;
+               t.get_cmd;
                t.heartbeat;
              ] @
              t.msg_threads)
@@ -696,7 +696,7 @@ struct
           let req_id = gen_req_id t in
           let task   = Lwt.task () in
             t.pending_cmds <- CMDM.add req_id task t.pending_cmds;
-            t.push_client_cmd (req_id, cmd);
+            t.push_cmd (req_id, cmd);
             match_lwt fst task with
                 Executed res -> return (res :> result)
               | Redirect _ -> execute t cmd
