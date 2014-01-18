@@ -13,7 +13,7 @@ struct
   type rep_id    = string
   type client_id = string
   type req_id    = client_id * Int64.t
-  type 'a result = [`OK of 'a | `Error of exn]
+  type ('a, 'b) result = [`OK of 'a | `Error of 'b]
 
   module IM = Map.Make(struct
                          type t = index
@@ -449,16 +449,16 @@ sig
   val abort   : connection -> unit Lwt.t
 end
 
-module type PROC =
+module type LWTPROC =
 sig
   type op
   type resp
 
-  val execute : op -> resp result Lwt.t
+  val execute : op -> (resp, exn) result Lwt.t
 end
 
 module Lwt_server
-  (PROC : PROC)
+  (PROC : LWTPROC)
   (IO : LWTIO with type op = PROC.op) =
 struct
   module S    = Set.Make(String)
@@ -496,7 +496,14 @@ struct
 
   and cmd_res =
       Redirect of rep_id option
-    | Executed of PROC.resp result
+    | Executed of (PROC.resp, exn) result
+
+  type result =
+      [ `OK of PROC.resp
+      | `Error of exn
+      | `Redirect of rep_id * IO.address
+      | `Redirect_randomized of rep_id * IO.address
+      | `Retry_later ]
 
   let make
         ?(election_period = 2.)
@@ -515,12 +522,14 @@ struct
                                   Lwt_unix.sleep heartbeat_period >>
                                   return Heartbeat_timeout
     in
-      { peers;
+      {
         heartbeat_period;
         election_period;
         state;
         election_timeout;
         heartbeat;
+        peers             = List.fold_left
+                              (fun m (k, v) -> RM.add k v m) RM.empty peers;
         next_req_id       = 42L;
         conns             = RM.empty;
         running           = true;
@@ -689,10 +698,6 @@ struct
             t.pending_cmds <- CMDM.add req_id task t.pending_cmds;
             t.push_client_cmd (req_id, cmd);
             match_lwt fst task with
-                Executed (`OK _ as res) -> return res
-              | Executed (`Error exn) ->
-                  return (`Error (Printexc.to_string exn))
-              | Redirect _ ->
-                  execute t cmd
-
+                Executed res -> return (res :> result)
+              | Redirect _ -> execute t cmd
 end
