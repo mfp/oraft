@@ -67,6 +67,10 @@ sig
 
   type 'a state
 
+  val make :
+    id:rep_id -> current_term:term -> voted_for:rep_id option ->
+    log:(index * 'a * term) list -> peers:rep_id array -> unit -> 'a state
+
   val receive_msg :
     'a state -> rep_id -> 'a message -> 'a state * 'a action list
 

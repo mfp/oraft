@@ -31,6 +31,8 @@ struct
 
     val empty       : init_index:index -> init_term:term -> 'a t
     val to_list     : 'a t -> (index * 'a * term) list
+    val of_list     : init_index:index -> init_term:term ->
+                        (index * 'a * term) list -> 'a t
     val append      : term:term -> 'a -> 'a t -> 'a t
     val last_index  : 'a t -> (term * index)
     val get         : 'a t -> index -> ('a * term) option
@@ -52,6 +54,16 @@ struct
 
     let to_list t =
       IM.bindings t.entries |> List.map (fun (i, (x, t)) -> (i, x, t))
+
+    let of_list ~init_index:idx ~init_term:term = function
+        [] -> { idx; term; entries = IM.empty }
+      | l ->
+          let entries =
+            List.fold_left
+              (fun m (idx, x, term) -> IM.add idx (x, term) m)
+              IM.empty l in
+          let (idx, (_, term)) = IM.max_binding entries in
+            { idx; term; entries; }
 
     let append ~term x t =
       let idx = Int64.succ t.idx in
@@ -110,13 +122,13 @@ struct
         voted_for    : rep_id option;
         log          : 'a LOG.t;
         id           : rep_id;
+        peers        : rep_id array;
 
         (* volatile *)
         state        : status;
         commit_index : index;
         last_applied : index;
 
-        peers     : rep_id array;
         leader_id : rep_id option;
 
         (* volatile on leaders *)
@@ -429,6 +441,19 @@ module Types = Kernel
 module Core =
 struct
   include Types
+
+  let make ~id ~current_term ~voted_for ~log ~peers () =
+    let log = LOG.of_list ~init_index:0L ~init_term:current_term log in
+      {
+        current_term; voted_for; log; id; peers;
+        state        = Follower;
+        commit_index = 0L;
+        last_applied = 0L;
+        leader_id    = None;
+        next_index   = RM.empty;
+        match_index  = RM.empty;
+        votes        = RS.empty;
+      }
 
   let receive_msg       = receive_msg
   let election_timeout  = election_timeout
