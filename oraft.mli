@@ -90,7 +90,6 @@ sig
   type connection
 
   val connect : address -> connection option Lwt.t
-  val accept  : unit -> (address * connection) Lwt.t
   val send    : connection -> (req_id * op) message -> bool Lwt.t
   val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
@@ -124,6 +123,6 @@ sig
     (req_id * IO.op) Core.state -> (rep_id * IO.address) list -> server
 
   val run     : server -> unit Lwt.t
-  val abort   : server -> unit
+  val abort   : server -> unit Lwt.t
   val execute : server -> PROC.op -> result Lwt.t
 end

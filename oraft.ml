@@ -468,7 +468,6 @@ sig
   type connection
 
   val connect : address -> connection option Lwt.t
-  val accept  : unit -> (address * connection) Lwt.t
   val send    : connection -> (req_id * op) message -> bool Lwt.t
   val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
@@ -571,8 +570,13 @@ struct
       }
 
   let abort t =
-    t.running <- false;
-    try (Lwt.wakeup (snd t.abort) Abort) with _ -> ()
+    if not t.running then
+      return ()
+    else begin
+      t.running <- false;
+      begin try (Lwt.wakeup (snd t.abort) Abort) with _ -> () end;
+      RM.bindings t.conns |> List.map snd |> Lwt_list.iter_p IO.abort
+    end
 
   let lookup_address t peer_id =
     maybe_nf (RM.find peer_id) t.peers
