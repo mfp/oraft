@@ -345,11 +345,16 @@ let receive_msg s peer = function
       if not vote_granted then
         (s, [])
       else
+        (* "If votes received from majority of servers: become leader" *)
         let votes = RS.add peer s.votes in
           if RS.cardinal votes < quorum s - 1 then
             (s, [])
           else
             (* become leader! *)
+
+            (* "When a leader first comes to power, it initializes all
+             * nextIndex values to the index just after the last one in its
+             * log" *)
             let next_idx    = LOG.last_index s.log |> snd |> Int64.succ in
             let next_index  = Array.fold_left
                                 (fun m peer -> RM.add peer next_idx m)
@@ -361,12 +366,17 @@ let receive_msg s peer = function
                                  state     = Leader;
                                  leader_id = Some s.id;
                         } in
+            (* "Upon election: send initial empty AppendEntries RPCs
+             * (heartbeat) to each server; repeat during idle periods to
+             * prevent election timeouts" *)
             let sends = broadcast s (heartbeat s) in
               (s, (`Become_leader :: sends))
 
   | Append_result { term; _ } when term < s.current_term ->
       (s, [])
   | Append_result { term; _ } when term > s.current_term ->
+      (* "If RPC request or response contains term T > currentTerm:
+       * set currentTerm = T, convert to follower" *)
       let s = { s with current_term = term; state = Follower; } in
         (s, [`Become_follower None])
   | Append_result { term; success; prev_log_index; last_log_index; } ->
@@ -381,6 +391,9 @@ let receive_msg s peer = function
         let s, actions  = try_commit s in
           (s, actions)
       end else begin
+        (* "After a rejection, the leader decrements nextIndex and retries
+         * the AppendEntries RPC. Eventually nextIndex will reach a point
+         * where the leader and follower logs match." *)
         let next_index = RM.modify peer
                            (fun idx -> min idx prev_log_index)
                            s.next_index in
@@ -396,7 +409,17 @@ let receive_msg s peer = function
 
 let election_timeout s = match s.state with
     Leader -> (s, [])
-  | Follower | Candidate ->
+  (* "If election timeout elapses without receiving AppendEntries RPC from
+   * current leader or granting vote to candidate: convert to candidate" *)
+  | Follower
+  (* "If election timeout elapses: start new election" *)
+  | Candidate ->
+      (* "On conversion to candidate, start election:
+       *  * Increment currentTerm
+       *  * Vote for self
+       *  * Reset election timeout
+       *  * Send RequestVote RPCs to all other servers"
+       * *)
       let s           = { s with current_term = Int64.succ s.current_term;
                                  state        = Candidate;
                                  votes        = RS.empty;
