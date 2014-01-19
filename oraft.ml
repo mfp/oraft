@@ -209,6 +209,12 @@ let append_result s ~prev_log_index ~last_log_index success =
   Append_result
     { term = s.current_term; prev_log_index; last_log_index; success; }
 
+let append_ok ~prev_log_index ~last_log_index s =
+  append_result s ~prev_log_index ~last_log_index true
+
+let append_fail ~prev_log_index s =
+  append_result s ~prev_log_index ~last_log_index:0L false
+
 let update_commit_index s =
   (* Find last N such that log[N].term = current term AND
    * a majority of peers has got  match_index[peer] >= N. *)
@@ -297,8 +303,8 @@ let receive_msg s peer = function
     end
   (* " If a server receives a request with a stale term number, it rejects the
    * request." *)
-  | Append_entries { term; _ } when term < s.current_term ->
-      (s, [`Send (peer, append_result s 0L 0L false)])
+  | Append_entries { term; prev_log_index; _ } when term < s.current_term ->
+      (s, [`Send (peer, append_fail ~prev_log_index s)])
   | Append_entries
       { term; prev_log_index; prev_log_term; entries; leader_commit; } -> begin
         (* "Current terms are exchanged whenever servers communicate; if one
@@ -318,18 +324,19 @@ let receive_msg s peer = function
             (s, [`Reset_election_timeout])
         in
           match LOG.get s.log prev_log_index with
-              None -> (s, (`Send (peer, append_result s 0L 0L false) :: actions))
+              None ->
+                (s, [`Send (peer, append_fail ~prev_log_index s)])
             | Some (_, term') when term <> term' ->
-                (s, (`Send (peer, append_result s 0L 0L false) :: actions))
+                (s, [`Send (peer, append_fail ~prev_log_index s)])
             | _ ->
                 let log          = LOG.append_many entries s.log in
                 let last_index   = snd (LOG.last_index log) in
                 let commit_index = if leader_commit > s.commit_index then
                                      min leader_commit last_index
                                    else s.commit_index in
-                let reply        = append_result s
+                let reply        = append_ok
                                      ~prev_log_index
-                                     ~last_log_index:last_index true in
+                                     ~last_log_index:last_index s in
                 let s            = { s with commit_index; log; } in
                   (s, (`Send (peer, reply) :: actions))
       end
