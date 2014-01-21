@@ -43,30 +43,30 @@ struct
   struct
     type 'a t =
         {
-          idx     : index;
-          term    : term;
-          entries : ('a * term) IM.t;
+          init_index : index;
+          init_term  : term;
+          entries    : ('a * term) IM.t;
         }
 
-    let empty ~init_index:idx ~init_term:term =
-      { idx; term; entries = IM.empty; }
+    let empty ~init_index ~init_term =
+      { init_index; init_term; entries = IM.empty; }
 
     let to_list t =
       IM.bindings t.entries |> List.map (fun (i, (x, t)) -> (i, x, t))
 
-    let of_list ~init_index:idx ~init_term:term = function
-        [] -> { idx; term; entries = IM.empty }
+    let of_list ~init_index ~init_term = function
+        [] -> empty ~init_index ~init_term
       | l ->
           let entries =
             List.fold_left
               (fun m (idx, x, term) -> IM.add idx (x, term) m)
               IM.empty l in
-          let (idx, (_, term)) = IM.max_binding entries in
-            { idx; term; entries; }
+          let (init_index, (_, init_term)) = IM.max_binding entries in
+            { init_index; init_term; entries; }
 
     let append ~term x t =
       let idx = match maybe_nf IM.max_binding t.entries with
-                  | None -> Int64.succ t.idx
+                  | None -> Int64.succ t.init_index
                   | Some (idx, _) -> Int64.succ idx
       in
         { t with entries = IM.add idx (x, term) t.entries; }
@@ -74,7 +74,7 @@ struct
     let last_index t =
       match maybe_nf IM.max_binding t.entries with
           Some (index, (_, term)) -> (term, index)
-        | None -> (t.term, t.idx)
+        | None -> (t.init_term, t.init_index)
 
     let get idx t =
       try
@@ -114,7 +114,7 @@ struct
       try
         Some (snd (IM.find idx t.entries))
       with Not_found ->
-        if idx = t.idx then Some t.term else None
+        if idx = t.init_index then Some t.init_term else None
   end
 
   type 'a state =
