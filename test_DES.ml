@@ -47,13 +47,15 @@ sig
     rtt:CLOCK.t ->
     unit -> 'a t
 
+  val random_node_id : 'a t -> rep_id
+
   val simulate :
     ?verbose:bool ->
     msg_loss_rate:float ->
     (time:Int64.t ->
      leader:Oraft.Types.rep_id option ->
      Oraft.Types.rep_id -> 'a -> unit) ->
-    'a -> 'a t -> unit
+     ?steps:int -> 'a t -> int
 end =
 struct
   module C   = Oraft.Core
@@ -129,6 +131,9 @@ struct
     let nodes    = Array.map (make_node node_ids) node_ids in
       { rng; ev_queue; clock; election_period; heartbeat_period; rtt; nodes; }
 
+  let random_node_id t =
+    t.nodes.(RND.int t.rng (Array.length t.nodes)).id
+
   let string_of_msg = function
       Request_vote { term; candidate_id; _ } ->
         sprintf "Request_vote %S @ %Ld" candidate_id term
@@ -176,17 +181,15 @@ struct
     Event_queue.schedule t.ev_queue
       node_id Int64.(t.clock + RND.int64 t.rng 100L) (Command cmd)
 
-  let simulate ?(verbose = false) ~msg_loss_rate on_apply init_cmd t =
-
-    let random_node_id () =
-      t.nodes.(RND.int t.rng (Array.length t.nodes)).id in
+  let simulate ?(verbose = false) ~msg_loss_rate on_apply
+               ?(steps = max_int) t =
 
     let node_of_id =
       let h = Hashtbl.create 13 in
         Array.iter (fun node -> Hashtbl.add h node.id node) t.nodes;
         (fun node_id -> Hashtbl.find h node_id) in
 
-    let send_cmd ?(dst = random_node_id ()) cmd =
+    let send_cmd ?(dst = random_node_id t) cmd =
       send_cmd t dst cmd in
 
     let react_to_event time node ev =
@@ -255,13 +258,11 @@ struct
     let steps = ref 0 in
       (* schedule initial election timeouts *)
       Array.iter (schedule_election t) t.nodes;
-      (* schedule init cmd delivery *)
-      send_cmd init_cmd;
 
       try
         let rec loop () =
           match Event_queue.next t.ev_queue with
-              None -> ()
+              None -> !steps
             | Some (time, rep_id, evs) ->
                 incr steps;
                 t.clock <- time;
@@ -270,9 +271,7 @@ struct
                 List.(iter (react_to_event time (node_of_id rep_id)) (rev evs));
                 loop ()
         in loop ()
-      with Exit ->
-        printf "Ran %d steps.\n" !steps;
-        ()
+      with Exit -> !steps
 end
 
 module IS = Set.Make(struct type t = int let compare = (-) end)
@@ -289,13 +288,16 @@ let () =
 
   let completed = ref 0 in
   let num_nodes = 3 in
-  let num_cmds  = 100_000 in
-  let last_sent = ref 1 in
+  let num_cmds  = 200_000 in
+  let init_cmd  = 1 in
+  let last_sent = ref init_cmd in
   let ev_queue  = DES.Event_queue.create () in
 
   let election_period  = 800L in
   let heartbeat_period = 200L in
   let rtt              = 50L in
+  let msg_loss_rate    = 0.01 in
+  let batch_size       = 20 in
 
   let on_apply ~time ~leader node_id cmd =
     (* printf "XXXXXXXXXXXXX apply %S  %d\n" node_id cmd; *)
@@ -305,8 +307,8 @@ let () =
       if cmd >= !last_sent then begin
       (* We schedule the next few commands being sent to the current leader
        * (simulating the client caching the current leader). *)
-        let dt = Int64.(heartbeat_period - 190L) in
-          for i = 1 to 10 do
+        let dt = Int64.(heartbeat_period - 10L) in
+          for i = 1 to batch_size do
             incr last_sent;
             let cmd = !last_sent in
               DES.Event_queue.schedule ev_queue
@@ -326,6 +328,12 @@ let () =
   let des = DES.make ~ev_queue ~rng ~num_nodes
               ~election_period ~heartbeat_period ~rtt ()
   in
-    DES.simulate ~verbose:false ~msg_loss_rate:0.01 on_apply 1 des;
-    print_endline "DONE"
-
+    (* schedule init cmd delivery *)
+    DES.Event_queue.schedule
+      ev_queue (DES.random_node_id des) 100L (DES.Command init_cmd);
+    let t0    = Unix.gettimeofday () in
+    let steps = DES.simulate ~verbose:false ~msg_loss_rate on_apply des in
+    let dt    = Unix.gettimeofday () -. t0 in
+      printf "Simulated %d steps (%4.2f steps/cmd, %.0f steps/s, %.0f cmds/s).\n"
+        steps (float steps /. float !last_sent)
+        (float steps /. dt) (float !last_sent /. dt)
