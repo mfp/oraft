@@ -71,6 +71,8 @@ sig
     id:rep_id -> current_term:term -> voted_for:rep_id option ->
     log:(index * 'a * term) list -> peers:rep_id array -> unit -> 'a state
 
+  val leader_id : 'a state -> rep_id option
+
   val receive_msg :
     'a state -> rep_id -> 'a message -> 'a state * 'a action list
 

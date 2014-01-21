@@ -156,7 +156,9 @@ struct
       let rec exec_action = function
           `Apply cmd ->
             if verbose then printf " Apply\n";
-            on_apply (send_cmd ?dst:None) node.id cmd
+            (* simulate current leader being cached by client *)
+            on_apply (send_cmd ?dst:(C.leader_id node.state)) node.id cmd
+            (* on_apply (send_cmd ?dst:None) node.id cmd *)
         | `Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat ev_queue node;

@@ -503,6 +503,8 @@ struct
         votes        = RS.empty;
       }
 
+  let leader_id (s : _ state) = s.leader_id
+
   let receive_msg       = receive_msg
   let election_timeout  = election_timeout
   let heartbeat_timeout = heartbeat_timeout
