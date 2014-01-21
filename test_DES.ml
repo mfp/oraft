@@ -126,11 +126,11 @@ struct
 
   let simulate
         ?(rng = Random.State.make_self_init ())
+        ?(ev_queue = Event_queue.create ())
         ?(verbose = false)
         ~msg_loss_rate ~num_nodes on_apply init_cmd () =
     let node_ids = Array.init num_nodes (sprintf "n%02d") in
     let nodes    = Array.map (make_node node_ids) node_ids in
-    let ev_queue = Event_queue.create () in
     let clock    = ref 0L in
 
     let random_node_id () =
@@ -158,8 +158,7 @@ struct
           `Apply cmd ->
             if verbose then printf " Apply\n";
             (* simulate current leader being cached by client *)
-            on_apply (send_cmd ?dst:(C.leader_id node.state)) node.id cmd
-            (* on_apply (send_cmd ?dst:None) node.id cmd *)
+            on_apply ~time:!clock ~leader:(C.leader_id node.state) node.id cmd
         | `Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat ev_queue node;
@@ -242,19 +241,27 @@ let () =
              q) in
 
   let completed = ref 0 in
-  let sent      = ref IS.empty in
   let num_nodes = 3 in
-  let num_cmds  = 200_000 in
+  let num_cmds  = 100_000 in
+  let last_sent = ref 1 in
+  let ev_queue  = DES.Event_queue.create () in
 
-  let on_apply send node_id cmd =
+  let on_apply ~time ~leader node_id cmd =
     (* printf "XXXXXXXXXXXXX apply %S  %d\n" node_id cmd; *)
     let q    = get_queue node_id in
-    let cmd' = cmd + 1 in
-    let len = Queue.length q + 1 in
-      Queue.push cmd q;
-      if len < num_cmds && not (IS.mem cmd' !sent) then begin
-        sent := IS.add cmd' !sent;
-        send cmd'
+    let ()   = Queue.push cmd q in
+    let len  = Queue.length q in
+      if cmd >= !last_sent then begin
+      (* We schedule the next few commands being sent to the current leader
+       * (simulating the client caching the current leader). *)
+        let dt = 190L in
+          for i = 1 to 10 do
+            incr last_sent;
+            let cmd = !last_sent in
+              DES.Event_queue.schedule ev_queue
+                (Option.default node_id leader)
+                Int64.(time + of_int i * dt) (DES.Command cmd)
+        done
       end;
       if len >= num_cmds then begin
         print_endline "COMPLETED";
@@ -264,6 +271,8 @@ let () =
       end in
 
   let rng = Random.State.make [| 2 |] in
-    DES.simulate ~rng ~verbose:false ~msg_loss_rate:0.01 ~num_nodes on_apply 0 ();
+    DES.simulate
+      ~ev_queue ~rng ~verbose:false
+      ~msg_loss_rate:0.01 ~num_nodes on_apply 1 ();
     print_endline "DONE"
 
