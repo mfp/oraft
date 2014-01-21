@@ -74,8 +74,9 @@ struct
     | Append_entries { term; prev_log_index; prev_log_term; entries; _ } ->
         sprintf "Append_entries (%Ld, %Ld, [%d]) @ %Ld"
           prev_log_index prev_log_term (List.length entries) term
-    | Append_result { term; success; _ } ->
-        sprintf "Append_result %b @ %Ld" success term
+    | Append_result { term; success; prev_log_index; last_log_index; _ } ->
+        sprintf "Append_result %b %Ld -- %Ld @ %Ld"
+          success prev_log_index last_log_index term
 
   let describe_event = function
       Election_timeout -> "Election_timeout"
