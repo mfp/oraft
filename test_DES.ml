@@ -154,7 +154,7 @@ struct
 
   let schedule_election t node =
     let dt = Int64.(t.election_period - t.election_period / 4L +
-                    RND.int64 t.rng (t.election_period / 4L)) in
+                    of_int (RND.int t.rng (to_int t.election_period lsr 2))) in
     let t1 = Int64.(t.clock + dt) in
       node.next_election <- Some t1;
       Event_queue.schedule t.ev_queue node.id t1 Election_timeout
@@ -178,7 +178,7 @@ struct
 
   let send_cmd t node_id cmd =
     Event_queue.schedule t.ev_queue
-      node_id Int64.(t.clock + RND.int64 t.rng 100L) (Command cmd)
+      node_id Int64.(t.clock + of_int (RND.int t.rng 100)) (Command cmd)
 
   let simulate ?(verbose = false) ~msg_loss_rate on_apply
                ?(steps = max_int) t =
@@ -243,7 +243,7 @@ struct
             (* drop message with probability msg_loss_rate *)
             if RND.float t.rng 1.0 >= msg_loss_rate then begin
               let t1 = Int64.(t.clock + t.rtt - t.rtt / 4L +
-                              RND.int64 t.rng (t.rtt / 2L))
+                              of_int (RND.int t.rng (to_int t.rtt lsr 1)))
               in
                 Event_queue.schedule t.ev_queue rep_id t1
                   (Message (node.id, msg))
