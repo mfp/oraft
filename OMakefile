@@ -5,6 +5,7 @@ NATIVE_ENABLED = true
 OCAMLFINDFLAGS = -syntax camlp4o
 
 OCAMLFLAGS = -g -w +a-4-6-9-27..29-30-32..99 -warn-error +a-4-6-9-18-27-28-29..99
+OCAMLOPTFLAGS = -inline 1000
 
 OCAMLPACKS[] =
    batteries

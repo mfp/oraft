@@ -245,17 +245,21 @@ let update_commit_index s =
 
   (* increate monotonically *)
   let commit_index = max s.commit_index commit_index' in
-    { s with commit_index }
+    if commit_index = s.commit_index then s
+    else { s with commit_index }
 
 let try_commit s =
   let prev    = s.last_applied in
-  let s       = { s with last_applied = s.commit_index } in
-  let actions = List.map (fun (_, (x, _)) -> `Apply x)
-                  (LOG.get_range
-                     ~from_inclusive:(Int64.succ prev)
-                     ~to_inclusive:s.commit_index
-                     s.log)
-  in (s, actions)
+    if prev = s.commit_index then
+      (s, [])
+    else
+      let s       = { s with last_applied = s.commit_index } in
+      let actions = List.map (fun (_, (x, _)) -> `Apply x)
+                      (LOG.get_range
+                         ~from_inclusive:(Int64.succ prev)
+                         ~to_inclusive:s.commit_index
+                         s.log)
+      in (s, actions)
 
 let heartbeat s =
   let prev_log_term, prev_log_index = LOG.last_index s.log in
