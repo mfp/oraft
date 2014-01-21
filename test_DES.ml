@@ -6,11 +6,7 @@ module Int64  = BatInt64
 module Option = BatOption
 module RND    = Random.State
 
-module CLOCK =
-struct
-  type t = Int64.t
-  let compare = compare
-end
+module CLOCK = Int64
 
 module type EVENT_QUEUE =
 sig
@@ -66,7 +62,10 @@ struct
   struct
     module M = Map.Make(struct
                           type t      = CLOCK.t * rep_id
-                          let compare = compare
+                          let compare (c1, r1) (c2, r2) =
+                            match Int64.compare c1 c2 with
+                                0 -> String.compare r1 r2
+                              | n -> n
                         end)
     type 'a t = { mutable q : 'a list M.t }
 
@@ -274,8 +273,6 @@ struct
       with Exit -> !steps
 end
 
-module IS = Set.Make(struct type t = int let compare = (-) end)
-
 let () =
   let get_queue =
     let h = Hashtbl.create 13 in
@@ -300,7 +297,7 @@ let () =
   let batch_size       = 20 in
 
   let on_apply ~time ~leader node_id cmd =
-    (* printf "XXXXXXXXXXXXX apply %S  %d\n" node_id cmd; *)
+    if cmd mod 10_000 = 0 then printf "XXXXXXXXXXXXX apply %S  %d\n%!" node_id cmd;
     let q    = get_queue node_id in
     let ()   = Queue.push cmd q in
     let len  = Queue.length q in
