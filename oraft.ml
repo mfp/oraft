@@ -45,11 +45,17 @@ struct
         {
           init_index : index;
           init_term  : term;
+          last_index : index;
+          last_term  : term;
           entries    : ('a * term) IM.t;
         }
 
     let empty ~init_index ~init_term =
-      { init_index; init_term; entries = IM.empty; }
+      { init_index; init_term;
+        last_index = init_index;
+        last_term  = init_term;
+        entries    = IM.empty;
+      }
 
     let to_list t =
       IM.bindings t.entries |> List.map (fun (i, (x, t)) -> (i, x, t))
@@ -61,20 +67,16 @@ struct
             List.fold_left
               (fun m (idx, x, term) -> IM.add idx (x, term) m)
               IM.empty l in
-          let (init_index, (_, init_term)) = IM.max_binding entries in
-            { init_index; init_term; entries; }
+          let (init_index, (_, init_term)) = IM.min_binding entries in
+          let (last_index, (_, last_term)) = IM.max_binding entries in
+            { init_index; init_term; last_index; last_term; entries; }
 
-    let append ~term x t =
-      let idx = match maybe_nf IM.max_binding t.entries with
-                  | None -> Int64.succ t.init_index
-                  | Some (idx, _) -> Int64.succ idx
-      in
-        { t with entries = IM.add idx (x, term) t.entries; }
+    let append ~term:last_term x t =
+      let last_index = Int64.succ t.last_index in
+      let entries    = IM.add last_index (x, last_term) t.entries in
+        { t with last_index; last_term; entries; }
 
-    let last_index t =
-      match maybe_nf IM.max_binding t.entries with
-          Some (index, (_, term)) -> (term, index)
-        | None -> (t.init_term, t.init_index)
+    let last_index t = (t.last_term, t.last_index)
 
     let get idx t =
       try
@@ -98,17 +100,23 @@ struct
             with Not_found ->
               t.entries
           in
-            let entries = List.fold_left
-                            (fun m (idx, (x, term)) -> IM.add idx (x, term) m)
-                            nonconflicting l
+            let last_index, last_term, entries =
+              List.fold_left
+                (fun (last_index, last_term, m) (idx, (x, term)) ->
+                   let m          = IM.add idx (x, term) m in
+                   let last_index = max last_index idx in
+                   let last_term  = max last_term term in
+                     (last_index, last_term, m))
+                (t.init_index, t.init_term, nonconflicting) l
             in
-              { t with entries; }
+              { t with last_index; last_term; entries; }
 
     let get_range ~from_inclusive ~to_inclusive t =
       let _, _, post = IM.split (Int64.pred from_inclusive) t.entries in
       let pre, _, _  = if to_inclusive = Int64.max_int then (post, None, post)
                        else IM.split (Int64.succ to_inclusive) post
-      in IM.bindings pre
+      in
+        IM.bindings pre
 
     let get_term idx t =
       try
