@@ -4,32 +4,66 @@ module List   = BatList
 module Map    = BatMap
 module Int64  = BatInt64
 module Option = BatOption
+module RND    = Random.State
 
-module Clock =
+module CLOCK =
 struct
   type t = Int64.t
   let compare = compare
 end
 
-module DES =
+module type EVENT_QUEUE =
+sig
+  open Oraft.Types
+  type 'a t
+
+  val create     : unit -> 'a t
+  val schedule   : 'a t -> rep_id -> CLOCK.t -> 'a -> unit
+  val unschedule : 'a t -> rep_id -> CLOCK.t -> 'a -> unit
+  val next       : 'a t -> (CLOCK.t * rep_id * 'a list) option
+  val is_empty   : 'a t -> bool
+end
+
+module DES :
+sig
+  open Oraft.Types
+
+  module Event_queue : EVENT_QUEUE
+
+  type 'a event =
+    | Election_timeout
+    | Heartbeat_timeout
+    | Command of 'a
+    | Message of rep_id * 'a message
+
+  type 'a t
+
+  val make :
+    ?rng:RND.t ->
+    ?ev_queue:'a event Event_queue.t ->
+    num_nodes:int ->
+    election_period:CLOCK.t ->
+    heartbeat_period:CLOCK.t ->
+    rtt:CLOCK.t ->
+    unit -> 'a t
+
+  val simulate :
+    ?verbose:bool ->
+    msg_loss_rate:float ->
+    (time:Int64.t ->
+     leader:Oraft.Types.rep_id option ->
+     Oraft.Types.rep_id -> 'a -> unit) ->
+    'a -> 'a t -> unit
+end =
 struct
-  module RND = Random.State
   module C   = Oraft.Core
 
   open Oraft.Types
 
-  module Event_queue : sig
-    type 'a t
-
-    val create     : unit -> 'a t
-    val schedule   : 'a t -> rep_id -> Clock.t -> 'a -> unit
-    val unschedule : 'a t -> rep_id -> Clock.t -> 'a -> unit
-    val next       : 'a t -> (Clock.t * rep_id * 'a list) option
-    val is_empty   : 'a t -> bool
-  end =
+  module Event_queue =
   struct
     module M = Map.Make(struct
-                          type t      = Clock.t * rep_id
+                          type t      = CLOCK.t * rep_id
                           let compare = compare
                         end)
     type 'a t = { mutable q : 'a list M.t }
@@ -62,9 +96,38 @@ struct
       {
         id                     : rep_id;
         mutable state          : 'a C.state;
-        mutable next_heartbeat : Clock.t option;
-        mutable next_election  : Clock.t option;
+        mutable next_heartbeat : CLOCK.t option;
+        mutable next_election  : CLOCK.t option;
       }
+
+  type 'a t =
+      {
+        rng              : RND.t;
+        ev_queue         : 'a event Event_queue.t;
+        mutable clock    : CLOCK.t;
+        nodes            : 'a node array;
+        election_period  : CLOCK.t;
+        heartbeat_period : CLOCK.t;
+        rtt              : CLOCK.t;
+      }
+
+  let make_node peers id =
+    let state = C.make
+                  ~id ~current_term:0L ~voted_for:None
+                  ~log:[] ~peers ()
+    in
+      { id; state; next_heartbeat = None; next_election = None }
+
+  let make
+        ?(rng = RND.make_self_init ())
+        ?(ev_queue = Event_queue.create ())
+        ~num_nodes
+        ~election_period ~heartbeat_period ~rtt
+        () =
+    let clock    = 0L in
+    let node_ids = Array.init num_nodes (sprintf "n%02d") in
+    let nodes    = Array.map (make_node node_ids) node_ids in
+      { rng; ev_queue; clock; election_period; heartbeat_period; rtt; nodes; }
 
   let string_of_msg = function
       Request_vote { term; candidate_id; _ } ->
@@ -85,68 +148,50 @@ struct
     | Message (rep_id, msg) ->
         sprintf "Message (%S, %s)" rep_id (string_of_msg msg)
 
-  let make_node peers id =
-    let state = C.make
-                  ~id ~current_term:0L ~voted_for:None
-                  ~log:[] ~peers ()
-    in
-      { id; state; next_heartbeat = None; next_election = None }
-
-  let election_period  = 800L
-  let heartbeat_period = 200L
-  let rtt              = 50L
-
-  let schedule_election rng ev_queue t0 node =
-    let dt = Int64.(election_period - election_period / 4L +
-                    RND.int64 rng (election_period / 4L)) in
-    let t1 = Int64.(t0 + dt) in
+  let schedule_election t node =
+    let dt = Int64.(t.election_period - t.election_period / 4L +
+                    RND.int64 t.rng (t.election_period / 4L)) in
+    let t1 = Int64.(t.clock + dt) in
       node.next_election <- Some t1;
-      Event_queue.schedule ev_queue node.id t1 Election_timeout
+      Event_queue.schedule t.ev_queue node.id t1 Election_timeout
 
-  let schedule_heartbeat ev_queue t node =
-    let t1 = Int64.(t + heartbeat_period) in
+  let schedule_heartbeat t node =
+    let t1 = Int64.(t.clock + t.heartbeat_period) in
       node.next_heartbeat <- Some t1;
-      Event_queue.schedule ev_queue node.id t1 Heartbeat_timeout
+      Event_queue.schedule t.ev_queue node.id t1 Heartbeat_timeout
 
-  let unschedule_aux ev_queue node t what =
+  let unschedule_aux t node time what =
     Option.may
-      (fun t ->
-         Event_queue.unschedule ev_queue node.id t what)
-      t
+      (fun time ->
+         Event_queue.unschedule t.ev_queue node.id time what)
+      time
 
-  let unschedule_election ev_queue node =
-    unschedule_aux ev_queue node node.next_election Election_timeout
+  let unschedule_election t node =
+    unschedule_aux t node node.next_election Election_timeout
 
-  let unschedule_heartbeat ev_queue node =
-    unschedule_aux ev_queue node node.next_heartbeat Heartbeat_timeout
+  let unschedule_heartbeat t node =
+    unschedule_aux t node node.next_heartbeat Heartbeat_timeout
 
-  let send_cmd rng ev_queue t0 node_id cmd =
-    Event_queue.schedule ev_queue
-      node_id Int64.(t0 + RND.int64 rng 100L) (Command cmd)
+  let send_cmd t node_id cmd =
+    Event_queue.schedule t.ev_queue
+      node_id Int64.(t.clock + RND.int64 t.rng 100L) (Command cmd)
 
-  let simulate
-        ?(rng = Random.State.make_self_init ())
-        ?(ev_queue = Event_queue.create ())
-        ?(verbose = false)
-        ~msg_loss_rate ~num_nodes on_apply init_cmd () =
-    let node_ids = Array.init num_nodes (sprintf "n%02d") in
-    let nodes    = Array.map (make_node node_ids) node_ids in
-    let clock    = ref 0L in
+  let simulate ?(verbose = false) ~msg_loss_rate on_apply init_cmd t =
 
     let random_node_id () =
-      node_ids.(RND.int rng (Array.length node_ids)) in
+      t.nodes.(RND.int t.rng (Array.length t.nodes)).id in
 
     let node_of_id =
       let h = Hashtbl.create 13 in
-        Array.iter (fun node -> Hashtbl.add h node.id node) nodes;
+        Array.iter (fun node -> Hashtbl.add h node.id node) t.nodes;
         (fun node_id -> Hashtbl.find h node_id) in
 
     let send_cmd ?(dst = random_node_id ()) cmd =
-      send_cmd rng ev_queue !clock dst cmd in
+      send_cmd t dst cmd in
 
-    let react_to_event t node ev =
+    let react_to_event time node ev =
       if verbose then
-        printf "%Ld @ %s -> %s\n" t node.id (describe_event ev);
+        printf "%Ld @ %s -> %s\n" time node.id (describe_event ev);
 
       let s, actions = match ev with
           Election_timeout -> C.election_timeout node.state
@@ -158,23 +203,23 @@ struct
           `Apply cmd ->
             if verbose then printf " Apply\n";
             (* simulate current leader being cached by client *)
-            on_apply ~time:!clock ~leader:(C.leader_id node.state) node.id cmd
+            on_apply ~time ~leader:(C.leader_id node.state) node.id cmd
         | `Become_candidate ->
             if verbose then printf " Become_candidate\n";
-            unschedule_heartbeat ev_queue node;
+            unschedule_heartbeat t node;
             exec_action `Reset_election_timeout
         | `Become_follower None ->
             if verbose then printf " Become_follower\n";
-            unschedule_heartbeat ev_queue node;
+            unschedule_heartbeat t node;
             exec_action `Reset_election_timeout
         | `Become_follower (Some leader) ->
             if verbose then printf " Become_follower %S\n" leader;
-            unschedule_heartbeat ev_queue node;
+            unschedule_heartbeat t node;
             exec_action `Reset_election_timeout
         | `Become_leader ->
             if verbose then printf " Become_leader\n";
-            unschedule_election ev_queue node;
-            schedule_heartbeat ev_queue t node
+            unschedule_election t node;
+            schedule_heartbeat t node
         | `Redirect (Some leader, cmd) ->
             if verbose then printf " Redirect %s\n" leader;
             send_cmd ~dst:leader cmd
@@ -184,19 +229,21 @@ struct
             send_cmd cmd
         | `Reset_election_timeout ->
             if verbose then printf " Reset_election_timeout\n";
-            unschedule_election ev_queue node;
-            schedule_election rng ev_queue t node
+            unschedule_election t node;
+            schedule_election t node
         | `Reset_heartbeat ->
             if verbose then printf " Reset_heartbeat\n";
-            unschedule_heartbeat ev_queue node;
-            schedule_heartbeat ev_queue t node
+            unschedule_heartbeat t node;
+            schedule_heartbeat t node
         | `Send (rep_id, msg) ->
             if verbose then
               printf " Send to %S <- %s\n" rep_id (string_of_msg msg);
             (* drop message with probability msg_loss_rate *)
-            if RND.float rng 1.0 >= msg_loss_rate then begin
-              let t1 = Int64.(t + rtt - rtt / 4L + RND.int64 rng (rtt / 2L)) in
-                Event_queue.schedule ev_queue rep_id t1
+            if RND.float t.rng 1.0 >= msg_loss_rate then begin
+              let t1 = Int64.(t.clock + t.rtt - t.rtt / 4L +
+                              RND.int64 t.rng (t.rtt / 2L))
+              in
+                Event_queue.schedule t.ev_queue rep_id t1
                   (Message (node.id, msg))
             end
       in
@@ -207,20 +254,20 @@ struct
 
     let steps = ref 0 in
       (* schedule initial election timeouts *)
-      Array.iter (schedule_election rng ev_queue 0L) nodes;
+      Array.iter (schedule_election t) t.nodes;
       (* schedule init cmd delivery *)
       send_cmd init_cmd;
 
       try
         let rec loop () =
-          match Event_queue.next ev_queue with
+          match Event_queue.next t.ev_queue with
               None -> ()
-            | Some (t, rep_id, evs) ->
+            | Some (time, rep_id, evs) ->
                 incr steps;
-                clock := t;
+                t.clock <- time;
                 (* we reverse evs to make sure that two simultaneous events
                  * are executed in the same order they were scheduled *)
-                List.(iter (react_to_event t (node_of_id rep_id)) (rev evs));
+                List.(iter (react_to_event time (node_of_id rep_id)) (rev evs));
                 loop ()
         in loop ()
       with Exit ->
@@ -246,6 +293,10 @@ let () =
   let last_sent = ref 1 in
   let ev_queue  = DES.Event_queue.create () in
 
+  let election_period  = 800L in
+  let heartbeat_period = 200L in
+  let rtt              = 50L in
+
   let on_apply ~time ~leader node_id cmd =
     (* printf "XXXXXXXXXXXXX apply %S  %d\n" node_id cmd; *)
     let q    = get_queue node_id in
@@ -254,7 +305,7 @@ let () =
       if cmd >= !last_sent then begin
       (* We schedule the next few commands being sent to the current leader
        * (simulating the client caching the current leader). *)
-        let dt = 190L in
+        let dt = Int64.(heartbeat_period - 190L) in
           for i = 1 to 10 do
             incr last_sent;
             let cmd = !last_sent in
@@ -271,8 +322,10 @@ let () =
       end in
 
   let rng = Random.State.make [| 2 |] in
-    DES.simulate
-      ~ev_queue ~rng ~verbose:false
-      ~msg_loss_rate:0.01 ~num_nodes on_apply 1 ();
+
+  let des = DES.make ~ev_queue ~rng ~num_nodes
+              ~election_period ~heartbeat_period ~rtt ()
+  in
+    DES.simulate ~verbose:false ~msg_loss_rate:0.01 on_apply 1 des;
     print_endline "DONE"
 
