@@ -14,9 +14,8 @@ sig
   type 'a t
 
   val create     : unit -> 'a t
-  val schedule   : 'a t -> rep_id -> CLOCK.t -> 'a -> unit
-  val unschedule : 'a t -> rep_id -> CLOCK.t -> 'a -> unit
-  val next       : 'a t -> (CLOCK.t * rep_id * 'a list) option
+  val schedule   : 'a t -> CLOCK.t -> rep_id -> 'a -> unit
+  val next       : 'a t -> (CLOCK.t * rep_id * 'a) option
   val is_empty   : 'a t -> bool
 end
 
@@ -60,31 +59,42 @@ struct
 
   module Event_queue =
   struct
-    module M = Map.Make(struct
-                          type t      = CLOCK.t * rep_id
-                          let compare (c1, r1) (c2, r2) =
-                            match Int64.compare c1 c2 with
-                                0 -> String.compare r1 r2
-                              | n -> n
-                        end)
-    type 'a t = { mutable q : 'a list M.t }
+    type rep_id = string
+    module type PACK =
+    sig
+      type elm
+      module M : BatHeap.H with type elem = elm
+      val h : M.t ref
+    end
 
-    let create () = { q = M.empty }
+    type 'a m = (module PACK with type elm = 'a)
+    type 'a t = (Int64.t * rep_id * 'a) m
 
-    let schedule t rep_id time ev =
-      t.q <- M.modify_def [] (time, rep_id) (fun l -> ev :: l) t.q
+    let create (type a) () : a t =
+      let module P =
+        struct
+          type elm = Int64.t * rep_id * a
+          module M = BatHeap.Make(struct
+                                    type t = elm
+                                    let compare (c1, _, _) (c2, _, _) =
+                                      Int64.compare c1 c2
+                                  end)
+          let h = ref M.empty
+        end
+      in
+        (module P)
 
-    let unschedule t rep_id time ev =
-      t.q <- M.modify_opt (time, rep_id) (Option.map (List.filter ((<>) ev))) t.q
+    let schedule (type a) ((module P) : a t) t node (ev : a) =
+      P.h := P.M.add (t, node, ev) !P.h
 
-    let is_empty t = M.is_empty t.q
+    let is_empty (type a) ((module P) : a t) = P.M.size !P.h = 0
 
-    let next t =
+    let next (type a) ((module P) : a t) =
       try
-        let (clock, rep_id), evs = M.min_binding t.q in
-          t.q <- M.remove (clock, rep_id) t.q;
-          Some (clock, rep_id, evs)
-      with Not_found -> None
+        let x = P.M.find_min !P.h in
+          P.h := P.M.del_min !P.h;
+          Some x
+      with Invalid_argument _ -> None
   end
 
   type 'a event =
@@ -157,28 +167,22 @@ struct
                     of_int (RND.int t.rng (to_int t.election_period lsr 2))) in
     let t1 = Int64.(t.clock + dt) in
       node.next_election <- Some t1;
-      Event_queue.schedule t.ev_queue node.id t1 Election_timeout
+      Event_queue.schedule t.ev_queue t1 node.id Election_timeout
 
   let schedule_heartbeat t node =
     let t1 = Int64.(t.clock + t.heartbeat_period) in
       node.next_heartbeat <- Some t1;
-      Event_queue.schedule t.ev_queue node.id t1 Heartbeat_timeout
-
-  let unschedule_aux t node time what =
-    Option.may
-      (fun time ->
-         Event_queue.unschedule t.ev_queue node.id time what)
-      time
+      Event_queue.schedule t.ev_queue t1 node.id Heartbeat_timeout
 
   let unschedule_election t node =
-    unschedule_aux t node node.next_election Election_timeout
+    node.next_election <- None
 
   let unschedule_heartbeat t node =
-    unschedule_aux t node node.next_heartbeat Heartbeat_timeout
+    node.next_heartbeat <- None
 
   let send_cmd t node_id cmd =
     Event_queue.schedule t.ev_queue
-      node_id Int64.(t.clock + of_int (RND.int t.rng 100)) (Command cmd)
+      Int64.(t.clock + of_int (RND.int t.rng 100)) node_id (Command cmd)
 
   let simulate ?(verbose = false) ~msg_loss_rate on_apply
                ?(steps = max_int) t =
@@ -196,8 +200,16 @@ struct
         printf "%Ld @ %s -> %s\n" time node.id (describe_event ev);
 
       let s, actions = match ev with
-          Election_timeout -> C.election_timeout node.state
-        | Heartbeat_timeout -> C.heartbeat_timeout node.state
+          Election_timeout -> begin
+            match node.next_election with
+                Some t when t = time -> C.election_timeout node.state
+              | _ -> (node.state, [])
+          end
+        | Heartbeat_timeout -> begin
+            match node.next_election with
+              | Some t when t = time -> C.heartbeat_timeout node.state
+              | _ -> (node.state, [])
+          end
         | Command c -> C.client_command c node.state
         | Message (peer, msg) -> C.receive_msg node.state peer msg in
 
@@ -245,7 +257,7 @@ struct
               let t1 = Int64.(t.clock + t.rtt - t.rtt / 4L +
                               of_int (RND.int t.rng (to_int t.rtt lsr 1)))
               in
-                Event_queue.schedule t.ev_queue rep_id t1
+                Event_queue.schedule t.ev_queue t1 rep_id
                   (Message (node.id, msg))
             end
       in
@@ -262,12 +274,12 @@ struct
         let rec loop () =
           match Event_queue.next t.ev_queue with
               None -> !steps
-            | Some (time, rep_id, evs) ->
+            | Some (time, rep_id, ev) ->
                 incr steps;
                 t.clock <- time;
                 (* we reverse evs to make sure that two simultaneous events
                  * are executed in the same order they were scheduled *)
-                List.(iter (react_to_event time (node_of_id rep_id)) (rev evs));
+                react_to_event time (node_of_id rep_id) ev;
                 loop ()
         in loop ()
       with Exit -> !steps
@@ -309,8 +321,9 @@ let () =
             incr last_sent;
             let cmd = !last_sent in
               DES.Event_queue.schedule ev_queue
+                Int64.(time + of_int i * dt)
                 (Option.default node_id leader)
-                Int64.(time + of_int i * dt) (DES.Command cmd)
+                (DES.Command cmd)
         done
       end;
       if len >= num_cmds then begin
@@ -327,7 +340,7 @@ let () =
   in
     (* schedule init cmd delivery *)
     DES.Event_queue.schedule
-      ev_queue (DES.random_node_id des) 100L (DES.Command init_cmd);
+      ev_queue 100L (DES.random_node_id des) (DES.Command init_cmd);
     let t0    = Unix.gettimeofday () in
     let steps = DES.simulate ~verbose:false ~msg_loss_rate on_apply des in
     let dt    = Unix.gettimeofday () -. t0 in
