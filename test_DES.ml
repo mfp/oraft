@@ -92,8 +92,8 @@ struct
     in
       { id; state; next_heartbeat = None; next_election = None }
 
-  let election_period  = 400L
-  let heartbeat_period = 100L
+  let election_period  = 800L
+  let heartbeat_period = 200L
   let rtt              = 50L
 
   let schedule_election rng ev_queue t0 node =
