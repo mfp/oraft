@@ -15,12 +15,8 @@ struct
   type req_id    = client_id * Int64.t
   type ('a, 'b) result = [`OK of 'a | `Error of 'b]
 
-  module IM = Map.Make(struct
-                         type t = index
-                         let compare = compare
-                       end)
-
   module REPID = struct type t = rep_id let compare = String.compare end
+  module IM = Map.Make(Int64)
   module RM = Map.Make(REPID)
   module RS = Set.Make(REPID)
 
