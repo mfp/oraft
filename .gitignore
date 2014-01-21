@@ -18,3 +18,5 @@
 OMake*.omc
 *.annot
 *.sig
+perf.data*
+/test_DES

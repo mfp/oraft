@@ -24,7 +24,7 @@ struct
   module RM = Map.Make(REPID)
   module RS = Set.Make(REPID)
 
-  let maybe_nf f x = try Some (f x) with Not_found -> None
+  let maybe_nf f x = try Some (f x) with Not_found | Invalid_argument _ -> None
 
   module LOG : sig
     type 'a t
@@ -35,7 +35,6 @@ struct
                         (index * 'a * term) list -> 'a t
     val append      : term:term -> 'a -> 'a t -> 'a t
     val last_index  : 'a t -> (term * index)
-    val get         : 'a t -> index -> ('a * term) option
     val append_many : (index * ('a * term)) list -> 'a t -> 'a t
     val get_range   : from_inclusive:index -> to_inclusive:index -> 'a t ->
                       (index * ('a * term)) list
@@ -66,15 +65,18 @@ struct
             { idx; term; entries; }
 
     let append ~term x t =
-      let idx = Int64.succ t.idx in
-        { t with idx; entries = IM.add idx (x, term) t.entries; }
+      let idx = match maybe_nf IM.max_binding t.entries with
+                  | None -> Int64.succ t.idx
+                  | Some (idx, _) -> Int64.succ idx
+      in
+        { t with entries = IM.add idx (x, term) t.entries; }
 
     let last_index t =
       match maybe_nf IM.max_binding t.entries with
           Some (index, (_, term)) -> (term, index)
         | None -> (t.term, t.idx)
 
-    let get t idx =
+    let get idx t =
       try
         Some (IM.find idx t.entries)
       with Not_found -> None
@@ -87,7 +89,7 @@ struct
               let idx, term =
                 List.find
                   (fun (idx, (_, term)) ->
-                     match get t idx with
+                     match get idx t with
                          Some (_, term') when term <> term' -> true
                        | _ -> false)
                   l in
@@ -98,15 +100,15 @@ struct
           in
             let entries = List.fold_left
                             (fun m (idx, (x, term)) -> IM.add idx (x, term) m)
-                            nonconflicting l in
-            (* entries is not empty since l <> [] *)
-            let (idx, (_, term)) = IM.max_binding t.entries in
-              { idx; term; entries; }
+                            nonconflicting l
+            in
+              { t with entries; }
 
     let get_range ~from_inclusive ~to_inclusive t =
       let _, _, post = IM.split (Int64.pred from_inclusive) t.entries in
-      let pre, _, _  = IM.split (Int64.succ to_inclusive) post in
-        IM.bindings pre
+      let pre, _, _  = if to_inclusive = Int64.max_int then (post, None, post)
+                       else IM.split (Int64.succ to_inclusive) post
+      in IM.bindings pre
 
     let get_term idx t =
       try
@@ -231,16 +233,15 @@ let update_commit_index s =
   in
     { s with commit_index }
 
-let try_commit s = match s.state with
-    Follower | Candidate -> (s, [])
-  | Leader ->
-      let s       = {s with last_applied = s.commit_index } in
-      let actions = List.map (fun (_, (x, _)) -> `Apply x)
-                      (LOG.get_range
-                         ~from_inclusive:(Int64.succ s.commit_index)
-                         ~to_inclusive:s.commit_index
-                         s.log)
-      in (s, actions)
+let try_commit s =
+  let prev    = s.last_applied in
+  let s       = { s with last_applied = s.commit_index } in
+  let actions = List.map (fun (_, (x, _)) -> `Apply x)
+                  (LOG.get_range
+                     ~from_inclusive:(Int64.succ prev)
+                     ~to_inclusive:s.commit_index
+                     s.log)
+  in (s, actions)
 
 let heartbeat s =
   let prev_log_term, prev_log_index = LOG.last_index s.log in
@@ -249,8 +250,9 @@ let heartbeat s =
                      leader_commit = s.commit_index }
 
 let send_entries s from =
-  match LOG.get_term from s.log with
-      None -> None
+  match LOG.get_term (Int64.pred from) s.log with
+      None ->
+        None
     | Some prev_log_term ->
         Some
           (Append_entries
@@ -267,7 +269,8 @@ let send_entries s from =
 
 let broadcast s msg =
   Array.to_list s.peers |>
-  List.map (fun p -> `Send (p, msg))
+  List.filter_map
+    (fun p -> if p = s.id then None else Some (`Send (p, msg)))
 
 let receive_msg s peer = function
   (* " If a server receives a request with a stale term number, it rejects the
@@ -323,11 +326,13 @@ let receive_msg s peer = function
           else
             (s, [`Reset_election_timeout])
         in
-          match LOG.get s.log prev_log_index with
+          match LOG.get_term prev_log_index s.log  with
               None ->
-                (s, [`Send (peer, append_fail ~prev_log_index s)])
-            | Some (_, term') when term <> term' ->
-                (s, [`Send (peer, append_fail ~prev_log_index s)])
+                (s, [`Reset_election_timeout;
+                     `Send (peer, append_fail ~prev_log_index s)])
+            | Some term' when prev_log_term <> term' ->
+                (s, [`Reset_election_timeout;
+                     `Send (peer, append_fail ~prev_log_index s)])
             | _ ->
                 let log          = LOG.append_many entries s.log in
                 let last_index   = snd (LOG.last_index log) in
@@ -337,8 +342,15 @@ let receive_msg s peer = function
                 let reply        = append_ok
                                      ~prev_log_index
                                      ~last_log_index:last_index s in
-                let s            = { s with commit_index; log; } in
-                  (s, (`Send (peer, reply) :: actions))
+                let s            = { s with commit_index; log;
+                                            leader_id = Some peer; } in
+                let s, commits   = try_commit s in
+                let actions      = List.concat
+                                     [ [`Send (peer, reply)];
+                                       commits;
+                                       actions ]
+                in
+                  (s, actions)
       end
 
   | Vote_result { term; _ } when term < s.current_term ->
@@ -354,6 +366,7 @@ let receive_msg s peer = function
       else
         (* "If votes received from majority of servers: become leader" *)
         let votes = RS.add peer s.votes in
+        let s     = { s with votes } in
           if RS.cardinal votes < quorum s - 1 then
             (s, [])
           else
@@ -431,6 +444,7 @@ let election_timeout s = match s.state with
                                  state        = Candidate;
                                  votes        = RS.empty;
                                  leader_id    = None;
+                                 voted_for    = Some s.id;
                         } in
       let term_, idx_ = LOG.last_index s.log in
       let msg         = Request_vote
@@ -452,18 +466,22 @@ let client_command x s = match s.state with
     Follower | Candidate -> (s, [`Redirect (s.leader_id, x)])
   | Leader ->
       let log     = LOG.append ~term:s.current_term x s.log in
+      let s       = { s with log; } in
       let actions = Array.to_list s.peers |>
                     List.filter_map
                       (fun peer ->
-                         match send_entries s (RM.find peer s.next_index) with
-                             None ->
-                               (* FIXME: should send snapshot if cannot send log *)
-                               None
-                           | Some msg -> Some (`Send (peer, msg))) in
+                         if peer = s.id then None
+                         else
+                           match send_entries s (RM.find peer s.next_index) with
+                               None ->
+                                 (* FIXME: should send snapshot if cannot send
+                                  * log *)
+                                 None
+                             | Some msg -> Some (`Send (peer, msg))) in
       let actions = match actions with
                       | [] -> []
-                      | l -> `Reset_heartbeat :: actions in
-      let s       = { s with log; } in
+                      | l -> `Reset_heartbeat :: actions
+      in
         (s, actions)
 
 module Types = Kernel
