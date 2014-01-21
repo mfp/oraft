@@ -218,7 +218,9 @@ struct
             | Some (t, rep_id, evs) ->
                 incr steps;
                 clock := t;
-                List.iter (react_to_event t (node_of_id rep_id)) evs;
+                (* we reverse evs to make sure that two simultaneous events
+                 * are executed in the same order they were scheduled *)
+                List.(iter (react_to_event t (node_of_id rep_id)) (rev evs));
                 loop ()
         in loop ()
       with Exit ->
