@@ -225,12 +225,14 @@ let update_commit_index s =
    * also counts).*)
   let sorted       = RM.bindings s.match_index |> List.map snd |>
                      List.sort Int64.compare in
-  let commit_index =
+  let commit_index' =
     try
       List.nth sorted (quorum s - 1)
     with Not_found ->
-      s.commit_index
-  in
+      s.commit_index in
+
+  (* increate monotonically *)
+  let commit_index = max s.commit_index commit_index' in
     { s with commit_index }
 
 let try_commit s =
@@ -284,13 +286,11 @@ let receive_msg s peer = function
    * its term is out of date, it immediately reverts to follower state."
    * *)
   | Request_vote { term; candidate_id; _ } when term > s.current_term -> begin
-      let s = { s with current_term = term; state = Follower; } in
-        match s.voted_for with
-            Some candidate when candidate <> candidate_id ->
-              (s, [`Become_follower None; `Send (peer, vote_result s false)])
-          | Some _ | None ->
-              let s = { s with voted_for = Some candidate_id; } in
-                (s, [`Become_follower None; `Send (peer, vote_result s true)])
+      let s = { s with current_term = term;
+                       voted_for    = Some candidate_id;
+                       state        = Follower; }
+      in
+        (s, [`Become_follower None; `Send (peer, vote_result s true)])
     end
   | Request_vote { term; candidate_id; last_log_index; last_log_term; } -> begin
       match s.voted_for with
