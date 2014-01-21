@@ -108,17 +108,25 @@ struct
               { t with last_index; last_term; entries; }
 
     let get_range ~from_inclusive ~to_inclusive t =
-      let _, _, post = IM.split (Int64.pred from_inclusive) t.entries in
-      let pre, _, _  = if to_inclusive = Int64.max_int then (post, None, post)
-                       else IM.split (Int64.succ to_inclusive) post
-      in
-        IM.bindings pre
+      if from_inclusive = t.last_index &&
+         to_inclusive >= t.last_index
+      then
+        [ from_inclusive, IM.find from_inclusive t.entries ]
+      else
+        let _, _, post = IM.split (Int64.pred from_inclusive) t.entries in
+        let pre, _, _  = if to_inclusive = Int64.max_int then (post, None, post)
+                         else IM.split (Int64.succ to_inclusive) post
+        in
+          IM.bindings pre
 
     let get_term idx t =
-      try
-        Some (snd (IM.find idx t.entries))
-      with Not_found ->
-        if idx = t.init_index then Some t.init_term else None
+      if t.last_index = idx then
+        Some t.last_term
+      else
+        try
+          Some (snd (IM.find idx t.entries))
+        with Not_found ->
+          if idx = t.init_index then Some t.init_term else None
   end
 
   type 'a state =
