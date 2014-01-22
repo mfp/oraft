@@ -235,13 +235,26 @@ let update_commit_index s =
   (* We compute it as follows: get all the match_index, sort them,
    * and get the (quorum - 1)-nth (not quorum-nth because the current leader
    * also counts).*)
-  let sorted       = RM.bindings s.match_index |> List.map snd |>
-                     List.sort Int64.compare in
-  let commit_index' =
+  let sorted = RM.bindings s.match_index |> List.map snd |>
+               List.sort Int64.compare in
+  let index  =
     try
       List.nth sorted (quorum s - 1)
     with Not_found ->
       s.commit_index in
+
+  (* index is the largest N such that a majority of match_Index[peer] >= N;
+   * we have to enforce the other restriction: log[N].term = current *)
+  let commit_index' =
+    try
+      let rec search_commit_index idx =
+        match LOG.get_term idx s.log with
+            None -> raise Not_found
+          | Some term when term = s.current_term -> idx
+          | _ -> raise Not_found
+      in
+        search_commit_index index
+    with Not_found -> s.commit_index in
 
   (* increate monotonically *)
   let commit_index = max s.commit_index commit_index' in
@@ -301,25 +314,64 @@ let receive_msg s peer = function
    * current term to the larger value. If a candidate or leader discovers that
    * its term is out of date, it immediately reverts to follower state."
    * *)
-  | Request_vote { term; candidate_id; _ } when term > s.current_term -> begin
+  | Vote_result { term; _ }
+  | Append_result { term; _ } when term > s.current_term ->
       let s = { s with current_term = term;
-                       voted_for    = Some candidate_id;
-                       state        = Follower; }
+                       voted_for    = None;
+                       state        = Follower }
+      in (s, [`Become_follower None])
+
+  | Request_vote { term; candidate_id; last_log_index; last_log_term; }
+      when term > s.current_term ->
+      let s = { s with current_term = term;
+                       voted_for    = None;
+                       state        = Follower;
+              }
       in
-        (s, [`Become_follower None; `Send (peer, vote_result s true)])
-    end
+        (* "If votedFor is null or candidateId, and candidate's log is at
+         * least as up-to-date as receiver’s log, grant vote"
+         *
+         * [voted_for] is None since it was reset above when we updated
+         * [current_term]
+         *
+         * "Raft determines which of two logs is more up-to-date
+         * by comparing the index and term of the last entries in the
+         * logs. If the logs have last entries with different terms, then
+         * the log with the later term is more up-to-date. If the logs
+         * end with the same term, then whichever log is longer is
+         * more up-to-date."
+         * *)
+        if (last_log_term, last_log_index) < LOG.last_index s.log then
+          (s, [`Become_follower None; `Send (peer, vote_result s false)])
+        else
+          let s = { s with voted_for = Some candidate_id } in
+            (s, [`Become_follower None; `Send (peer, vote_result s true)])
+
   | Request_vote { term; candidate_id; last_log_index; last_log_term; } -> begin
-      match s.voted_for with
-          Some candidate when candidate <> candidate_id ->
+      (* case term = current_term *)
+      match s.state, s.voted_for with
+          _, Some candidate when candidate <> candidate_id ->
             (s, [`Send (peer, vote_result s false)])
-        | _ ->
+        | (Candidate | Leader), _ ->
+            (s, [`Send (peer, vote_result s false)])
+        | Follower, _ (* None or Some candidate equal to candidate_id *) ->
+            (* "If votedFor is null or candidateId, and candidate's log is at
+             * least as up-to-date as receiver’s log, grant vote"
+             *
+             * "Raft determines which of two logs is more up-to-date
+             * by comparing the index and term of the last entries in the
+             * logs. If the logs have last entries with different terms, then
+             * the log with the later term is more up-to-date. If the logs
+             * end with the same term, then whichever log is longer is
+             * more up-to-date."
+             * *)
             if (last_log_term, last_log_index) < LOG.last_index s.log then
               (s, [`Send (peer, vote_result s false)])
-            else begin
+            else
               let s = { s with voted_for = Some candidate_id } in
-                (s, [`Reset_election_timeout; `Send (peer, vote_result s true)])
-            end
+                (s, [`Send (peer, vote_result s true)])
     end
+
   (* " If a server receives a request with a stale term number, it rejects the
    * request." *)
   | Append_entries { term; prev_log_index; _ } when term < s.current_term ->
@@ -336,19 +388,20 @@ let receive_msg s peer = function
             let s = { s with current_term = term;
                              state        = Follower;
                              leader_id    = Some peer;
+                             (* set voted_for so that no other candidates are
+                              * accepted during the new term *)
+                             voted_for    = Some peer;
                     }
             in
               (s, [`Become_follower (Some peer)])
-          else
+          else (* term = s.current_term *)
             (s, [`Reset_election_timeout])
         in
           match LOG.get_term prev_log_index s.log  with
               None ->
-                (s, [`Reset_election_timeout;
-                     `Send (peer, append_fail ~prev_log_index s)])
+                (s, `Send (peer, append_fail ~prev_log_index s) :: actions)
             | Some term' when prev_log_term <> term' ->
-                (s, [`Reset_election_timeout;
-                     `Send (peer, append_fail ~prev_log_index s)])
+                (s, `Send (peer, append_fail ~prev_log_index s) :: actions)
             | _ ->
                 let log          = LOG.append_many entries s.log in
                 let last_index   = snd (LOG.last_index log) in
@@ -371,9 +424,6 @@ let receive_msg s peer = function
 
   | Vote_result { term; _ } when term < s.current_term ->
       (s, [])
-  | Vote_result { term; _ } when term > s.current_term ->
-      let s = { s with current_term = term; state = Follower } in
-        (s, [`Become_follower None])
   | Vote_result { term; vote_granted; } when s.state <> Candidate ->
       (s, [])
   | Vote_result { term; vote_granted; } ->
@@ -410,11 +460,6 @@ let receive_msg s peer = function
 
   | Append_result { term; _ } when term < s.current_term ->
       (s, [])
-  | Append_result { term; _ } when term > s.current_term ->
-      (* "If RPC request or response contains term T > currentTerm:
-       * set currentTerm = T, convert to follower" *)
-      let s = { s with current_term = term; state = Follower; } in
-        (s, [`Become_follower None])
   | Append_result { term; success; prev_log_index; last_log_index; } ->
       if success then begin
         let next_index  = RM.modify peer
