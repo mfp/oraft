@@ -458,7 +458,7 @@ let receive_msg s peer = function
             let sends = broadcast s (heartbeat s) in
               (s, (`Become_leader :: sends))
 
-  | Append_result { term; _ } when term < s.current_term ->
+  | Append_result { term; _ } when term < s.current_term || s.state <> Leader ->
       (s, [])
   | Append_result { term; success; prev_log_index; last_log_index; } ->
       if success then begin
