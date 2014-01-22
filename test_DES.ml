@@ -48,6 +48,7 @@ sig
 
   val simulate :
     ?verbose:bool ->
+    ?string_of_cmd:('a -> string) ->
     msg_loss_rate:float ->
     (time:Int64.t ->
      leader:Oraft.Types.rep_id option ->
@@ -148,25 +149,33 @@ struct
 
   let node_ids t = Array.(to_list (map (fun n -> n.id) t.nodes))
 
-  let string_of_msg = function
+  let string_of_msg string_of_cmd = function
       Request_vote { term; candidate_id; last_log_term; last_log_index; _ } ->
         sprintf "Request_vote %S last_term:%Ld last_index:%Ld @ %Ld"
           candidate_id last_log_term last_log_index term
     | Vote_result { term; vote_granted } ->
         sprintf "Vote_result %b @ %Ld" vote_granted term
     | Append_entries { term; prev_log_index; prev_log_term; entries; _ } ->
-        sprintf "Append_entries (%Ld, %Ld, [%d]) @ %Ld"
-          prev_log_index prev_log_term (List.length entries) term
+        let payload_desc =
+          entries |>
+          List.map
+            (fun (index, (cmd, term)) ->
+               sprintf "(%Ld, %s, %Ld)" index
+                 (Option.default (fun _ -> "<cmd>") string_of_cmd cmd) term) |>
+          String.concat ", "
+        in
+          sprintf "Append_entries (%Ld, %Ld, [%s]) @ %Ld"
+            prev_log_index prev_log_term payload_desc term
     | Append_result { term; success; prev_log_index; last_log_index; _ } ->
         sprintf "Append_result %b %Ld -- %Ld @ %Ld"
           success prev_log_index last_log_index term
 
-  let describe_event = function
+  let describe_event string_of_cmd = function
       Election_timeout -> "Election_timeout"
     | Heartbeat_timeout -> "Heartbeat_timeout"
     | Command cmd -> "Command"
     | Message (rep_id, msg) ->
-        sprintf "Message (%S, %s)" rep_id (string_of_msg msg)
+        sprintf "Message (%S, %s)" rep_id (string_of_msg string_of_cmd msg)
     | Func _ -> "Func _"
 
   let schedule_election t node =
@@ -191,7 +200,7 @@ struct
     Event_queue.schedule t.ev_queue
       Int64.(t.clock + of_int (RND.int t.rng 100)) node_id (Command cmd)
 
-  let simulate ?(verbose = false) ~msg_loss_rate on_apply
+  let simulate ?(verbose = false) ?string_of_cmd ~msg_loss_rate on_apply
                ?(steps = max_int) t =
 
     let node_of_id =
@@ -204,7 +213,7 @@ struct
 
     let react_to_event time node ev =
       if verbose then
-        printf "%Ld @ %s -> %s\n" time node.id (describe_event ev);
+        printf "%Ld @ %s -> %s\n" time node.id (describe_event string_of_cmd ev);
 
       let s, actions = match ev with
           Election_timeout -> begin
@@ -261,7 +270,7 @@ struct
             schedule_heartbeat t node
         | `Send (rep_id, msg) ->
             if verbose then
-              printf " Send to %S <- %s\n" rep_id (string_of_msg msg);
+              printf " Send to %S <- %s\n" rep_id (string_of_msg string_of_cmd msg);
             (* drop message with probability msg_loss_rate *)
             if RND.float t.rng 1.0 >= msg_loss_rate then begin
               let t1 = Int64.(t.clock + t.rtt - t.rtt / 4L +
@@ -305,7 +314,12 @@ let () =
              Hashtbl.add h id q;
              q) in
 
-  let completed = ref 0 in
+  let q_to_list q =
+    Queue.fold (fun l x -> x :: l) [] q |> List.rev in
+
+  let module S = Set.Make(String) in
+
+  let completed = ref S.empty in
   let num_nodes = 3 in
   let num_cmds  = 100_000 in
   let init_cmd  = 1 in
@@ -355,9 +369,8 @@ let () =
         done
       end;
       if len >= num_cmds then begin
-        print_endline "COMPLETED";
-        completed := !completed  + 1;
-        if !completed >= num_nodes then
+        completed := S.add node_id !completed;
+        if S.cardinal !completed >= num_nodes then
           raise Exit
       end in
 
@@ -370,13 +383,26 @@ let () =
     DES.Event_queue.schedule
       ev_queue 100L (DES.random_node_id des) (DES.Command init_cmd);
     let t0    = Unix.gettimeofday () in
-    let steps = DES.simulate ~verbose:false ~msg_loss_rate on_apply des in
+    let steps = DES.simulate
+                  ~verbose:false ~string_of_cmd:string_of_int
+                  ~msg_loss_rate on_apply des in
     let dt    = Unix.gettimeofday () -. t0 in
-    let ncmds = Queue.length (get_queue (DES.random_node_id des)) in
-      printf "Replicated log lengths: %s\n"
-        (DES.node_ids des |>
-         List.map (fun id -> sprintf "%s: %d" id (Queue.length (get_queue id))) |>
-         String.concat ", ");
+    let ncmds = DES.node_ids des |>
+                List.map (fun id -> get_queue id |> Queue.length) |>
+                List.fold_left min max_int in
+    let logs  = DES.node_ids des |>
+                List.map (fun id -> get_queue id |> q_to_list |> List.take ncmds) in
+    let ok, _ = List.fold_left
+                  (fun (ok, l) l' -> match l with
+                       None -> (ok, Some l')
+                     | Some l -> (ok && l = l', Some l'))
+                  (true, None)
+                  logs
+    in
+      printf "%d commands\n" ncmds;
       printf "Simulated %d steps (%4.2f steps/cmd, %.0f steps/s, %.0f cmds/s).\n"
         steps (float steps /. float ncmds)
         (float steps /. dt) (float ncmds /. dt);
+      if ok then print_endline "OK"
+      else print_endline "FAILURE: replicated logs differ"
+
