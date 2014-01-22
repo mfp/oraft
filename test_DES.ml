@@ -30,6 +30,7 @@ sig
     | Heartbeat_timeout
     | Command of 'a
     | Message of rep_id * 'a message
+    | Func of (CLOCK.t -> unit)
 
   type 'a t
 
@@ -43,6 +44,7 @@ sig
     unit -> 'a t
 
   val random_node_id : 'a t -> rep_id
+  val node_ids       : 'a t -> rep_id list
 
   val simulate :
     ?verbose:bool ->
@@ -102,6 +104,7 @@ struct
     | Heartbeat_timeout
     | Command of 'a
     | Message of rep_id * 'a message
+    | Func of (CLOCK.t -> unit)
 
   type 'a node =
       {
@@ -143,9 +146,12 @@ struct
   let random_node_id t =
     t.nodes.(RND.int t.rng (Array.length t.nodes)).id
 
+  let node_ids t = Array.(to_list (map (fun n -> n.id) t.nodes))
+
   let string_of_msg = function
-      Request_vote { term; candidate_id; _ } ->
-        sprintf "Request_vote %S @ %Ld" candidate_id term
+      Request_vote { term; candidate_id; last_log_term; last_log_index; _ } ->
+        sprintf "Request_vote %S last_term:%Ld last_index:%Ld @ %Ld"
+          candidate_id last_log_term last_log_index term
     | Vote_result { term; vote_granted } ->
         sprintf "Vote_result %b @ %Ld" vote_granted term
     | Append_entries { term; prev_log_index; prev_log_term; entries; _ } ->
@@ -161,6 +167,7 @@ struct
     | Command cmd -> "Command"
     | Message (rep_id, msg) ->
         sprintf "Message (%S, %s)" rep_id (string_of_msg msg)
+    | Func _ -> "Func _"
 
   let schedule_election t node =
     let dt = Int64.(t.election_period - t.election_period / 4L +
@@ -206,12 +213,15 @@ struct
               | _ -> (node.state, [])
           end
         | Heartbeat_timeout -> begin
-            match node.next_election with
+            match node.next_heartbeat with
               | Some t when t = time -> C.heartbeat_timeout node.state
               | _ -> (node.state, [])
           end
         | Command c -> C.client_command c node.state
-        | Message (peer, msg) -> C.receive_msg node.state peer msg in
+        | Message (peer, msg) -> C.receive_msg node.state peer msg
+        | Func f ->
+            f time;
+            (node.state, []) in
 
       let rec exec_action = function
           `Apply cmd ->
@@ -297,7 +307,7 @@ let () =
 
   let completed = ref 0 in
   let num_nodes = 3 in
-  let num_cmds  = 200_000 in
+  let num_cmds  = 100_000 in
   let init_cmd  = 1 in
   let last_sent = ref init_cmd in
   let ev_queue  = DES.Event_queue.create () in
@@ -308,11 +318,16 @@ let () =
   let msg_loss_rate    = 0.01 in
   let batch_size       = 20 in
 
+  let retry_period = 5000L in
+
+  let applied = BatBitSet.create (num_cmds + 20) in
+
   let on_apply ~time ~leader node_id cmd =
     if cmd mod 10_000 = 0 then printf "XXXXXXXXXXXXX apply %S  %d\n%!" node_id cmd;
     let q    = get_queue node_id in
     let ()   = Queue.push cmd q in
     let len  = Queue.length q in
+      BatBitSet.set applied cmd;
       if cmd >= !last_sent then begin
       (* We schedule the next few commands being sent to the current leader
        * (simulating the client caching the current leader). *)
@@ -320,10 +335,23 @@ let () =
           for i = 1 to batch_size do
             incr last_sent;
             let cmd = !last_sent in
+            let rec schedule time =
               DES.Event_queue.schedule ev_queue
                 Int64.(time + of_int i * dt)
                 (Option.default node_id leader)
-                (DES.Command cmd)
+                (DES.Command cmd);
+              (* after the retry_period, check if the cmd has been executed
+               * and reschedule if needed *)
+              DES.Event_queue.schedule ev_queue
+                Int64.(time + retry_period)
+                (Option.default node_id leader)
+                (DES.Func
+                   (fun time ->
+                      if not (BatBitSet.mem applied cmd) then begin
+                        schedule time
+                      end))
+            in
+              schedule time
         done
       end;
       if len >= num_cmds then begin
@@ -344,6 +372,11 @@ let () =
     let t0    = Unix.gettimeofday () in
     let steps = DES.simulate ~verbose:false ~msg_loss_rate on_apply des in
     let dt    = Unix.gettimeofday () -. t0 in
+    let ncmds = Queue.length (get_queue (DES.random_node_id des)) in
+      printf "Replicated log lengths: %s\n"
+        (DES.node_ids des |>
+         List.map (fun id -> sprintf "%s: %d" id (Queue.length (get_queue id))) |>
+         String.concat ", ");
       printf "Simulated %d steps (%4.2f steps/cmd, %.0f steps/s, %.0f cmds/s).\n"
-        steps (float steps /. float !last_sent)
-        (float steps /. dt) (float !last_sent /. dt)
+        steps (float steps /. float ncmds)
+        (float steps /. dt) (float ncmds /. dt);
