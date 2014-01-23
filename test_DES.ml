@@ -277,16 +277,19 @@ struct
             unschedule_heartbeat t node;
             schedule_heartbeat t node
         | `Send (rep_id, msg) ->
-            if verbose then
-              printf " Send to %S <- %s\n" rep_id (string_of_msg string_of_cmd msg);
             (* drop message with probability msg_loss_rate *)
-            if RND.float t.rng 1.0 >= msg_loss_rate then begin
-              let dt = Int64.(t.rtt - t.rtt / 4L +
-                              of_int (RND.int t.rng (to_int t.rtt lsr 1)))
-              in
-                ignore (Event_queue.schedule t.ev_queue dt rep_id
-                          (Message (node.id, msg)))
-            end
+            let dropped = RND.float t.rng 1.0 <= msg_loss_rate in
+              if verbose then
+                printf " Send to %S <- %s%s\n" rep_id
+                  (string_of_msg string_of_cmd msg)
+                  (if dropped then " DROPPED" else "");
+              if not dropped then begin
+                let dt = Int64.(t.rtt - t.rtt / 4L +
+                                of_int (RND.int t.rng (to_int t.rtt lsr 1)))
+                in
+                  ignore (Event_queue.schedule t.ev_queue dt rep_id
+                            (Message (node.id, msg)))
+              end
       in
         node.state <- s;
         List.iter exec_action actions
@@ -358,7 +361,8 @@ let run ?(seed = 2) () =
     in () in
 
   let on_apply ~time ~leader node_id cmd =
-    if cmd mod 10_000 = 0 then printf "XXXXXXXXXXXXX apply %S  %d\n%!" node_id cmd;
+    if cmd mod 10_000 = 0 then
+      printf "XXXXXXXXXXXXX apply %S  %d  @ %Ld\n%!" node_id cmd time;
     let q    = get_queue node_id in
     let ()   = Queue.push cmd q in
     let len  = Queue.length q in
