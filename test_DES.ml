@@ -342,7 +342,7 @@ let run ?(seed = 2) () =
   let msg_loss_rate    = 0.01 in
   let batch_size       = 20 in
 
-  let retry_period = 5000L in
+  let retry_period = CLOCK.(4L * election_period) in
 
   let applied = BatBitSet.create (num_cmds + 20) in
 
