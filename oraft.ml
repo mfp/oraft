@@ -406,7 +406,7 @@ let receive_msg s peer = function
          * discovers that its term is out of date, it immediately reverts to
          * follower state." *)
         let s, actions =
-          if term > s.current_term then
+          if term > s.current_term || s.state = Candidate then
             let s = { s with current_term = term;
                              state        = Follower;
                              leader_id    = Some peer;
@@ -416,7 +416,7 @@ let receive_msg s peer = function
                     }
             in
               (s, [`Become_follower (Some peer)])
-          else (* term = s.current_term *)
+          else (* term = s.current_term && s.state <> Candidate *)
             (s, [`Reset_election_timeout])
         in
           match LOG.get_term prev_log_index s.log  with
