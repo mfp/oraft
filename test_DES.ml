@@ -6,7 +6,11 @@ module Int64  = BatInt64
 module Option = BatOption
 module RND    = Random.State
 
-module CLOCK = Int64
+module CLOCK =
+struct
+  include BatInt64
+  type delta = t
+end
 
 module type EVENT_QUEUE =
 sig
@@ -14,7 +18,7 @@ sig
   type 'a t
 
   val create     : unit -> 'a t
-  val schedule   : 'a t -> CLOCK.t -> rep_id -> 'a -> unit
+  val schedule   : 'a t -> CLOCK.delta -> rep_id -> 'a -> CLOCK.t
   val next       : 'a t -> (CLOCK.t * rep_id * 'a) option
   val is_empty   : 'a t -> bool
 end
@@ -68,6 +72,7 @@ struct
       type elm
       module M : BatHeap.H with type elem = elm
       val h : M.t ref
+      val t : CLOCK.t ref
     end
 
     type 'a m = (module PACK with type elm = 'a)
@@ -83,19 +88,23 @@ struct
                                       Int64.compare c1 c2
                                   end)
           let h = ref M.empty
+          let t = ref 0L
         end
       in
         (module P)
 
-    let schedule (type a) ((module P) : a t) t node (ev : a) =
-      P.h := P.M.add (t, node, ev) !P.h
+    let schedule (type a) ((module P) : a t) dt node (ev : a) =
+      let t = CLOCK.(!P.t + dt) in
+        P.h := P.M.add (t, node, ev) !P.h;
+        t
 
     let is_empty (type a) ((module P) : a t) = P.M.size !P.h = 0
 
     let next (type a) ((module P) : a t) =
       try
-        let x = P.M.find_min !P.h in
+        let (t, _, _) as x = P.M.find_min !P.h in
           P.h := P.M.del_min !P.h;
+          P.t := t;
           Some x
       with Invalid_argument _ -> None
   end
@@ -119,7 +128,6 @@ struct
       {
         rng              : RND.t;
         ev_queue         : 'a event Event_queue.t;
-        mutable clock    : CLOCK.t;
         nodes            : 'a node array;
         election_period  : CLOCK.t;
         heartbeat_period : CLOCK.t;
@@ -139,10 +147,9 @@ struct
         ~num_nodes
         ~election_period ~heartbeat_period ~rtt
         () =
-    let clock    = 0L in
     let node_ids = Array.init num_nodes (sprintf "n%02d") in
     let nodes    = Array.map (make_node node_ids) node_ids in
-      { rng; ev_queue; clock; election_period; heartbeat_period; rtt; nodes; }
+      { rng; ev_queue; election_period; heartbeat_period; rtt; nodes; }
 
   let random_node_id t =
     t.nodes.(RND.int t.rng (Array.length t.nodes)).id
@@ -173,22 +180,23 @@ struct
   let describe_event string_of_cmd = function
       Election_timeout -> "Election_timeout"
     | Heartbeat_timeout -> "Heartbeat_timeout"
-    | Command cmd -> "Command"
+    | Command cmd -> sprintf "Command %s"
+                       (Option.default  (fun _ -> "<cmd>") string_of_cmd cmd)
     | Message (rep_id, msg) ->
         sprintf "Message (%S, %s)" rep_id (string_of_msg string_of_cmd msg)
     | Func _ -> "Func _"
 
   let schedule_election t node =
-    let dt = Int64.(t.election_period - t.election_period / 4L +
+    let dt = CLOCK.(t.election_period - t.election_period / 4L +
                     of_int (RND.int t.rng (to_int t.election_period lsr 2))) in
-    let t1 = Int64.(t.clock + dt) in
-      node.next_election <- Some t1;
-      Event_queue.schedule t.ev_queue t1 node.id Election_timeout
+    let t1 = Event_queue.schedule t.ev_queue dt node.id Election_timeout in
+      node.next_election <- Some t1
 
   let schedule_heartbeat t node =
-    let t1 = Int64.(t.clock + t.heartbeat_period) in
-      node.next_heartbeat <- Some t1;
-      Event_queue.schedule t.ev_queue t1 node.id Heartbeat_timeout
+    let t1 = Event_queue.schedule
+               t.ev_queue t.heartbeat_period node.id Heartbeat_timeout
+    in
+      node.next_heartbeat <- Some t1
 
   let unschedule_election t node =
     node.next_election <- None
@@ -197,8 +205,8 @@ struct
     node.next_heartbeat <- None
 
   let send_cmd t node_id cmd =
-    Event_queue.schedule t.ev_queue
-      Int64.(t.clock + of_int (RND.int t.rng 100)) node_id (Command cmd)
+    ignore (Event_queue.schedule t.ev_queue
+              Int64.(of_int (RND.int t.rng 100)) node_id (Command cmd))
 
   let simulate ?(verbose = false) ?string_of_cmd ~msg_loss_rate on_apply
                ?(steps = max_int) t =
@@ -273,11 +281,11 @@ struct
               printf " Send to %S <- %s\n" rep_id (string_of_msg string_of_cmd msg);
             (* drop message with probability msg_loss_rate *)
             if RND.float t.rng 1.0 >= msg_loss_rate then begin
-              let t1 = Int64.(t.clock + t.rtt - t.rtt / 4L +
+              let dt = Int64.(t.rtt - t.rtt / 4L +
                               of_int (RND.int t.rng (to_int t.rtt lsr 1)))
               in
-                Event_queue.schedule t.ev_queue t1 rep_id
-                  (Message (node.id, msg))
+                ignore (Event_queue.schedule t.ev_queue dt rep_id
+                          (Message (node.id, msg)))
             end
       in
         node.state <- s;
@@ -295,7 +303,6 @@ struct
               None -> !steps
             | Some (time, rep_id, ev) ->
                 incr steps;
-                t.clock <- time;
                 (* we reverse evs to make sure that two simultaneous events
                  * are executed in the same order they were scheduled *)
                 react_to_event time (node_of_id rep_id) ev;
@@ -304,7 +311,7 @@ struct
       with Exit -> !steps
 end
 
-let () =
+let run ?(seed = 2) () =
   let get_queue =
     let h = Hashtbl.create 13 in
       (fun id ->
@@ -336,6 +343,20 @@ let () =
 
   let applied = BatBitSet.create (num_cmds + 20) in
 
+  let rng     = Random.State.make [| seed |] in
+
+  let des     = DES.make ~ev_queue ~rng ~num_nodes
+                  ~election_period ~heartbeat_period ~rtt () in
+
+  let rec schedule dt node cmd =
+    let _    = DES.Event_queue.schedule ev_queue dt node (DES.Command cmd) in
+    (* after the retry_period, check if the cmd has been executed
+     * and reschedule if needed *)
+    let f _  = if not (BatBitSet.mem applied cmd) then schedule 100L node cmd in
+    let _    = DES.Event_queue.schedule ev_queue
+                 CLOCK.(dt + retry_period) node (DES.Func f)
+    in () in
+
   let on_apply ~time ~leader node_id cmd =
     if cmd mod 10_000 = 0 then printf "XXXXXXXXXXXXX apply %S  %d\n%!" node_id cmd;
     let q    = get_queue node_id in
@@ -344,29 +365,15 @@ let () =
       BatBitSet.set applied cmd;
       if cmd >= !last_sent then begin
       (* We schedule the next few commands being sent to the current leader
-       * (simulating the client caching the current leader). *)
-        let dt = Int64.(heartbeat_period - 10L) in
+       * (simulating the client caching the current leader).  *)
+        let dt = CLOCK.(heartbeat_period - 10L) in
           for i = 1 to batch_size do
             incr last_sent;
             let cmd = !last_sent in
-            let rec schedule time =
-              DES.Event_queue.schedule ev_queue
-                Int64.(time + of_int i * dt)
+              schedule CLOCK.(of_int i * dt)
                 (Option.default node_id leader)
-                (DES.Command cmd);
-              (* after the retry_period, check if the cmd has been executed
-               * and reschedule if needed *)
-              DES.Event_queue.schedule ev_queue
-                Int64.(time + retry_period)
-                (Option.default node_id leader)
-                (DES.Func
-                   (fun time ->
-                      if not (BatBitSet.mem applied cmd) then begin
-                        schedule time
-                      end))
-            in
-              schedule time
-        done
+                cmd
+          done
       end;
       if len >= num_cmds then begin
         completed := S.add node_id !completed;
@@ -374,35 +381,39 @@ let () =
           raise Exit
       end in
 
-  let rng = Random.State.make [| 2 |] in
-
-  let des = DES.make ~ev_queue ~rng ~num_nodes
-              ~election_period ~heartbeat_period ~rtt ()
-  in
-    (* schedule init cmd delivery *)
-    DES.Event_queue.schedule
-      ev_queue 100L (DES.random_node_id des) (DES.Command init_cmd);
-    let t0    = Unix.gettimeofday () in
-    let steps = DES.simulate
-                  ~verbose:false ~string_of_cmd:string_of_int
-                  ~msg_loss_rate on_apply des in
-    let dt    = Unix.gettimeofday () -. t0 in
-    let ncmds = DES.node_ids des |>
-                List.map (fun id -> get_queue id |> Queue.length) |>
-                List.fold_left min max_int in
-    let logs  = DES.node_ids des |>
-                List.map (fun id -> get_queue id |> q_to_list |> List.take ncmds) in
-    let ok, _ = List.fold_left
-                  (fun (ok, l) l' -> match l with
-                       None -> (ok, Some l')
-                     | Some l -> (ok && l = l', Some l'))
-                  (true, None)
-                  logs
+  (* schedule init cmd delivery *)
+  let ()    = schedule 1000L (DES.random_node_id des) init_cmd in
+  let t0    = Unix.gettimeofday () in
+  let steps = DES.simulate
+                ~verbose:false ~string_of_cmd:string_of_int
+                ~msg_loss_rate on_apply des in
+  let dt    = Unix.gettimeofday () -. t0 in
+  let ncmds = DES.node_ids des |>
+              List.map (fun id -> get_queue id |> Queue.length) |>
+              List.fold_left min max_int in
+  let logs  = DES.node_ids des |>
+              List.map (fun id -> get_queue id |> q_to_list |> List.take ncmds) in
+  let ok, _ = List.fold_left
+                (fun (ok, l) l' -> match l with
+                     None -> (ok, Some l')
+                   | Some l -> (ok && l = l', Some l'))
+                (true, None)
+                logs
     in
       printf "%d commands\n" ncmds;
       printf "Simulated %d steps (%4.2f steps/cmd, %.0f steps/s, %.0f cmds/s).\n"
         steps (float steps /. float ncmds)
         (float steps /. dt) (float ncmds /. dt);
-      if ok then print_endline "OK"
-      else print_endline "FAILURE: replicated logs differ"
+      if ok then
+        print_endline "OK"
+      else begin
+        print_endline "FAILURE: replicated logs differ";
+        exit 1;
+      end
 
+let () =
+  for i = 1 to 100 do
+    print_endline "";
+    printf "Running with seed %d\n%!" i;
+    run ~seed:i ()
+  done
