@@ -4,6 +4,7 @@ open Lwt
 module Map    = BatMap
 module List   = BatList
 module Option = BatOption
+module Array  = BatArray
 
 module Kernel =
 struct
@@ -214,7 +215,7 @@ end
 
 include Kernel
 
-let quorum s = Array.length s.peers / 2 + 1
+let quorum s = (1 + Array.length s.peers) / 2 + 1
 
 let vote_result s vote_granted =
   Vote_result { term = s.current_term; vote_granted; }
@@ -233,18 +234,39 @@ let update_commit_index s =
   (* Find last N such that log[N].term = current term AND
    * a majority of peers has got  match_index[peer] >= N. *)
   (* We compute it as follows: get all the match_index, sort them,
-   * and get the (quorum - 1)-nth (not quorum-nth because the current leader
-   * also counts).*)
+   * and get the (M - quorum + 1)-nth as the commit index candidate, where M
+   * is the number of peers: this guarantees that a majority of all nodes
+   * (including the current leader) have least all entries up to N.
+   *
+   * Sample index computation and commit index candidates:
+   *  [1; 2; 3; 4; 5; 6] -> 4 idx 3   quorum 4    7-4
+   *  [1; 2; 3; 4; 5] -> 3    idx 2   quorum 4    6-4
+   *  [1; 2; 3; 4] -> 3       idx 2   quorum 3    5-3
+   *  [1; 2; 3] -> 2          idx 1   quorum 3    4-3
+   *  [1; 2] -> 2             idx 1   quorum 2    3-2
+   *  [1] -> 1                idx 0   quorum 2    2-2
+   *
+   * E.g., M = 3 nodes, quorum = 2, with sorted match_index array like
+   *   [ 1; 2 ]
+   * we take the  (3 - 2 + 1) = 2nd element (index 1 = 3 - 2 = M - quorum).
+   *
+   * The new commit index candidate is N = 2: if it fulfills the 2nd criterion
+   * ("restriction on commitment"), we can consider entries up to (including)
+   * 2 committed, since it's replicated in the leader plus another node.
+   *
+   * *)
   let sorted = RM.bindings s.match_index |> List.map snd |>
                List.sort Int64.compare in
+
   let index  =
     try
-      List.nth sorted (quorum s - 1)
-    with Not_found ->
+      List.nth sorted (Array.length s.peers + 1 - quorum s)
+    with Invalid_argument _ | Not_found ->
       s.commit_index in
 
-  (* index is the largest N such that a majority of match_Index[peer] >= N;
-   * we have to enforce the other restriction: log[N].term = current *)
+  (* index is the largest N such that at least half of the peers have
+   * match_Index[peer] >= N; we have to enforce the other restriction:
+   * log[N].term = current *)
   let commit_index' =
     try
       let rec search_commit_index idx =
@@ -552,7 +574,8 @@ struct
   include Types
 
   let make ~id ~current_term ~voted_for ~log ~peers () =
-    let log = LOG.of_list ~init_index:0L ~init_term:current_term log in
+    let log   = LOG.of_list ~init_index:0L ~init_term:current_term log in
+    let peers = Array.filter ((<>) id) peers in
       {
         current_term; voted_for; log; id; peers;
         state        = Follower;
@@ -664,7 +687,8 @@ struct
         election_timeout;
         heartbeat;
         peers         = List.fold_left
-                          (fun m (k, v) -> RM.add k v m) RM.empty peers;
+                          (fun m (k, v) -> RM.add k v m) RM.empty
+                          (List.filter (fun (id, _) -> id <> state.id) peers);
         next_req_id   = 42L;
         conns         = RM.empty;
         running       = true;
