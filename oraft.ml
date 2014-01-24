@@ -268,15 +268,9 @@ let update_commit_index s =
    * match_Index[peer] >= N; we have to enforce the other restriction:
    * log[N].term = current *)
   let commit_index' =
-    try
-      let rec search_commit_index idx =
-        match LOG.get_term idx s.log with
-            None -> raise Not_found
-          | Some term when term = s.current_term -> idx
-          | _ -> raise Not_found
-      in
-        search_commit_index index
-    with Not_found -> s.commit_index in
+    match LOG.get_term index s.log with
+      | Some term when term = s.current_term -> index
+      | _ -> s.commit_index in
 
   (* increate monotonically *)
   let commit_index = max s.commit_index commit_index' in
