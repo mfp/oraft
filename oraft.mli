@@ -39,9 +39,11 @@ sig
     leader_id : rep_id;
     prev_log_index : index;
     prev_log_term : term;
-    entries : (index * ('a * term)) list;
+    entries : (index * ('a entry * term)) list;
     leader_commit : index;
   }
+
+  and 'a entry = Nop | Op of 'a
 
   and append_result = {
     term : term;
@@ -69,7 +71,7 @@ sig
 
   val make :
     id:rep_id -> current_term:term -> voted_for:rep_id option ->
-    log:(index * 'a * term) list -> peers:rep_id array -> unit -> 'a state
+    log:(index * 'a entry * term) list -> peers:rep_id array -> unit -> 'a state
 
   val leader_id : 'a state -> rep_id option
 

@@ -135,7 +135,7 @@ struct
         (* persistent *)
         current_term : term;
         voted_for    : rep_id option;
-        log          : 'a LOG.t;
+        log          : 'a entry LOG.t;
         id           : rep_id;
         peers        : rep_id array;
 
@@ -152,6 +152,8 @@ struct
 
         votes : RS.t;
       }
+
+  and 'a entry = Nop | Op of 'a
 
   type 'a message =
       Request_vote of request_vote
@@ -179,7 +181,7 @@ struct
       leader_id : rep_id;
       prev_log_index : index;
       prev_log_term : term;
-      entries : (index * ('a * term)) list;
+      entries : (index * ('a entry * term)) list;
       leader_commit : index;
     }
 
@@ -283,11 +285,15 @@ let try_commit s =
       (s, [])
     else
       let s       = { s with last_applied = s.commit_index } in
-      let actions = List.map (fun (_, (x, _)) -> `Apply x)
-                      (LOG.get_range
-                         ~from_inclusive:(Int64.succ prev)
-                         ~to_inclusive:s.commit_index
-                         s.log)
+      let entries = LOG.get_range
+                      ~from_inclusive:(Int64.succ prev)
+                      ~to_inclusive:s.commit_index
+                      s.log in
+      let actions = List.filter_map
+                      (function
+                           (_, (Op x, _)) -> Some (`Apply x)
+                         | (_, (Nop, _)) -> None)
+                      entries
       in (s, actions)
 
 let heartbeat s =
@@ -454,24 +460,45 @@ let receive_msg s peer = function
           else
             (* become leader! *)
 
-            (* "When a leader first comes to power, it initializes all
-             * nextIndex values to the index just after the last one in its
-             * log" *)
-            let next_idx    = LOG.last_index s.log |> snd |> Int64.succ in
+            (* So as to have the leader know which entries are committed
+             * (one of the 2 requirements to support read-only operations in
+             * the leader, the other being making sure it's still the leader
+             * with a hearbeat exchange), we have it commit a blank no-op
+             * entry at the start of its term, which also serves as the
+             * initial heartbeat *)
+            let log         = LOG.append ~term:s.current_term Nop s.log in
+
+
+            (* With a regular (empty) hearbeat, this applies:
+             *   "When a leader first comes to power, it initializes all
+             *   nextIndex values to the index just after the last one in its
+             *   log"
+             * However, in this case we want to send the Nop too.
+             * *)
+            let next_idx    = LOG.last_index log |> snd in
             let next_index  = Array.fold_left
                                 (fun m peer -> RM.add peer next_idx m)
                                 RM.empty s.peers in
             let match_index = Array.fold_left
                                 (fun m peer -> RM.add peer 0L m)
                                 RM.empty s.peers in
-            let s     = { s with next_index; match_index;
+            let s     = { s with log; next_index; match_index;
                                  state     = Leader;
                                  leader_id = Some s.id;
                         } in
-            (* "Upon election: send initial empty AppendEntries RPCs
-             * (heartbeat) to each server; repeat during idle periods to
-             * prevent election timeouts" *)
-            let sends = broadcast s (heartbeat s) in
+            (* This heartbeat is replaced by the broadcast of the no-op
+             * explained above:
+             *
+              (* "Upon election: send initial empty AppendEntries RPCs
+               * (heartbeat) to each server; repeat during idle periods to
+               * prevent election timeouts" *)
+              let sends = broadcast s (heartbeat s) in
+            *)
+            let msg   = send_entries s next_idx in
+            let sends = Array.to_list s.peers |>
+                        List.filter_map
+                          (fun peer -> Option.map (fun m -> `Send (peer, m)) msg)
+            in
               (s, (`Become_leader :: sends))
 
   | Append_result { term; _ } when term < s.current_term || s.state <> Leader ->
@@ -542,7 +569,7 @@ let heartbeat_timeout s = match s.state with
 let client_command x s = match s.state with
     Follower | Candidate -> (s, [`Redirect (s.leader_id, x)])
   | Leader ->
-      let log     = LOG.append ~term:s.current_term x s.log in
+      let log     = LOG.append ~term:s.current_term (Op x) s.log in
       let s       = { s with log; } in
       let actions = Array.to_list s.peers |>
                     List.filter_map

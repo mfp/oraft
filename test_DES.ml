@@ -163,12 +163,15 @@ struct
     | Vote_result { term; vote_granted } ->
         sprintf "Vote_result %b @ %Ld" vote_granted term
     | Append_entries { term; prev_log_index; prev_log_term; entries; _ } ->
+        let string_of_entry = function
+            Nop -> "Nop"
+          | Op cmd -> "Op" ^ Option.default (fun _ -> "<cmd>") string_of_cmd cmd in
         let payload_desc =
           entries |>
           List.map
-            (fun (index, (cmd, term)) ->
+            (fun (index, (entry, term)) ->
                sprintf "(%Ld, %s, %Ld)" index
-                 (Option.default (fun _ -> "<cmd>") string_of_cmd cmd) term) |>
+                 (string_of_entry entry) term) |>
           String.concat ", "
         in
           sprintf "Append_entries (%Ld, %Ld, [%s]) @ %Ld"
