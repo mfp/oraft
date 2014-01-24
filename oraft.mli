@@ -74,6 +74,8 @@ sig
     log:(index * 'a entry * term) list -> peers:rep_id array -> unit -> 'a state
 
   val leader_id : 'a state -> rep_id option
+  val id        : 'a state -> rep_id
+  val status    : 'a state -> status
 
   val receive_msg :
     'a state -> rep_id -> 'a message -> 'a state * 'a action list
@@ -83,50 +85,4 @@ sig
   val heartbeat_timeout : 'a state -> 'a state * 'a action list
 
   val client_command    : 'a -> 'a state -> 'a state * 'a action list
-end
-
-module type LWTIO =
-sig
-  open Types
-
-  type address
-  type op
-  type connection
-
-  val connect : address -> connection option Lwt.t
-  val send    : connection -> (req_id * op) message -> bool Lwt.t
-  val receive : connection -> (req_id * op) message option Lwt.t
-  val abort   : connection -> unit Lwt.t
-end
-
-module type LWTPROC =
-sig
-  type op
-  type resp
-
-  val execute : op -> (resp, exn) Types.result Lwt.t
-end
-
-module Lwt_server :
-  functor(PROC : LWTPROC) ->
-  functor(IO : LWTIO with type op = PROC.op) ->
-sig
-  open Types
-
-  type server
-
-  type result =
-      [ `OK of PROC.resp
-      | `Error of exn
-      | `Redirect of rep_id * IO.address
-      | `Redirect_randomized of rep_id * IO.address
-      | `Retry_later
-      ]
-
-  val make : ?election_period:float -> ?heartbeat_period:float ->
-    (req_id * IO.op) Core.state -> (rep_id * IO.address) list -> server
-
-  val run     : server -> unit Lwt.t
-  val abort   : server -> unit Lwt.t
-  val execute : server -> PROC.op -> result Lwt.t
 end

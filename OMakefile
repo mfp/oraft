@@ -17,6 +17,14 @@ if $(not $(OCAMLFIND_EXISTS))
    eprintln(You need to install ocamlfind and run "omake --configure".)
    exit 1
 
-.DEFAULT: $(OCamlLibrary oraft, oraft) $(OCamlProgram test_DES, oraft test_DES)
+OBJECTS[] =
+    oraft
+    oraft_lwt
+
+LIBS     = $(OCamlLibrary oraft, $(OBJECTS))
+
+PROGRAMS = $(OCamlProgram test_DES, oraft test_DES)
+
+.DEFAULT: $(LIBS) $(PROGRAMS)
 
 # vim: set expandtab:
