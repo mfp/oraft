@@ -153,27 +153,27 @@ struct
       make_thread 5
 
   let rec exec_action t : _ action -> unit Lwt.t = function
-    | `Reset_election_timeout ->
+    | Reset_election_timeout ->
         t.election_timeout <- (Lwt_unix.sleep t.election_period >>
                                return Election_timeout);
         return ()
-    | `Reset_heartbeat ->
+    | Reset_heartbeat ->
         t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period >>
                         return Heartbeat_timeout);
         return ()
-    | `Become_candidate
-    | `Become_follower None ->
+    | Become_candidate
+    | Become_follower None ->
         t.heartbeat <- fst (Lwt.wait ());
-        exec_action t `Reset_election_timeout
-    | `Become_follower (Some _) ->
+        exec_action t Reset_election_timeout
+    | Become_follower (Some _) ->
         Lwt_condition.broadcast t.leader_signal ();
         t.heartbeat <- fst (Lwt.wait ());
-        exec_action t `Reset_election_timeout
-    | `Become_leader ->
+        exec_action t Reset_election_timeout
+    | Become_leader ->
         Lwt_condition.broadcast t.leader_signal ();
         t.election_timeout  <- fst (Lwt.wait ());
-        exec_action t `Reset_heartbeat
-    | `Apply (req_id, op) ->
+        exec_action t Reset_heartbeat
+    | Apply (req_id, op) ->
         (* TODO: allow to run this in parallel with rest RAFT algorithm.
          * Must make sure that Apply actions are not reordered. *)
         lwt resp = try_lwt PROC.execute op
@@ -185,14 +185,14 @@ struct
               return ()
           with _ -> return ()
         end
-    | `Redirect (rep_id, (req_id, _)) -> begin
+    | Redirect (rep_id, (req_id, _)) -> begin
         try_lwt
           let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
             Lwt.wakeup_later u (Redirect rep_id);
             return ()
         with _ -> return ()
       end
-    | `Send (rep_id, msg) ->
+    | Send (rep_id, msg) ->
         (* we allow to run this in parallel with rest RAFT algorithm.
          * It's OK to reorder sends. *)
         (* TODO: limit the number of msgs in outboung queue.

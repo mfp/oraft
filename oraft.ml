@@ -204,15 +204,14 @@ struct
     }
 
   type 'a action =
-      [ `Apply of 'a
-      | `Become_candidate
-      | `Become_follower of rep_id option
-      | `Become_leader
-      | `Reset_election_timeout
-      | `Reset_heartbeat
-      | `Redirect of rep_id option * 'a
-      | `Send of rep_id * 'a message
-      ]
+      Apply of 'a
+    | Become_candidate
+    | Become_follower of rep_id option
+    | Become_leader
+    | Redirect of rep_id option * 'a
+    | Reset_election_timeout
+    | Reset_heartbeat
+    | Send of rep_id * 'a message
 end
 
 include Kernel
@@ -291,7 +290,7 @@ let try_commit s =
                       s.log in
       let actions = List.filter_map
                       (function
-                           (_, (Op x, _)) -> Some (`Apply x)
+                           (_, (Op x, _)) -> Some (Apply x)
                          | (_, (Nop, _)) -> None)
                       entries
       in (s, actions)
@@ -323,13 +322,13 @@ let send_entries s from =
 let broadcast s msg =
   Array.to_list s.peers |>
   List.filter_map
-    (fun p -> if p = s.id then None else Some (`Send (p, msg)))
+    (fun p -> if p = s.id then None else Some (Send (p, msg)))
 
 let receive_msg s peer = function
   (* " If a server receives a request with a stale term number, it rejects the
    * request." *)
   | Request_vote { term; _ } when term < s.current_term ->
-      (s, [`Send (peer, vote_result s false)])
+      (s, [Send (peer, vote_result s false)])
 
   (* "Current terms are exchanged whenever servers communicate; if one
    * server’s current term is smaller than the other, then it updates its
@@ -341,7 +340,7 @@ let receive_msg s peer = function
       let s = { s with current_term = term;
                        voted_for    = None;
                        state        = Follower }
-      in (s, [`Become_follower None])
+      in (s, [Become_follower None])
 
   | Request_vote { term; candidate_id; last_log_index; last_log_term; }
       when term > s.current_term ->
@@ -364,18 +363,18 @@ let receive_msg s peer = function
          * more up-to-date."
          * *)
         if (last_log_term, last_log_index) < LOG.last_index s.log then
-          (s, [`Become_follower None; `Send (peer, vote_result s false)])
+          (s, [Become_follower None; Send (peer, vote_result s false)])
         else
           let s = { s with voted_for = Some candidate_id } in
-            (s, [`Become_follower None; `Send (peer, vote_result s true)])
+            (s, [Become_follower None; Send (peer, vote_result s true)])
 
   | Request_vote { term; candidate_id; last_log_index; last_log_term; } -> begin
       (* case term = current_term *)
       match s.state, s.voted_for with
           _, Some candidate when candidate <> candidate_id ->
-            (s, [`Send (peer, vote_result s false)])
+            (s, [Send (peer, vote_result s false)])
         | (Candidate | Leader), _ ->
-            (s, [`Send (peer, vote_result s false)])
+            (s, [Send (peer, vote_result s false)])
         | Follower, _ (* None or Some candidate equal to candidate_id *) ->
             (* "If votedFor is null or candidateId, and candidate's log is at
              * least as up-to-date as receiver’s log, grant vote"
@@ -388,16 +387,16 @@ let receive_msg s peer = function
              * more up-to-date."
              * *)
             if (last_log_term, last_log_index) < LOG.last_index s.log then
-              (s, [`Send (peer, vote_result s false)])
+              (s, [Send (peer, vote_result s false)])
             else
               let s = { s with voted_for = Some candidate_id } in
-                (s, [`Send (peer, vote_result s true)])
+                (s, [Send (peer, vote_result s true)])
     end
 
   (* " If a server receives a request with a stale term number, it rejects the
    * request." *)
   | Append_entries { term; prev_log_index; _ } when term < s.current_term ->
-      (s, [`Send (peer, append_fail ~prev_log_index s)])
+      (s, [Send (peer, append_fail ~prev_log_index s)])
   | Append_entries
       { term; prev_log_index; prev_log_term; entries; leader_commit; } -> begin
         (* "Current terms are exchanged whenever servers communicate; if one
@@ -415,15 +414,15 @@ let receive_msg s peer = function
                              voted_for    = Some peer;
                     }
             in
-              (s, [`Become_follower (Some peer)])
+              (s, [Become_follower (Some peer)])
           else (* term = s.current_term && s.state <> Candidate *)
-            (s, [`Reset_election_timeout])
+            (s, [Reset_election_timeout])
         in
           match LOG.get_term prev_log_index s.log  with
               None ->
-                (s, `Send (peer, append_fail ~prev_log_index s) :: actions)
+                (s, Send (peer, append_fail ~prev_log_index s) :: actions)
             | Some term' when prev_log_term <> term' ->
-                (s, `Send (peer, append_fail ~prev_log_index s) :: actions)
+                (s, Send (peer, append_fail ~prev_log_index s) :: actions)
             | _ ->
                 let log          = LOG.append_many entries s.log in
                 let last_index   = snd (LOG.last_index log) in
@@ -437,7 +436,7 @@ let receive_msg s peer = function
                                             leader_id = Some peer; } in
                 let s, commits   = try_commit s in
                 let actions      = List.concat
-                                     [ [`Send (peer, reply)];
+                                     [ [Send (peer, reply)];
                                        commits;
                                        actions ]
                 in
@@ -497,9 +496,9 @@ let receive_msg s peer = function
             let msg   = send_entries s next_idx in
             let sends = Array.to_list s.peers |>
                         List.filter_map
-                          (fun peer -> Option.map (fun m -> `Send (peer, m)) msg)
+                          (fun peer -> Option.map (fun m -> Send (peer, m)) msg)
             in
-              (s, (`Become_leader :: sends))
+              (s, (Become_leader :: sends))
 
   | Append_result { term; _ } when term < s.current_term || s.state <> Leader ->
       (s, [])
@@ -528,7 +527,7 @@ let receive_msg s peer = function
                 (* FIXME *)
                 (s, [])
             | Some msg ->
-                (s, [`Send (peer, msg)])
+                (s, [Send (peer, msg)])
       end
 
 let election_timeout s = match s.state with
@@ -559,15 +558,15 @@ let election_timeout s = match s.state with
                             last_log_term = term_;
                           } in
       let sends       = broadcast s msg in
-        (s, (`Become_candidate :: sends))
+        (s, (Become_candidate :: sends))
 
 let heartbeat_timeout s = match s.state with
     Follower | Candidate -> (s, [])
   | Leader ->
-      (s, (`Reset_heartbeat :: broadcast s (heartbeat s)))
+      (s, (Reset_heartbeat :: broadcast s (heartbeat s)))
 
 let client_command x s = match s.state with
-    Follower | Candidate -> (s, [`Redirect (s.leader_id, x)])
+    Follower | Candidate -> (s, [Redirect (s.leader_id, x)])
   | Leader ->
       let log     = LOG.append ~term:s.current_term (Op x) s.log in
       let s       = { s with log; } in
@@ -579,10 +578,10 @@ let client_command x s = match s.state with
                                (* FIXME: should send snapshot if cannot send
                                 * log *)
                                None
-                           | Some msg -> Some (`Send (peer, msg))) in
+                           | Some msg -> Some (Send (peer, msg))) in
       let actions = match actions with
                       | [] -> []
-                      | l -> `Reset_heartbeat :: actions
+                      | l -> Reset_heartbeat :: actions
       in
         (s, actions)
 

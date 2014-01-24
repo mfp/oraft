@@ -244,42 +244,42 @@ struct
             (node.state, []) in
 
       let rec exec_action = function
-          `Apply cmd ->
+          Apply cmd ->
             if verbose then printf " Apply\n";
             (* simulate current leader being cached by client *)
             on_apply ~time ~leader:(C.leader_id node.state) node.id cmd
-        | `Become_candidate ->
+        | Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat t node;
-            exec_action `Reset_election_timeout
-        | `Become_follower None ->
+            exec_action Reset_election_timeout
+        | Become_follower None ->
             if verbose then printf " Become_follower\n";
             unschedule_heartbeat t node;
-            exec_action `Reset_election_timeout
-        | `Become_follower (Some leader) ->
+            exec_action Reset_election_timeout
+        | Become_follower (Some leader) ->
             if verbose then printf " Become_follower %S\n" leader;
             unschedule_heartbeat t node;
-            exec_action `Reset_election_timeout
-        | `Become_leader ->
+            exec_action Reset_election_timeout
+        | Become_leader ->
             if verbose then printf " Become_leader\n";
             unschedule_election t node;
             schedule_heartbeat t node
-        | `Redirect (Some leader, cmd) ->
+        | Redirect (Some leader, cmd) ->
             if verbose then printf " Redirect %s\n" leader;
             send_cmd ~dst:leader cmd
-        | `Redirect (None, cmd) ->
+        | Redirect (None, cmd) ->
             if verbose then printf " Redirect\n";
             (* send to a random server *)
             send_cmd cmd
-        | `Reset_election_timeout ->
+        | Reset_election_timeout ->
             if verbose then printf " Reset_election_timeout\n";
             unschedule_election t node;
             schedule_election t node
-        | `Reset_heartbeat ->
+        | Reset_heartbeat ->
             if verbose then printf " Reset_heartbeat\n";
             unschedule_heartbeat t node;
             schedule_heartbeat t node
-        | `Send (rep_id, msg) ->
+        | Send (rep_id, msg) ->
             (* drop message with probability msg_loss_rate *)
             let dropped = RND.float t.rng 1.0 <= msg_loss_rate in
               if verbose then
