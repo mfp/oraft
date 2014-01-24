@@ -574,14 +574,12 @@ let client_command x s = match s.state with
       let actions = Array.to_list s.peers |>
                     List.filter_map
                       (fun peer ->
-                         if peer = s.id then None
-                         else
-                           match send_entries s (RM.find peer s.next_index) with
-                               None ->
-                                 (* FIXME: should send snapshot if cannot send
-                                  * log *)
-                                 None
-                             | Some msg -> Some (`Send (peer, msg))) in
+                         match send_entries s (RM.find peer s.next_index) with
+                             None ->
+                               (* FIXME: should send snapshot if cannot send
+                                * log *)
+                               None
+                           | Some msg -> Some (`Send (peer, msg))) in
       let actions = match actions with
                       | [] -> []
                       | l -> `Reset_heartbeat :: actions
