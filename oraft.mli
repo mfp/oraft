@@ -81,6 +81,10 @@ sig
   val id        : 'a state -> rep_id
   val status    : 'a state -> status
 
+  val last_index : 'a state -> index
+  val last_term  : 'a state -> term
+  val config     : 'a state -> config
+
   val receive_msg :
     'a state -> rep_id -> 'a message -> 'a state * 'a action list
 

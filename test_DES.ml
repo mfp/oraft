@@ -5,6 +5,7 @@ module Map    = BatMap
 module Int64  = BatInt64
 module Option = BatOption
 module RND    = Random.State
+module C      = Oraft.Core
 
 module CLOCK =
 struct
@@ -55,16 +56,12 @@ sig
     ?verbose:bool ->
     ?string_of_cmd:('a -> string) ->
     msg_loss_rate:float ->
-    (time:Int64.t ->
-     leader:Oraft.Types.rep_id option ->
-     Oraft.Types.rep_id -> 'a -> unit) ->
-    (rep_id -> index -> 'b * [`Term of term] * [`Index of index]) ->
-    (rep_id -> 'b -> unit) ->
+    (time:Int64.t -> 'a C.state -> 'a -> unit) ->
+    ('a C.state -> 'b * [`Term of term] * [`Index of index]) ->
+    ('a C.state -> 'b -> unit) ->
      ?steps:int -> ('a, 'b) t -> int
 end =
 struct
-  module C   = Oraft.Core
-
   open Oraft.Types
 
   module Event_queue =
@@ -253,7 +250,7 @@ struct
             let s, accepted = C.install_snapshot
                                 ~last_term ~last_index ~config node.state
             in
-              if accepted then apply_snapshot node.id snapshot;
+              if accepted then apply_snapshot node.state snapshot;
               (s, [])
       in
 
@@ -261,7 +258,7 @@ struct
           Apply cmd ->
             if verbose then printf " Apply\n";
             (* simulate current leader being cached by client *)
-            on_apply ~time ~leader:(C.leader_id node.state) node.id cmd
+            on_apply ~time node.state cmd
         | Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat t node;
@@ -309,7 +306,7 @@ struct
               end
         | Send_snapshot (dst, idx, config) ->
             let snapshot, `Term last_term, `Index last_index =
-              take_snapshot node.id idx in
+              take_snapshot node.state in
             let dt = Int64.(t.rtt - t.rtt / 4L +
                        of_int (RND.int t.rng (to_int t.rtt lsr 1)))
             in
@@ -389,10 +386,11 @@ let run ?(seed = 2) () =
                  CLOCK.(dt + retry_period) node (DES.Func f)
     in () in
 
-  let on_apply ~time ~leader node_id cmd =
+  let on_apply ~time s cmd =
     if cmd mod 10_000 = 0 then
-      printf "XXXXXXXXXXXXX apply %S  %d  @ %Ld\n%!" node_id cmd time;
-    let q    = get_queue node_id in
+      printf "XXXXXXXXXXXXX apply %S  %d  @ %Ld\n%!" (C.id s) cmd time;
+    let id   = C.id s in
+    let q    = get_queue id in
     let ()   = Queue.push cmd q in
     let len  = Queue.length q in
       BatBitSet.set applied cmd;
@@ -403,13 +401,12 @@ let run ?(seed = 2) () =
           for i = 1 to batch_size do
             incr last_sent;
             let cmd = !last_sent in
-              schedule CLOCK.(of_int i * dt)
-                (Option.default node_id leader)
-                cmd
+              schedule
+                CLOCK.(of_int i * dt) (Option.default id (C.leader_id s)) cmd
           done
       end;
       if len >= num_cmds then begin
-        completed := S.add node_id !completed;
+        completed := S.add id !completed;
         if S.cardinal !completed >= num_nodes then
           raise Exit
       end in
@@ -420,8 +417,8 @@ let run ?(seed = 2) () =
   let steps = DES.simulate
                 ~verbose:false ~string_of_cmd:string_of_int
                 ~msg_loss_rate on_apply
-                (fun id idx -> failwith "snapshot not implemented")
-                (fun id snapshot -> ())
+                (fun state -> failwith "snapshot not implemented")
+                (fun state snapshot -> ())
                 des in
   let dt    = Unix.gettimeofday () -. t0 in
   let ncmds = DES.node_ids des |>

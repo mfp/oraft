@@ -700,6 +700,9 @@ struct
 
   let id s     = s.id
   let status s = s.state
+  let last_index s = snd (LOG.last_index s.log)
+  let last_term s  = fst (LOG.last_index s.log)
+  let config s     = Array.append [| s.id |] s.peers
 
   let receive_msg       = receive_msg
   let election_timeout  = election_timeout
