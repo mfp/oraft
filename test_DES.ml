@@ -29,26 +29,27 @@ sig
 
   module Event_queue : EVENT_QUEUE
 
-  type 'a event =
+  type ('a, 'b) event =
     | Election_timeout
     | Heartbeat_timeout
     | Command of 'a
     | Message of rep_id * 'a message
     | Func of (CLOCK.t -> unit)
+    | Install_snapshot of 'b * term * index * config
 
-  type 'a t
+  type ('a, 'b) t
 
   val make :
     ?rng:RND.t ->
-    ?ev_queue:'a event Event_queue.t ->
+    ?ev_queue:('a, 'b) event Event_queue.t ->
     num_nodes:int ->
     election_period:CLOCK.t ->
     heartbeat_period:CLOCK.t ->
     rtt:CLOCK.t ->
-    unit -> 'a t
+    unit -> ('a, 'b) t
 
-  val random_node_id : 'a t -> rep_id
-  val node_ids       : 'a t -> rep_id list
+  val random_node_id : (_, _) t -> rep_id
+  val node_ids       : (_, _) t -> rep_id list
 
   val simulate :
     ?verbose:bool ->
@@ -57,7 +58,9 @@ sig
     (time:Int64.t ->
      leader:Oraft.Types.rep_id option ->
      Oraft.Types.rep_id -> 'a -> unit) ->
-     ?steps:int -> 'a t -> int
+    (rep_id -> index -> 'b * [`Term of term] * [`Index of index]) ->
+    (rep_id -> 'b -> unit) ->
+     ?steps:int -> ('a, 'b) t -> int
 end =
 struct
   module C   = Oraft.Core
@@ -109,12 +112,13 @@ struct
       with Invalid_argument _ -> None
   end
 
-  type 'a event =
+  type ('a, 'b) event =
     | Election_timeout
     | Heartbeat_timeout
     | Command of 'a
     | Message of rep_id * 'a message
     | Func of (CLOCK.t -> unit)
+    | Install_snapshot of 'b * term * index * config
 
   type 'a node =
       {
@@ -124,20 +128,20 @@ struct
         mutable next_election  : CLOCK.t option;
       }
 
-  type 'a t =
+  type ('a, 'b) t =
       {
         rng              : RND.t;
-        ev_queue         : 'a event Event_queue.t;
+        ev_queue         : ('a, 'b) event Event_queue.t;
         nodes            : 'a node array;
         election_period  : CLOCK.t;
         heartbeat_period : CLOCK.t;
         rtt              : CLOCK.t;
       }
 
-  let make_node peers id =
+  let make_node config id =
     let state = C.make
                   ~id ~current_term:0L ~voted_for:None
-                  ~log:[] ~peers ()
+                  ~log:[] ~config ()
     in
       { id; state; next_heartbeat = None; next_election = None }
 
@@ -188,6 +192,8 @@ struct
     | Message (rep_id, msg) ->
         sprintf "Message (%S, %s)" rep_id (string_of_msg string_of_cmd msg)
     | Func _ -> "Func _"
+    | Install_snapshot (_, term, index, config) ->
+        sprintf "Install_snapshot (_, %Ld, %Ld, _)" term index
 
   let schedule_election t node =
     let dt = CLOCK.(t.election_period - t.election_period / 4L +
@@ -211,8 +217,9 @@ struct
     ignore (Event_queue.schedule t.ev_queue
               Int64.(of_int (RND.int t.rng 100)) node_id (Command cmd))
 
-  let simulate ?(verbose = false) ?string_of_cmd ~msg_loss_rate on_apply
-               ?(steps = max_int) t =
+  let simulate
+        ?(verbose = false) ?string_of_cmd ~msg_loss_rate on_apply
+        take_snapshot apply_snapshot ?(steps = max_int) t =
 
     let node_of_id =
       let h = Hashtbl.create 13 in
@@ -241,7 +248,14 @@ struct
         | Message (peer, msg) -> C.receive_msg node.state peer msg
         | Func f ->
             f time;
-            (node.state, []) in
+            (node.state, [])
+        | Install_snapshot (snapshot, last_term, last_index, config) ->
+            let s, accepted = C.install_snapshot
+                                ~last_term ~last_index ~config node.state
+            in
+              if accepted then apply_snapshot node.id snapshot;
+              (s, [])
+      in
 
       let rec exec_action = function
           Apply cmd ->
@@ -293,6 +307,18 @@ struct
                   ignore (Event_queue.schedule t.ev_queue dt rep_id
                             (Message (node.id, msg)))
               end
+        | Send_snapshot (dst, idx, config) ->
+            let snapshot, `Term last_term, `Index last_index =
+              take_snapshot node.id idx in
+            let dt = Int64.(t.rtt - t.rtt / 4L +
+                       of_int (RND.int t.rng (to_int t.rtt lsr 1)))
+            in
+              ignore begin
+                Event_queue.schedule t.ev_queue dt dst
+                  (Install_snapshot
+                     (snapshot, last_term, last_index, config))
+              end
+
       in
         node.state <- s;
         List.iter exec_action actions
@@ -393,7 +419,10 @@ let run ?(seed = 2) () =
   let t0    = Unix.gettimeofday () in
   let steps = DES.simulate
                 ~verbose:false ~string_of_cmd:string_of_int
-                ~msg_loss_rate on_apply des in
+                ~msg_loss_rate on_apply
+                (fun id idx -> failwith "snapshot not implemented")
+                (fun id snapshot -> ())
+                des in
   let dt    = Unix.gettimeofday () -. t0 in
   let ncmds = DES.node_ids des |>
               List.map (fun id -> get_queue id |> Queue.length) |>

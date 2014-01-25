@@ -14,8 +14,10 @@ struct
   type term      = Int64.t
   type index     = Int64.t
   type rep_id    = string
+  type config    = rep_id array
   type client_id = string
   type req_id    = client_id * Int64.t
+
   type ('a, 'b) result = [`OK of 'a | `Error of 'b]
 
   module REPID = struct type t = rep_id let compare = String.compare end
@@ -36,6 +38,8 @@ struct
     val get_range   : from_inclusive:index -> to_inclusive:index -> 'a t ->
                       (index * ('a * term)) list
     val get_term    : index -> 'a t -> term option
+
+    val trim_prefix : last_index:index -> last_term:term -> 'a t -> 'a t
   end =
   struct
     type 'a t =
@@ -53,6 +57,15 @@ struct
         last_term  = init_term;
         entries    = IM.empty;
       }
+
+    let trim_prefix ~last_index ~last_term t =
+      let _, _, entries = IM.split last_index t.entries in
+        {
+          last_index; last_term; entries;
+          init_index = last_index;
+          init_term  = last_term;
+        }
+
 
     let to_list t =
       IM.bindings t.entries |> List.map (fun (i, (x, t)) -> (i, x, t))
@@ -150,6 +163,8 @@ struct
         next_index  : index RM.t;
         match_index : index RM.t;
 
+        snapshot_transfers : RS.t;
+
         votes : RS.t;
       }
 
@@ -212,6 +227,7 @@ struct
     | Reset_election_timeout
     | Reset_heartbeat
     | Send of rep_id * 'a message
+    | Send_snapshot of rep_id * index * config
 end
 
 include Kernel
@@ -301,10 +317,12 @@ let heartbeat s =
                      prev_log_term; prev_log_index; entries = [];
                      leader_commit = s.commit_index }
 
+type 'a send_entries =
+    Snapshot | Send_entries of 'a | Snapshot_in_progress
+
 let send_entries s from =
   match LOG.get_term (Int64.pred from) s.log with
-      None ->
-        None
+      None -> None
     | Some prev_log_term ->
         Some
           (Append_entries
@@ -318,6 +336,14 @@ let send_entries s from =
                                  s.log;
               leader_commit  = s.commit_index;
             })
+
+let send_entries_or_snapshot s peer from =
+  if RS.mem peer s.snapshot_transfers then
+    Snapshot_in_progress
+  else
+    match send_entries s from with
+        None -> Snapshot
+      | Some x -> Send_entries x
 
 let broadcast s msg =
   Array.to_list s.peers |>
@@ -467,14 +493,13 @@ let receive_msg s peer = function
              * initial heartbeat *)
             let log         = LOG.append ~term:s.current_term Nop s.log in
 
-
             (* With a regular (empty) hearbeat, this applies:
              *   "When a leader first comes to power, it initializes all
              *   nextIndex values to the index just after the last one in its
              *   log"
-             * However, in this case we want to send the Nop too.
+             * However, in this case we want to send the Nop too, so no Int64.succ.
              * *)
-            let next_idx    = LOG.last_index log |> snd in
+            let next_idx    = LOG.last_index log |> snd (* |> Int64.succ *) in
             let next_index  = Array.fold_left
                                 (fun m peer -> RM.add peer next_idx m)
                                 RM.empty s.peers in
@@ -484,6 +509,7 @@ let receive_msg s peer = function
             let s     = { s with log; next_index; match_index;
                                  state     = Leader;
                                  leader_id = Some s.id;
+                                 snapshot_transfers = RS.empty;
                         } in
             (* This heartbeat is replaced by the broadcast of the no-op
              * explained above:
@@ -521,12 +547,16 @@ let receive_msg s peer = function
                            (fun idx -> min idx prev_log_index)
                            s.next_index in
         let s          = { s with next_index } in
-          match send_entries s (RM.find peer next_index) with
-              None ->
+        let idx        = RM.find peer next_index in
+          match send_entries_or_snapshot s peer idx with
+            | Snapshot ->
                 (* Must send snapshot *)
-                (* FIXME *)
-                (s, [])
-            | Some msg ->
+                let config    = Array.append [| s.id |] s.peers in
+                let transfers = RS.add peer s.snapshot_transfers in
+                let s         = { s with snapshot_transfers = transfers } in
+                  (s, [Send_snapshot (peer, idx, config)])
+            | Snapshot_in_progress -> (s, [])
+            | Send_entries msg ->
                 (s, [Send (peer, msg)])
       end
 
@@ -563,27 +593,87 @@ let election_timeout s = match s.state with
 let heartbeat_timeout s = match s.state with
     Follower | Candidate -> (s, [])
   | Leader ->
-      (s, (Reset_heartbeat :: broadcast s (heartbeat s)))
+      let s, sends =
+        Array.to_list s.peers |>
+        List.fold_left
+          (fun (s, sends) peer ->
+             let idx = RM.find peer s.next_index in
+               match
+                 send_entries_or_snapshot s peer idx
+               with
+                   Snapshot_in_progress -> (s, sends)
+                 | Send_entries msg -> (s, Send (peer, msg) :: sends)
+                 | Snapshot ->
+                     (* must send snapshot if cannot send log *)
+                     let transfers = RS.add peer s.snapshot_transfers in
+                     let s         = { s with snapshot_transfers = transfers } in
+                     let config    = Array.append [| s.id |] s.peers in
+                       (s, Send_snapshot (peer, idx, config) :: sends))
+          (s, [])
+      in
+        (s, (Reset_heartbeat :: sends))
 
 let client_command x s = match s.state with
     Follower | Candidate -> (s, [Redirect (s.leader_id, x)])
   | Leader ->
-      let log     = LOG.append ~term:s.current_term (Op x) s.log in
-      let s       = { s with log; } in
-      let actions = Array.to_list s.peers |>
-                    List.filter_map
-                      (fun peer ->
-                         match send_entries s (RM.find peer s.next_index) with
-                             None ->
-                               (* FIXME: should send snapshot if cannot send
-                                * log *)
-                               None
-                           | Some msg -> Some (Send (peer, msg))) in
+      let log        = LOG.append ~term:s.current_term (Op x) s.log in
+      let s, actions =
+        Array.to_list s.peers |>
+        List.fold_left
+          (fun (s, actions) peer ->
+             let idx = RM.find peer s.next_index in
+               match send_entries_or_snapshot s peer idx with
+                   Snapshot ->
+                     (* must send snapshot if cannot send log *)
+                     let transfers = RS.add peer s.snapshot_transfers in
+                     let s         = { s with snapshot_transfers = transfers } in
+                     let config    = Array.append [| s.id |] s.peers in
+                       (s, Send_snapshot (peer, idx, config) :: actions)
+                 | Snapshot_in_progress -> (s, actions)
+                 | Send_entries msg -> (s, Send (peer, msg) :: actions))
+          ({ s with log }, []) in
       let actions = match actions with
                       | [] -> []
                       | l -> Reset_heartbeat :: actions
       in
         (s, actions)
+
+let install_snapshot ~last_term ~last_index ~config s = match s.state with
+    Leader | Candidate -> (s, false)
+  | Follower ->
+      let peers = Array.filter ((<>) s.id) config in
+      let log   =
+        match LOG.get_term last_index s.log with
+            (* "If the follower has an entry that matches the snapshot’s last
+             * included index and term, then there is no conflict: it removes only
+             * the prefix of its log that the snapshot replaces.  Otherwise, the
+             * follower removes its entire log; it is all superseded by the
+             * snapshot."
+             * *)
+            Some t when t = last_term -> LOG.trim_prefix ~last_index ~last_term s.log
+          | _ -> LOG.empty ~init_index:last_index ~init_term:last_term
+      in
+        ({ s with peers; log }, true)
+
+let snapshot_sent peer s = match s.state with
+    Follower | Candidate -> (s, [])
+  | Leader ->
+      let transfers = RS.remove peer s.snapshot_transfers in
+      let s         = { s with snapshot_transfers = transfers } in
+        match send_entries s (RM.find peer s.next_index) with
+            None -> (s, [])
+          | Some msg -> (s, [Send (peer, msg)])
+
+let compact_log last_index s = match s.state with
+  | Follower | Candidate -> s
+  | Leader ->
+      if not (RS.is_empty s.snapshot_transfers) then s
+      else
+        match LOG.get_term last_index s.log with
+            None -> s
+          | Some last_term ->
+              let log = LOG.trim_prefix ~last_index ~last_term s.log in
+                { s with log }
 
 module Types = Kernel
 
@@ -591,9 +681,9 @@ module Core =
 struct
   include Types
 
-  let make ~id ~current_term ~voted_for ~log ~peers () =
+  let make ~id ~current_term ~voted_for ~log ~config () =
     let log   = LOG.of_list ~init_index:0L ~init_term:current_term log in
-    let peers = Array.filter ((<>) id) peers in
+    let peers = Array.filter ((<>) id) config in
       {
         current_term; voted_for; log; id; peers;
         state        = Follower;
@@ -603,6 +693,7 @@ struct
         next_index   = RM.empty;
         match_index  = RM.empty;
         votes        = RS.empty;
+        snapshot_transfers = RS.empty;
       }
 
   let leader_id (s : _ state) = s.leader_id
@@ -614,4 +705,7 @@ struct
   let election_timeout  = election_timeout
   let heartbeat_timeout = heartbeat_timeout
   let client_command    = client_command
+  let install_snapshot  = install_snapshot
+  let snapshot_sent     = snapshot_sent
+  let compact_log       = compact_log
 end

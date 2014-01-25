@@ -11,6 +11,13 @@ sig
   val send    : connection -> (req_id * op) message -> bool Lwt.t
   val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
+
+  type snapshot_transfer
+
+  val prepare_snapshot :
+    connection -> index -> config -> snapshot_transfer option Lwt.t
+
+  val send_snapshot : snapshot_transfer -> unit Lwt.t
 end
 
 module type LWTPROC =

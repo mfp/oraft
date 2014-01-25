@@ -12,8 +12,10 @@ sig
   type term      = Int64.t
   type index     = Int64.t
   type rep_id    = string
+  type config    = rep_id array
   type client_id = string
   type req_id    = client_id * Int64.t
+
   type ('a, 'b) result = [`OK of 'a | `Error of 'b]
 
   type 'a message =
@@ -61,6 +63,7 @@ sig
     | Reset_election_timeout
     | Reset_heartbeat
     | Send of rep_id * 'a message
+    | Send_snapshot of rep_id * index * config
 end
 
 module Core :
@@ -71,7 +74,8 @@ sig
 
   val make :
     id:rep_id -> current_term:term -> voted_for:rep_id option ->
-    log:(index * 'a entry * term) list -> peers:rep_id array -> unit -> 'a state
+    log:(index * 'a entry * term) list ->
+    config:config -> unit -> 'a state
 
   val leader_id : 'a state -> rep_id option
   val id        : 'a state -> rep_id
@@ -81,8 +85,13 @@ sig
     'a state -> rep_id -> 'a message -> 'a state * 'a action list
 
   val election_timeout  : 'a state -> 'a state * 'a action list
-
   val heartbeat_timeout : 'a state -> 'a state * 'a action list
-
   val client_command    : 'a -> 'a state -> 'a state * 'a action list
+  val snapshot_sent     : rep_id -> 'a state -> ('a state * 'a action list)
+
+  val install_snapshot :
+    last_term:term -> last_index:index -> config:config -> 'a state ->
+    'a state * bool
+
+  val compact_log : index -> 'a state -> 'a state
 end

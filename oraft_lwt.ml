@@ -21,6 +21,13 @@ sig
   val send    : connection -> (req_id * op) message -> bool Lwt.t
   val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
+
+  type snapshot_transfer
+
+  val prepare_snapshot :
+    connection -> index -> config -> snapshot_transfer option Lwt.t
+
+  val send_snapshot : snapshot_transfer -> unit Lwt.t
 end
 
 module type LWTPROC =
@@ -60,6 +67,9 @@ struct
         cmd_stream               : (req_id * PROC.op) Lwt_stream.t;
         mutable pending_cmds     : (cmd_res Lwt.t * cmd_res Lwt.u) CMDM.t;
         leader_signal            : unit Lwt_condition.t;
+        snapshot_sent_stream     : rep_id Lwt_stream.t;
+        mutable snapshots_sent : th_res Lwt.t;
+        snapshot_sent            : (rep_id -> unit);
       }
 
   and th_res =
@@ -68,6 +78,7 @@ struct
     | Abort
     | Election_timeout
     | Heartbeat_timeout
+    | Snapshots_sent of rep_id list
 
   and cmd_res =
       Redirect of rep_id option
@@ -79,6 +90,14 @@ struct
       | `Redirect of rep_id * IO.address
       | `Redirect_randomized of rep_id * IO.address
       | `Retry_later ]
+
+  let get_sent_snapshots stream =
+    match_lwt Lwt_stream.get stream with
+        None -> fst (Lwt.wait ())
+      | Some peer ->
+          let l = Lwt_stream.get_available stream in
+            Lwt_stream.njunk (List.length l) stream >>
+            return (Snapshots_sent (peer :: l))
 
   let make
         ?(election_period = 2.)
@@ -95,7 +114,11 @@ struct
                               | Follower | Candidate -> fst (Lwt.wait ())
                               | Leader ->
                                   Lwt_unix.sleep heartbeat_period >>
-                                  return Heartbeat_timeout
+                                  return Heartbeat_timeout in
+    let snapshot_sent_stream,
+        push_snapshot_ok  = Lwt_stream.create () in
+    let snapshots_sent    = get_sent_snapshots snapshot_sent_stream
+
     in
       {
         heartbeat_period;
@@ -103,6 +126,8 @@ struct
         state;
         election_timeout;
         heartbeat;
+        snapshot_sent_stream;
+        snapshots_sent;
         peers         = List.fold_left
                           (fun m (k, v) -> RM.add k v m) RM.empty
                           (List.filter (fun (id, _) -> id <> Core.id state) peers);
@@ -124,6 +149,7 @@ struct
         cmd_stream    = stream;
         pending_cmds  = CMDM.empty;
         leader_signal = Lwt_condition.create ();
+        snapshot_sent = (fun x -> push_snapshot_ok (Some x));
       }
 
   let abort t =
@@ -205,6 +231,17 @@ struct
           return ()
         end;
         return ()
+    | Send_snapshot (rep_id, idx, config) ->
+        ignore begin
+          try_lwt
+            match_lwt IO.prepare_snapshot (RM.find rep_id t.conns) idx config with
+              | None -> return ()
+              | Some transfer -> IO.send_snapshot transfer
+          finally
+            t.snapshot_sent rep_id;
+            return ()
+        end;
+        return ()
 
   let exec_actions t l = Lwt_list.iter_s (exec_action t) l
 
@@ -223,6 +260,7 @@ struct
                fst t.abort;
                t.get_cmd;
                t.heartbeat;
+               t.snapshots_sent;
              ] @
              t.msg_threads)
         with
@@ -244,6 +282,18 @@ struct
                 run t
           | Heartbeat_timeout ->
               let state, actions = Core.heartbeat_timeout t.state in
+                t.state <- state;
+                exec_actions t actions >>
+                run t
+          | Snapshots_sent peers ->
+              let state, actions =
+                List.fold_left
+                  (fun (s, actions) peer ->
+                     let s, actions' = Core.snapshot_sent peer s in
+                       (s, actions' @ actions))
+                  (t.state, [])
+                  peers
+              in
                 t.state <- state;
                 exec_actions t actions >>
                 run t
