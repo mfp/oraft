@@ -30,36 +30,44 @@ sig
 
   module Event_queue : EVENT_QUEUE
 
-  type ('a, 'b) event =
+  type ('op, 'snapshot) event =
     | Election_timeout
     | Heartbeat_timeout
-    | Command of 'a
-    | Message of rep_id * 'a message
+    | Command of 'op
+    | Message of rep_id * 'op message
     | Func of (CLOCK.t -> unit)
-    | Install_snapshot of 'b * term * index * config
+    | Install_snapshot of 'snapshot * term * index * config
 
-  type ('a, 'b) t
+  type ('op, 'app_state, 'snapshot) t
+  type ('op, 'app_state) node
 
   val make :
     ?rng:RND.t ->
-    ?ev_queue:('a, 'b) event Event_queue.t ->
+    ?ev_queue:('op, 'snapshot) event Event_queue.t ->
     num_nodes:int ->
     election_period:CLOCK.t ->
     heartbeat_period:CLOCK.t ->
     rtt:CLOCK.t ->
-    unit -> ('a, 'b) t
+    'app_state -> ('op, 'app_state, 'snapshot) t
 
-  val random_node_id : (_, _) t -> rep_id
-  val node_ids       : (_, _) t -> rep_id list
+  val random_node_id : (_, _, _) t -> rep_id
+  val node_ids       : (_, _, _) t -> rep_id list
+  val nodes          : ('op, 'app_state, _) t -> ('op, 'app_state) node list
+
+  val node_id       : (_, _) node -> rep_id
+  val app_state     : (_, 'app_state) node -> 'app_state
+  val set_app_state : (_, 'app_state) node -> 'app_state -> unit
+  val leader_id     : (_, _) node -> rep_id option
 
   val simulate :
     ?verbose:bool ->
-    ?string_of_cmd:('a -> string) ->
+    ?string_of_cmd:('op -> string) ->
     msg_loss_rate:float ->
-    (time:Int64.t -> 'a C.state -> (index * 'a * term) list -> unit) ->
-    ('a C.state -> 'b * [`Term of term] * [`Index of index]) ->
-    ('a C.state -> 'b -> unit) ->
-     ?steps:int -> ('a, 'b) t -> int
+    on_apply:(time:Int64.t -> ('op, 'app_state) node ->
+                (index * 'op * term) list -> 'app_state) ->
+    take_snapshot:(('op, 'app_state) node -> index * 'snapshot * term) ->
+    install_snapshot:(('op, 'app_state) node -> 'snapshot -> unit) ->
+     ?steps:int -> ('op, 'app_state, 'snapshot) t -> int
 end =
 struct
   open Oraft.Types
@@ -109,53 +117,61 @@ struct
       with Invalid_argument _ -> None
   end
 
-  type ('a, 'b) event =
+  type ('op, 'snapshot) event =
     | Election_timeout
     | Heartbeat_timeout
-    | Command of 'a
-    | Message of rep_id * 'a message
+    | Command of 'op
+    | Message of rep_id * 'op message
     | Func of (CLOCK.t -> unit)
-    | Install_snapshot of 'b * term * index * config
+    | Install_snapshot of 'snapshot * term * index * config
 
-  type 'a node =
+  type ('op, 'app_state) node =
       {
         id                     : rep_id;
-        mutable state          : 'a C.state;
+        mutable state          : 'op C.state;
         mutable next_heartbeat : CLOCK.t option;
         mutable next_election  : CLOCK.t option;
+        mutable app_state      : 'app_state;
       }
 
-  type ('a, 'b) t =
+  type ('op, 'app_state, 'snapshot) t =
       {
         rng              : RND.t;
-        ev_queue         : ('a, 'b) event Event_queue.t;
-        nodes            : 'a node array;
+        ev_queue         : ('op, 'snapshot) event Event_queue.t;
+        nodes            : ('op, 'app_state) node array;
         election_period  : CLOCK.t;
         heartbeat_period : CLOCK.t;
         rtt              : CLOCK.t;
       }
 
-  let make_node config id =
+  let make_node config app_state id =
     let state = C.make
                   ~id ~current_term:0L ~voted_for:None
                   ~log:[] ~config ()
     in
-      { id; state; next_heartbeat = None; next_election = None }
+      { id; state; next_heartbeat = None; next_election = None; app_state; }
+
+  let node_id n         = n.id
+  let leader_id n       = C.leader_id n.state
+  let app_state n       = n.app_state
+  let set_app_state n x = n.app_state <- x
 
   let make
         ?(rng = RND.make_self_init ())
         ?(ev_queue = Event_queue.create ())
         ~num_nodes
         ~election_period ~heartbeat_period ~rtt
-        () =
+        init_app_state =
     let node_ids = Array.init num_nodes (sprintf "n%02d") in
-    let nodes    = Array.map (make_node node_ids) node_ids in
+    let nodes    = Array.map (make_node node_ids init_app_state) node_ids in
       { rng; ev_queue; election_period; heartbeat_period; rtt; nodes; }
 
   let random_node_id t =
     t.nodes.(RND.int t.rng (Array.length t.nodes)).id
 
   let node_ids t = Array.(to_list (map (fun n -> n.id) t.nodes))
+
+  let nodes t = Array.to_list t.nodes
 
   let string_of_msg string_of_cmd = function
       Request_vote { term; candidate_id; last_log_term; last_log_index; _ } ->
@@ -215,8 +231,8 @@ struct
               Int64.(of_int (RND.int t.rng 100)) node_id (Command cmd))
 
   let simulate
-        ?(verbose = false) ?string_of_cmd ~msg_loss_rate on_apply
-        take_snapshot apply_snapshot ?(steps = max_int) t =
+        ?(verbose = false) ?string_of_cmd ~msg_loss_rate
+        ~on_apply ~take_snapshot ~install_snapshot ?(steps = max_int) t =
 
     let node_of_id =
       let h = Hashtbl.create 13 in
@@ -250,7 +266,7 @@ struct
             let s, accepted = C.install_snapshot
                                 ~last_term ~last_index ~config node.state
             in
-              if accepted then apply_snapshot node.state snapshot;
+              if accepted then install_snapshot node snapshot;
               (s, [])
       in
 
@@ -268,7 +284,8 @@ struct
                    cmds |>
                  String.concat ", ");
             (* simulate current leader being cached by client *)
-            on_apply ~time node.state cmds
+            let app_state = on_apply ~time node cmds in
+              node.app_state <- app_state
         | Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat t node;
@@ -315,8 +332,7 @@ struct
                             (Message (node.id, msg)))
               end
         | Send_snapshot (dst, idx, config) ->
-            let snapshot, `Term last_term, `Index last_index =
-              take_snapshot node.state in
+            let last_index, snapshot, last_term = take_snapshot node in
             let dt = Int64.(t.rtt - t.rtt / 4L +
                        of_int (RND.int t.rng (to_int t.rtt lsr 1)))
             in
@@ -396,10 +412,10 @@ let run ?(seed = 2) () =
                  CLOCK.(dt + retry_period) node (DES.Func f)
     in () in
 
-  let apply_one ~time s (index, cmd, term) =
+  let apply_one ~time node (index, cmd, term) =
     if cmd mod 10_000 = 0 then
-      printf "XXXXXXXXXXXXX apply %S  %d  @ %Ld\n%!" (C.id s) cmd time;
-    let id   = C.id s in
+      printf "XXXXXXXXXXXXX apply %S  %d  @ %Ld\n%!" (DES.node_id node) cmd time;
+    let id   = DES.node_id node in
     let q    = get_queue id in
     let ()   = Queue.push cmd q in
     let len  = Queue.length q in
@@ -407,12 +423,12 @@ let run ?(seed = 2) () =
       if cmd >= !last_sent then begin
       (* We schedule the next few commands being sent to the current leader
        * (simulating the client caching the current leader).  *)
-        let dt = CLOCK.(heartbeat_period - 10L) in
+        let dt  = CLOCK.(heartbeat_period - 10L) in
+        let dst = Option.default id (DES.leader_id node) in
           for i = 1 to batch_size do
             incr last_sent;
             let cmd = !last_sent in
-              schedule
-                CLOCK.(of_int i * dt) (Option.default id (C.leader_id s)) cmd
+              schedule CLOCK.(of_int i * dt) dst cmd
           done
       end;
       if len >= num_cmds then begin
@@ -421,16 +437,18 @@ let run ?(seed = 2) () =
           raise Exit
       end in
 
-  let on_apply ~time s cmds = List.iter (apply_one ~time s) cmds in
+  let on_apply ~time node cmds = List.iter (apply_one ~time node) cmds in
+
+  let take_snapshot node = failwith "snapshot not implemented" in
+  let install_snapshot node snapshot = () in
 
   (* schedule init cmd delivery *)
   let ()    = schedule 1000L (DES.random_node_id des) init_cmd in
   let t0    = Unix.gettimeofday () in
   let steps = DES.simulate
                 ~verbose:false ~string_of_cmd:string_of_int
-                ~msg_loss_rate on_apply
-                (fun state -> failwith "snapshot not implemented")
-                (fun state snapshot -> ())
+                ~msg_loss_rate
+                ~on_apply ~take_snapshot ~install_snapshot
                 des in
   let dt    = Unix.gettimeofday () -. t0 in
   let ncmds = DES.node_ids des |>
