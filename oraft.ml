@@ -219,7 +219,7 @@ struct
     }
 
   type 'a action =
-      Apply of 'a
+      Apply of (index * 'a * term) list
     | Become_candidate
     | Become_follower of rep_id option
     | Become_leader
@@ -304,12 +304,13 @@ let try_commit s =
                       ~from_inclusive:(Int64.succ prev)
                       ~to_inclusive:s.commit_index
                       s.log in
-      let actions = List.filter_map
+      let ops     = List.filter_map
                       (function
-                           (_, (Op x, _)) -> Some (Apply x)
+                           (index, (Op x, term)) -> Some (index, x, term)
                          | (_, (Nop, _)) -> None)
-                      entries
-      in (s, actions)
+                      entries in
+      let actions = match ops with [] -> [] | l -> [Apply ops] in
+        (s, actions)
 
 let heartbeat s =
   let prev_log_term, prev_log_index = LOG.last_index s.log in

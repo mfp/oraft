@@ -55,7 +55,7 @@ sig
   }
 
   type 'a action =
-      Apply of 'a
+      Apply of (index * 'a * term) list
     | Become_candidate
     | Become_follower of rep_id option
     | Become_leader

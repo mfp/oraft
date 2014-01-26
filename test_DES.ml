@@ -56,7 +56,7 @@ sig
     ?verbose:bool ->
     ?string_of_cmd:('a -> string) ->
     msg_loss_rate:float ->
-    (time:Int64.t -> 'a C.state -> 'a -> unit) ->
+    (time:Int64.t -> 'a C.state -> (index * 'a * term) list -> unit) ->
     ('a C.state -> 'b * [`Term of term] * [`Index of index]) ->
     ('a C.state -> 'b -> unit) ->
      ?steps:int -> ('a, 'b) t -> int
@@ -255,10 +255,20 @@ struct
       in
 
       let rec exec_action = function
-          Apply cmd ->
-            if verbose then printf " Apply\n";
+          Apply cmds ->
+            if verbose then
+              printf " Apply %d cmds [%s]\n"
+                (List.length cmds)
+                (List.map
+                   (fun (idx, cmd, term) ->
+                      sprintf "(%Ld, %s, %Ld)"
+                        idx
+                        (Option.default (fun _ -> "<cmd>") string_of_cmd cmd)
+                        term)
+                   cmds |>
+                 String.concat ", ");
             (* simulate current leader being cached by client *)
-            on_apply ~time node.state cmd
+            on_apply ~time node.state cmds
         | Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat t node;
@@ -386,7 +396,7 @@ let run ?(seed = 2) () =
                  CLOCK.(dt + retry_period) node (DES.Func f)
     in () in
 
-  let on_apply ~time s cmd =
+  let apply_one ~time s (index, cmd, term) =
     if cmd mod 10_000 = 0 then
       printf "XXXXXXXXXXXXX apply %S  %d  @ %Ld\n%!" (C.id s) cmd time;
     let id   = C.id s in
@@ -410,6 +420,8 @@ let run ?(seed = 2) () =
         if S.cardinal !completed >= num_nodes then
           raise Exit
       end in
+
+  let on_apply ~time s cmds = List.iter (apply_one ~time s) cmds in
 
   (* schedule init cmd delivery *)
   let ()    = schedule 1000L (DES.random_node_id des) init_cmd in

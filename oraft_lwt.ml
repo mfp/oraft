@@ -199,18 +199,21 @@ struct
         Lwt_condition.broadcast t.leader_signal ();
         t.election_timeout  <- fst (Lwt.wait ());
         exec_action t Reset_heartbeat
-    | Apply (req_id, op) ->
-        (* TODO: allow to run this in parallel with rest RAFT algorithm.
-         * Must make sure that Apply actions are not reordered. *)
-        lwt resp = try_lwt PROC.execute op
-                   with exn -> return (`Error exn)
-        in begin
-          try_lwt
-            let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
-              Lwt.wakeup_later u (Executed resp);
-              return ()
-          with _ -> return ()
-        end
+    | Apply l ->
+        Lwt_list.iter_s
+          (fun (index, (req_id, op), term) ->
+             (* TODO: allow to run this in parallel with rest RAFT algorithm.
+              * Must make sure that Apply actions are not reordered. *)
+             lwt resp = try_lwt PROC.execute op
+                        with exn -> return (`Error exn)
+             in begin
+               try_lwt
+                 let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
+                   Lwt.wakeup_later u (Executed resp);
+                   return ()
+               with _ -> return ()
+             end)
+          l
     | Redirect (rep_id, (req_id, _)) -> begin
         try_lwt
           let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
