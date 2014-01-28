@@ -115,14 +115,15 @@ struct
             with Not_found ->
               t.entries
           in
-            let last_index, last_term, entries =
+            let entries =
               List.fold_left
-                (fun (last_index, last_term, m) (idx, (x, term)) ->
-                   let m          = IM.add idx (x, term) m in
-                   let last_index = max last_index idx in
-                   let last_term  = max last_term term in
-                     (last_index, last_term, m))
-                (t.init_index, t.init_term, nonconflicting) l
+                (fun m (idx, (x, term)) -> IM.add idx (x, term) m)
+                nonconflicting l in
+            let last_index, last_term =
+              try
+                let idx, (_, term) = IM.max_binding entries in
+                  (idx, term)
+              with _ -> t.init_index, t.init_term
             in
               { t with last_index; last_term; entries; }
 
