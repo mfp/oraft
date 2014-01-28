@@ -36,7 +36,8 @@ sig
     | Command of 'op
     | Message of rep_id * 'op message
     | Func of (CLOCK.t -> unit)
-    | Install_snapshot of 'snapshot * term * index * config
+    | Install_snapshot of rep_id * 'snapshot * term * index * config
+    | Snapshot_sent of rep_id * index
 
   type ('op, 'app_state, 'snapshot) t
   type ('op, 'app_state) node
@@ -125,7 +126,8 @@ struct
     | Command of 'op
     | Message of rep_id * 'op message
     | Func of (CLOCK.t -> unit)
-    | Install_snapshot of 'snapshot * term * index * config
+    | Install_snapshot of rep_id * 'snapshot * term * index * config
+    | Snapshot_sent of rep_id * index
 
   type ('op, 'app_state) node =
       {
@@ -207,8 +209,9 @@ struct
     | Message (rep_id, msg) ->
         sprintf "Message (%S, %s)" rep_id (string_of_msg string_of_cmd msg)
     | Func _ -> "Func _"
-    | Install_snapshot (_, term, index, config) ->
-        sprintf "Install_snapshot (_, %Ld, %Ld, _)" term index
+    | Install_snapshot (src, _, term, index, config) ->
+        sprintf "Install_snapshot (%S, _, %Ld, %Ld, _)" src term index
+    | Snapshot_sent (dst, idx) -> sprintf "Snapshot_sent %S last_index:%Ld" dst idx
 
   let schedule_election t node =
     let dt = CLOCK.(t.election_period - t.election_period / 4L +
@@ -264,12 +267,19 @@ struct
         | Func f ->
             f time;
             (node.state, [])
-        | Install_snapshot (snapshot, last_term, last_index, config) ->
+        | Install_snapshot (src, snapshot, last_term, last_index, config) ->
             let s, accepted = C.install_snapshot
                                 ~last_term ~last_index ~config node.state
             in
-              if accepted then install_snapshot node snapshot;
+              if accepted then begin
+                let _ = Event_queue.schedule t.ev_queue 40L src
+                          (Snapshot_sent (node.id, last_index))
+                in
+                  install_snapshot node snapshot
+              end;
               (s, [])
+        | Snapshot_sent (peer, last_index) ->
+            C.snapshot_sent peer ~last_index node.state
       in
 
       let rec exec_action = function
@@ -348,7 +358,7 @@ struct
               ignore begin
                 Event_queue.schedule t.ev_queue dt dst
                   (Install_snapshot
-                     (snapshot, last_term, last_index, config))
+                     (node.id, snapshot, last_term, last_index, config))
               end
 
       in

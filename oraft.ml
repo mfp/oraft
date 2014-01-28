@@ -683,11 +683,14 @@ let install_snapshot ~last_term ~last_index ~config s = match s.state with
       in
         ({ s with peers; log }, true)
 
-let snapshot_sent peer s = match s.state with
+let snapshot_sent peer ~last_index s = match s.state with
     Follower | Candidate -> (s, [])
   | Leader ->
-      let transfers = RS.remove peer s.snapshot_transfers in
-      let s         = { s with snapshot_transfers = transfers } in
+      let transfers  = RS.remove peer s.snapshot_transfers in
+      let next_index = RM.modify peer
+                         (fun idx -> max idx (Int64.succ last_index))
+                         s.next_index in
+      let s          = { s with snapshot_transfers = transfers; next_index } in
         match send_entries s (RM.find peer s.next_index) with
             None -> (s, [])
           | Some msg -> (s, [Send (peer, msg)])

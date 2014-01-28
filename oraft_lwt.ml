@@ -67,9 +67,9 @@ struct
         cmd_stream               : (req_id * PROC.op) Lwt_stream.t;
         mutable pending_cmds     : (cmd_res Lwt.t * cmd_res Lwt.u) CMDM.t;
         leader_signal            : unit Lwt_condition.t;
-        snapshot_sent_stream     : rep_id Lwt_stream.t;
-        mutable snapshots_sent : th_res Lwt.t;
-        snapshot_sent            : (rep_id -> unit);
+        snapshot_sent_stream     : (rep_id * index) Lwt_stream.t;
+        mutable snapshots_sent   : th_res Lwt.t;
+        snapshot_sent            : ((rep_id * index) -> unit);
       }
 
   and th_res =
@@ -78,7 +78,7 @@ struct
     | Abort
     | Election_timeout
     | Heartbeat_timeout
-    | Snapshots_sent of rep_id list
+    | Snapshots_sent of (rep_id * index) list
 
   and cmd_res =
       Redirect of rep_id option
@@ -94,10 +94,10 @@ struct
   let get_sent_snapshots stream =
     match_lwt Lwt_stream.get stream with
         None -> fst (Lwt.wait ())
-      | Some peer ->
+      | Some (peer, last_index) ->
           let l = Lwt_stream.get_available stream in
             Lwt_stream.njunk (List.length l) stream >>
-            return (Snapshots_sent (peer :: l))
+            return (Snapshots_sent ((peer, last_index) :: l))
 
   let make
         ?(election_period = 2.)
@@ -241,7 +241,7 @@ struct
               | None -> return ()
               | Some transfer -> IO.send_snapshot transfer
           finally
-            t.snapshot_sent rep_id;
+            t.snapshot_sent (rep_id, idx);
             return ()
         end;
         return ()
@@ -288,14 +288,14 @@ struct
                 t.state <- state;
                 exec_actions t actions >>
                 run t
-          | Snapshots_sent peers ->
+          | Snapshots_sent data ->
               let state, actions =
                 List.fold_left
-                  (fun (s, actions) peer ->
-                     let s, actions' = Core.snapshot_sent peer s in
+                  (fun (s, actions) (peer, last_index) ->
+                     let s, actions' = Core.snapshot_sent peer ~last_index s in
                        (s, actions' @ actions))
                   (t.state, [])
-                  peers
+                  data
               in
                 t.state <- state;
                 exec_actions t actions >>
