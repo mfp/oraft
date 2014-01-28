@@ -48,7 +48,7 @@ sig
     election_period:CLOCK.t ->
     heartbeat_period:CLOCK.t ->
     rtt:CLOCK.t ->
-    'app_state -> ('op, 'app_state, 'snapshot) t
+    (unit -> 'app_state) -> ('op, 'app_state, 'snapshot) t
 
   val random_node_id : (_, _, _) t -> rep_id
   val node_ids       : (_, _, _) t -> rep_id list
@@ -64,7 +64,9 @@ sig
     ?string_of_cmd:('op -> string) ->
     msg_loss_rate:float ->
     on_apply:(time:Int64.t -> ('op, 'app_state) node ->
-                (index * 'op * term) list -> 'app_state) ->
+              (index * 'op * term) list ->
+              [`Snapshot of index * 'app_state |
+               `State of 'app_state]) ->
     take_snapshot:(('op, 'app_state) node -> index * 'snapshot * term) ->
     install_snapshot:(('op, 'app_state) node -> 'snapshot -> unit) ->
      ?steps:int -> ('op, 'app_state, 'snapshot) t -> int
@@ -144,11 +146,11 @@ struct
         rtt              : CLOCK.t;
       }
 
-  let make_node config app_state id =
-    let state = C.make
-                  ~id ~current_term:0L ~voted_for:None
-                  ~log:[] ~config ()
-    in
+  let make_node mk_app_state config id =
+    let state     = C.make
+                      ~id ~current_term:0L ~voted_for:None
+                      ~log:[] ~config () in
+    let app_state = mk_app_state () in
       { id; state; next_heartbeat = None; next_election = None; app_state; }
 
   let node_id n         = n.id
@@ -161,9 +163,9 @@ struct
         ?(ev_queue = Event_queue.create ())
         ~num_nodes
         ~election_period ~heartbeat_period ~rtt
-        init_app_state =
+        mk_app_state =
     let node_ids = Array.init num_nodes (sprintf "n%02d") in
-    let nodes    = Array.map (make_node node_ids init_app_state) node_ids in
+    let nodes    = Array.map (make_node mk_app_state node_ids) node_ids in
       { rng; ev_queue; election_period; heartbeat_period; rtt; nodes; }
 
   let random_node_id t =
@@ -182,7 +184,7 @@ struct
     | Append_entries { term; prev_log_index; prev_log_term; entries; _ } ->
         let string_of_entry = function
             Nop -> "Nop"
-          | Op cmd -> "Op" ^ Option.default (fun _ -> "<cmd>") string_of_cmd cmd in
+          | Op cmd -> "Op " ^ Option.default (fun _ -> "<cmd>") string_of_cmd cmd in
         let payload_desc =
           entries |>
           List.map
@@ -228,7 +230,7 @@ struct
 
   let send_cmd t node_id cmd =
     ignore (Event_queue.schedule t.ev_queue
-              Int64.(of_int (RND.int t.rng 100)) node_id (Command cmd))
+              200L node_id (Command cmd))
 
   let simulate
         ?(verbose = false) ?string_of_cmd ~msg_loss_rate
@@ -284,8 +286,13 @@ struct
                    cmds |>
                  String.concat ", ");
             (* simulate current leader being cached by client *)
-            let app_state = on_apply ~time node cmds in
-              node.app_state <- app_state
+            begin match on_apply ~time node cmds with
+                `Snapshot (last_index, app_state) ->
+                  node.app_state <- app_state;
+                  node.state <- C.compact_log last_index node.state
+              | `State app_state ->
+                  node.app_state <- app_state
+            end
         | Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat t node;
@@ -332,6 +339,8 @@ struct
                             (Message (node.id, msg)))
               end
         | Send_snapshot (dst, idx, config) ->
+            if verbose then
+              printf " Send_snapshot (%S, %Ld)\n" dst idx;
             let last_index, snapshot, last_term = take_snapshot node in
             let dt = Int64.(t.rtt - t.rtt / 4L +
                        of_int (RND.int t.rng (to_int t.rtt lsr 1)))
@@ -366,19 +375,25 @@ struct
       with Exit -> !steps
 end
 
-let run ?(seed = 2) () =
-  let get_queue =
-    let h = Hashtbl.create 13 in
-      (fun id ->
-         try Hashtbl.find h id
-         with Not_found ->
-           let q = Queue.create () in
-             Hashtbl.add h id q;
-             q) in
+module FQueue :
+sig
+  type 'a t
 
-  let q_to_list q =
-    Queue.fold (fun l x -> x :: l) [] q |> List.rev in
+  val empty : 'a t
+  val push : 'a -> 'a t -> 'a t
+  val length : 'a t -> int
+  val to_list : 'a t -> 'a list
+end =
+struct
+  type 'a t = int * 'a list
 
+  let empty          = (0, [])
+  let push x (n, l)  = (n + 1, x :: l)
+  let length (n, _)  = n
+  let to_list (_, l) = List.rev l
+end
+
+let run ?(seed = 2) ?(verbose=false) () =
   let module S = Set.Make(String) in
 
   let completed = ref S.empty in
@@ -396,12 +411,13 @@ let run ?(seed = 2) () =
 
   let retry_period = CLOCK.(4L * election_period) in
 
-  let applied = BatBitSet.create (num_cmds + 20) in
+  let applied = BatBitSet.create (2 * num_cmds) (* work around BatBitSet bug *) in
 
   let rng     = Random.State.make [| seed |] in
 
   let des     = DES.make ~ev_queue ~rng ~num_nodes
-                  ~election_period ~heartbeat_period ~rtt () in
+                  ~election_period ~heartbeat_period ~rtt
+                  (fun () -> (0L, FQueue.empty, 0L)) in
 
   let rec schedule dt node cmd =
     let _    = DES.Event_queue.schedule ev_queue dt node (DES.Command cmd) in
@@ -412,13 +428,21 @@ let run ?(seed = 2) () =
                  CLOCK.(dt + retry_period) node (DES.Func f)
     in () in
 
-  let apply_one ~time node (index, cmd, term) =
-    if cmd mod 10_000 = 0 then
-      printf "XXXXXXXXXXXXX apply %S  %d  @ %Ld\n%!" (DES.node_id node) cmd time;
+  let check_if_finished node len =
+    if len >= num_cmds then begin
+      completed := S.add (DES.node_id node) !completed;
+      if S.cardinal !completed >= num_nodes then
+        raise Exit
+    end in
+
+  let apply_one ~time node acc (index, cmd, term) =
+    if cmd mod (if verbose then 1 else 10_000) = 0 then
+      printf "XXXXXXXXXXXXX apply %S  cmd:%d index:%Ld term:%Ld @ %Ld\n%!"
+        (DES.node_id node) cmd index term time;
+    let q    = match acc with | `Snapshot (_, (_, q, _)) | `State (_, q, _) -> q in
     let id   = DES.node_id node in
-    let q    = get_queue id in
-    let ()   = Queue.push cmd q in
-    let len  = Queue.length q in
+    let q    = FQueue.push cmd q in
+    let len  = FQueue.length q in
       BatBitSet.set applied cmd;
       if cmd >= !last_sent then begin
       (* We schedule the next few commands being sent to the current leader
@@ -431,31 +455,53 @@ let run ?(seed = 2) () =
               schedule CLOCK.(of_int i * dt) dst cmd
           done
       end;
-      if len >= num_cmds then begin
-        completed := S.add id !completed;
-        if S.cardinal !completed >= num_nodes then
-          raise Exit
-      end in
+      check_if_finished node len;
+      if cmd mod 10 = 0 then begin
+        if verbose then
+          printf "XXXXX snapshot %S %Ld (last cmds: %s)\n" id index
+            (FQueue.to_list q |> List.rev |> List.take 5 |> List.rev |>
+             List.map string_of_int |> String.concat ", ");
+        `Snapshot (index, (index, q, term))
+      end else
+        `State (index, q, term)
+  in
 
-  let on_apply ~time node cmds = List.iter (apply_one ~time node) cmds in
+  let on_apply ~time node cmds =
+    List.fold_left (apply_one ~time node) (`State (DES.app_state node)) cmds in
 
-  let take_snapshot node = failwith "snapshot not implemented" in
-  let install_snapshot node snapshot = () in
+  let take_snapshot node =
+    if verbose then printf "TAKE SNAPSHOT at %S\n" (DES.node_id node);
+    let (index, _, term) as snapshot = DES.app_state node in
+      (index, snapshot, term) in
+
+  let install_snapshot node ((last_index, q, last_term) as snapshot) =
+    if verbose then
+      printf "INSTALL SNAPSHOT at %S last_index:%Ld last_term:%Ld\n"
+        (DES.node_id node) last_index last_term;
+    DES.set_app_state node snapshot;
+    check_if_finished node (FQueue.length q)
+  in
 
   (* schedule init cmd delivery *)
   let ()    = schedule 1000L (DES.random_node_id des) init_cmd in
   let t0    = Unix.gettimeofday () in
   let steps = DES.simulate
-                ~verbose:false ~string_of_cmd:string_of_int
+                ~verbose ~string_of_cmd:string_of_int
                 ~msg_loss_rate
                 ~on_apply ~take_snapshot ~install_snapshot
                 des in
   let dt    = Unix.gettimeofday () -. t0 in
-  let ncmds = DES.node_ids des |>
-              List.map (fun id -> get_queue id |> Queue.length) |>
+  let ncmds = DES.nodes des |>
+              List.map
+                (fun node ->
+                   let _, q, _ = DES.app_state node in
+                     FQueue.length q) |>
               List.fold_left min max_int in
-  let logs  = DES.node_ids des |>
-              List.map (fun id -> get_queue id |> q_to_list |> List.take ncmds) in
+  let logs  = DES.nodes des |>
+              List.map
+                (fun node ->
+                   let _, q, _ = DES.app_state node in
+                     FQueue.to_list q |> List.take ncmds) in
   let ok, _ = List.fold_left
                 (fun (ok, l) l' -> match l with
                      None -> (ok, Some l')
@@ -471,6 +517,11 @@ let run ?(seed = 2) () =
         print_endline "OK"
       else begin
         print_endline "FAILURE: replicated logs differ";
+        List.iteri
+          (fun n l ->
+             let s = List.map string_of_int l |> String.concat "    " in
+               printf "%8d %s\n" n s)
+          (List.transpose logs);
         exit 1;
       end
 
@@ -478,5 +529,5 @@ let () =
   for i = 1 to 100 do
     print_endline "";
     printf "Running with seed %d\n%!" i;
-    run ~seed:i ()
+    run ~seed:i ~verbose:false ()
   done

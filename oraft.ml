@@ -40,6 +40,9 @@ struct
     val get_term    : index -> 'a t -> term option
 
     val trim_prefix : last_index:index -> last_term:term -> 'a t -> 'a t
+
+    val prev_log_index : 'a t -> index
+    val prev_log_term  : 'a t -> term
   end =
   struct
     type 'a t =
@@ -61,11 +64,13 @@ struct
     let trim_prefix ~last_index ~last_term t =
       let _, _, entries = IM.split last_index t.entries in
         {
-          last_index; last_term; entries;
-          init_index = last_index;
-          init_term  = last_term;
+          t with entries;
+                 init_index = last_index;
+                 init_term  = last_term;
         }
 
+    let prev_log_index t = t.init_index
+    let prev_log_term  t = t.init_term
 
     let to_list t =
       IM.bindings t.entries |> List.map (fun (i, (x, t)) -> (i, x, t))
@@ -443,7 +448,28 @@ let receive_msg s peer = function
             in
               (s, [Become_follower (Some peer)])
           else (* term = s.current_term && s.state <> Candidate *)
-            (s, [Reset_election_timeout])
+            (s, [Reset_election_timeout]) in
+
+        (* "Reply false if log doesn’t contain an entry at prevLogIndex
+         * whose term matches prevLogTerm" *)
+        (* In the presence of snapshots, prev_log_index might refer to a log
+         * entry that was removed (subsumed by the snapshot), in which case
+         * we must use as prev_log_index the index of the latest entry in
+         * the snapshot (equal to the init_index of the log), and as
+         * prev_log_term the term of the corresponding entry in the
+         * Append_entries message. *)
+        let prev_log_index, prev_log_term, entries =
+          if prev_log_index >= LOG.prev_log_index s.log then
+            (prev_log_index, prev_log_term, entries)
+          else
+            try
+              let prev_idx  = LOG.prev_log_index s.log in
+              let prev_term = List.assoc prev_idx entries |> snd in
+              let entries   = List.drop_while
+                                (fun (idx', _) -> idx' <= prev_idx) entries
+              in
+                (prev_idx, prev_term, entries)
+            with _ -> (prev_log_index, prev_log_term, entries)
         in
           match LOG.get_term prev_log_index s.log  with
               None ->
