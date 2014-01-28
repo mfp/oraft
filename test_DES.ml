@@ -251,16 +251,22 @@ struct
       if verbose then
         printf "%Ld @ %s -> %s\n" time node.id (describe_event string_of_cmd ev);
 
+      let executed = ref true in
+
       let s, actions = match ev with
           Election_timeout -> begin
             match node.next_election with
                 Some t when t = time -> C.election_timeout node.state
-              | _ -> (node.state, [])
+              | _ ->
+                  executed := false;
+                  (node.state, [])
           end
         | Heartbeat_timeout -> begin
             match node.next_heartbeat with
               | Some t when t = time -> C.heartbeat_timeout node.state
-              | _ -> (node.state, [])
+              | _ ->
+                  executed := false;
+                  (node.state, [])
           end
         | Command c -> C.client_command c node.state
         | Message (peer, msg) -> C.receive_msg node.state peer msg
@@ -363,7 +369,8 @@ struct
 
       in
         node.state <- s;
-        List.iter exec_action actions
+        List.iter exec_action actions;
+        !executed
 
     in
 
@@ -376,10 +383,7 @@ struct
           match Event_queue.next t.ev_queue with
               None -> !steps
             | Some (time, rep_id, ev) ->
-                incr steps;
-                (* we reverse evs to make sure that two simultaneous events
-                 * are executed in the same order they were scheduled *)
-                react_to_event time (node_of_id rep_id) ev;
+                if react_to_event time (node_of_id rep_id) ev then incr steps;
                 loop ()
         in loop ()
       with Exit -> !steps
