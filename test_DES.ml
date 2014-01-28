@@ -519,8 +519,14 @@ let run ?(seed = 2) ?(verbose=false) () =
         print_endline "FAILURE: replicated logs differ";
         List.iteri
           (fun n l ->
-             let s = List.map string_of_int l |> String.concat "    " in
-               printf "%8d %s\n" n s)
+             let all_eq, _ = List.fold_left
+                               (fun (b, prev) x -> match prev with
+                                    None -> (true, Some x)
+                                  | Some x' -> (b && x = x', Some x))
+                               (true, None) l in
+             let desc      = if all_eq then "" else " DIFF" in
+             let s         = List.map string_of_int l |> String.concat "    " in
+               printf "%8d %s%s\n" n s desc)
           (List.transpose logs);
         exit 1;
       end
