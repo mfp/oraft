@@ -95,6 +95,8 @@ sig
   val snapshot_sent :
     rep_id -> last_index:index -> 'a state -> ('a state * 'a action list)
 
+  val snapshot_send_failed : rep_id -> 'a state -> ('a state * 'a action list)
+
   val install_snapshot :
     last_term:term -> last_index:index -> config:config -> 'a state ->
     'a state * bool

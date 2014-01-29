@@ -701,6 +701,10 @@ let snapshot_sent peer ~last_index s = match s.state with
             None -> (s, [])
           | Some msg -> (s, [Send (peer, msg)])
 
+let snapshot_send_failed peer s =
+  let s = { s with snapshot_transfers = RS.remove peer s.snapshot_transfers } in
+    (s, [])
+
 let compact_log last_index s = match s.state with
   | Follower | Candidate -> s
   | Leader ->
@@ -748,4 +752,5 @@ struct
   let install_snapshot  = install_snapshot
   let snapshot_sent     = snapshot_sent
   let compact_log       = compact_log
+  let snapshot_send_failed = snapshot_send_failed
 end
