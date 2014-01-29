@@ -566,7 +566,7 @@ let receive_msg s peer = function
                             (max last_log_index) s.match_index in
         let s           = update_commit_index { s with next_index; match_index } in
         let s, actions  = try_commit s in
-          (s, actions)
+          (s, (Reset_election_timeout :: actions))
       end else begin
         (* "After a rejection, the leader decrements nextIndex and retries
          * the AppendEntries RPC. Eventually nextIndex will reach a point
@@ -582,14 +582,17 @@ let receive_msg s peer = function
                 let config    = Array.append [| s.id |] s.peers in
                 let transfers = RS.add peer s.snapshot_transfers in
                 let s         = { s with snapshot_transfers = transfers } in
-                  (s, [Send_snapshot (peer, idx, config)])
+                  (s, [Reset_election_timeout; Send_snapshot (peer, idx, config)])
             | Snapshot_in_progress -> (s, [])
             | Send_entries msg ->
-                (s, [Send (peer, msg)])
+                (s, [Reset_election_timeout; Send (peer, msg)])
       end
 
 let election_timeout s = match s.state with
-    Leader -> (s, [])
+    (* we have the leader step down if it does not get any append_result
+     * within an election timeout *)
+    Leader
+
   (* "If election timeout elapses without receiving AppendEntries RPC from
    * current leader or granting vote to candidate: convert to candidate" *)
   | Follower

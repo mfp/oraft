@@ -197,7 +197,7 @@ struct
         exec_action t Reset_election_timeout
     | Become_leader ->
         Lwt_condition.broadcast t.leader_signal ();
-        t.election_timeout  <- fst (Lwt.wait ());
+        exec_action t Reset_election_timeout >>
         exec_action t Reset_heartbeat
     | Apply l ->
         Lwt_list.iter_s

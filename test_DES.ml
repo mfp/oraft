@@ -332,6 +332,7 @@ struct
         | Become_leader ->
             if verbose then printf " Become_leader\n";
             unschedule_election t node;
+            schedule_election t node;
             schedule_heartbeat t node
         | Redirect (Some leader, cmd) ->
             if verbose then printf " Redirect %s\n" leader;
