@@ -682,9 +682,12 @@ let install_snapshot ~last_term ~last_index ~config s = match s.state with
              * snapshot."
              * *)
             Some t when t = last_term -> LOG.trim_prefix ~last_index ~last_term s.log
-          | _ -> LOG.empty ~init_index:last_index ~init_term:last_term
-      in
-        ({ s with peers; log }, true)
+          | _ -> LOG.empty ~init_index:last_index ~init_term:last_term in
+      let s     = { s with log; peers;
+                           last_applied = last_index;
+                           commit_index = last_index;
+                  }
+      in (s, true)
 
 let snapshot_sent peer ~last_index s = match s.state with
     Follower | Candidate -> (s, [])
