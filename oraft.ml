@@ -465,7 +465,11 @@ let receive_msg s peer = function
         in
           match LOG.get_term prev_log_index s.log  with
               None ->
-                (s, Send (peer, append_fail ~prev_log_index s) :: actions)
+                (* we don't have the entry at prev_log_index; we use the last
+                 * entry we do have as the prev_log_index in the failure msg,
+                 * thus allowing to rewind next_index in the leader quickly *)
+                let prev_log_index = LOG.last_index s.log |> snd in
+                  (s, Send (peer, append_fail ~prev_log_index s) :: actions)
             | Some term' when prev_log_term <> term' ->
                 (s, Send (peer, append_fail ~prev_log_index s) :: actions)
             | _ ->
