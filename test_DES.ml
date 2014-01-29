@@ -235,6 +235,18 @@ struct
     ignore (Event_queue.schedule t.ev_queue
               200L node_id (Command cmd))
 
+  let must_account time node = function
+      Election_timeout -> begin match node.next_election with
+          Some t when t = time -> true
+        | _ -> false
+      end
+    | Heartbeat_timeout -> begin match node.next_heartbeat with
+          Some t when t = time -> true
+        | _ -> false
+      end
+    | Func _ -> false
+    | Command _ | Message _ | Install_snapshot _ | Snapshot_sent _ -> true
+
   let simulate
         ?(verbose = false) ?string_of_cmd ~msg_loss_rate
         ~on_apply ~take_snapshot ~install_snapshot ?(steps = max_int) t =
@@ -248,25 +260,21 @@ struct
       send_cmd t dst cmd in
 
     let react_to_event time node ev =
-      if verbose then
-        printf "%Ld @ %s -> %s\n" time node.id (describe_event string_of_cmd ev);
-
-      let executed = ref true in
+      let considered = must_account time node ev in
+      let () =
+        if considered && verbose then
+          printf "%Ld @ %s -> %s\n" time node.id (describe_event string_of_cmd ev) in
 
       let s, actions = match ev with
           Election_timeout -> begin
             match node.next_election with
                 Some t when t = time -> C.election_timeout node.state
-              | _ ->
-                  executed := false;
-                  (node.state, [])
+              | _ -> (node.state, [])
           end
         | Heartbeat_timeout -> begin
             match node.next_heartbeat with
               | Some t when t = time -> C.heartbeat_timeout node.state
-              | _ ->
-                  executed := false;
-                  (node.state, [])
+              | _ -> (node.state, [])
           end
         | Command c -> C.client_command c node.state
         | Message (peer, msg) -> C.receive_msg node.state peer msg
@@ -370,8 +378,7 @@ struct
       in
         node.state <- s;
         List.iter exec_action actions;
-        !executed
-
+        considered
     in
 
     let steps = ref 0 in
