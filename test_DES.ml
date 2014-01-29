@@ -38,6 +38,7 @@ sig
     | Func of (CLOCK.t -> unit)
     | Install_snapshot of rep_id * 'snapshot * term * index * config
     | Snapshot_sent of rep_id * index
+    | Snapshot_send_failed of rep_id
 
   type ('op, 'app_state, 'snapshot) t
   type ('op, 'app_state) node
@@ -128,6 +129,7 @@ struct
     | Func of (CLOCK.t -> unit)
     | Install_snapshot of rep_id * 'snapshot * term * index * config
     | Snapshot_sent of rep_id * index
+    | Snapshot_send_failed of rep_id
 
   type ('op, 'app_state) node =
       {
@@ -212,6 +214,7 @@ struct
     | Install_snapshot (src, _, term, index, config) ->
         sprintf "Install_snapshot (%S, _, %Ld, %Ld, _)" src term index
     | Snapshot_sent (dst, idx) -> sprintf "Snapshot_sent %S last_index:%Ld" dst idx
+    | Snapshot_send_failed dst -> sprintf "Snapshot_send_failed %S" dst
 
   let schedule_election t node =
     let dt = CLOCK.(t.election_period - t.election_period / 4L +
@@ -245,7 +248,50 @@ struct
         | _ -> false
       end
     | Func _ -> false
-    | Command _ | Message _ | Install_snapshot _ | Snapshot_sent _ -> true
+    | Command _ | Message _ | Install_snapshot _
+    | Snapshot_sent _ | Snapshot_send_failed _ -> true
+
+
+  module FAILURE_SIMULATOR :
+  sig
+    type t
+
+    val make : ?verbose:bool -> msg_loss_rate:float -> period:int -> RND.t -> t
+    val tick : t -> config -> int -> unit
+    val is_msg_lost : t -> src:rep_id -> dst:rep_id -> bool
+  end =
+  struct
+    type t =
+        {
+          period                      : int;
+          mutable ticks_to_transition : int;
+          mutable state               : [`Down of rep_id | `Up ];
+          msg_loss_rate               : float;
+          rng                         : RND.t;
+          verbose                     : bool;
+        }
+
+    let make ?(verbose=false) ~msg_loss_rate ~period rng =
+      { verbose; period; ticks_to_transition = 1000; msg_loss_rate; rng; state = `Up }
+
+    let tick t config n =
+      t.ticks_to_transition <- t.ticks_to_transition - n;
+      if t.ticks_to_transition <= 0 then begin
+        t.ticks_to_transition <- t.period;
+        match t.state with
+            `Down id ->
+              if t.verbose then printf "### Node %S UP\n" id;
+              t.state <- `Up
+          | `Up ->
+              let id = config.(RND.int t.rng (Array.length config)) in
+                if t.verbose then printf "### Node %S DOWN\n" id;
+                t.state <- `Down id
+      end
+
+    let is_msg_lost t ~src ~dst = match t.state with
+      | `Down peer when peer = dst || peer = src -> true
+      | _ -> RND.float t.rng 1.0 < t.msg_loss_rate
+  end
 
   let simulate
         ?(verbose = false) ?string_of_cmd ~msg_loss_rate
@@ -258,6 +304,8 @@ struct
 
     let send_cmd ?(dst = random_node_id t) cmd =
       send_cmd t dst cmd in
+
+    let fail_sim = FAILURE_SIMULATOR.make ~verbose ~msg_loss_rate ~period:1000 t.rng in
 
     let react_to_event time node ev =
       let considered = must_account time node ev in
@@ -285,15 +333,14 @@ struct
             let s, accepted = C.install_snapshot
                                 ~last_term ~last_index ~config node.state
             in
-              if accepted then begin
-                let _ = Event_queue.schedule t.ev_queue 40L src
-                          (Snapshot_sent (node.id, last_index))
-                in
-                  install_snapshot node snapshot
-              end;
+              ignore (Event_queue.schedule t.ev_queue 40L src
+                        (Snapshot_sent (node.id, last_index)));
+              if accepted then install_snapshot node snapshot;
               (s, [])
         | Snapshot_sent (peer, last_index) ->
             C.snapshot_sent peer ~last_index node.state
+        | Snapshot_send_failed peer ->
+            C.snapshot_send_failed peer node.state
       in
 
       let rec exec_action = function
@@ -316,7 +363,8 @@ struct
                   node.state <- C.compact_log last_index node.state
               | `State app_state ->
                   node.app_state <- app_state
-            end
+            end;
+            FAILURE_SIMULATOR.tick fail_sim (C.config node.state) (List.length cmds)
         | Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat t node;
@@ -350,8 +398,9 @@ struct
             unschedule_heartbeat t node;
             schedule_heartbeat t node
         | Send (rep_id, msg) ->
-            (* drop message with probability msg_loss_rate *)
-            let dropped = RND.float t.rng 1.0 <= msg_loss_rate in
+            let dropped = FAILURE_SIMULATOR.is_msg_lost fail_sim
+                            ~src:node.id ~dst:rep_id
+            in
               if verbose then
                 printf " Send to %S <- %s%s\n" rep_id
                   (string_of_msg string_of_cmd msg)
@@ -366,14 +415,22 @@ struct
         | Send_snapshot (dst, idx, config) ->
             if verbose then
               printf " Send_snapshot (%S, %Ld)\n" dst idx;
-            let last_index, snapshot, last_term = take_snapshot node in
-            let dt = Int64.(t.rtt - t.rtt / 4L +
-                       of_int (RND.int t.rng (to_int t.rtt lsr 1)))
+            let dropped = FAILURE_SIMULATOR.is_msg_lost fail_sim
+                            ~src:node.id ~dst
             in
-              ignore begin
-                Event_queue.schedule t.ev_queue dt dst
-                  (Install_snapshot
-                     (node.id, snapshot, last_term, last_index, config))
+              if not dropped then begin
+                let last_index, snapshot, last_term = take_snapshot node in
+                let dt = Int64.(t.rtt - t.rtt / 4L +
+                           of_int (RND.int t.rng (to_int t.rtt lsr 1)))
+                in
+                  ignore begin
+                    Event_queue.schedule t.ev_queue dt dst
+                      (Install_snapshot
+                         (node.id, snapshot, last_term, last_index, config))
+                  end
+              end else begin
+                ignore (Event_queue.schedule t.ev_queue
+                          CLOCK.(10L * t.rtt) node.id (Snapshot_send_failed dst))
               end
 
       in
