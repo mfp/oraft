@@ -47,12 +47,16 @@ sig
 
   and 'a entry = Nop | Op of 'a
 
-  and append_result = {
-    term : term;
-    success : bool;
-    prev_log_index : index;
-    last_log_index : index;
-  }
+  and append_result =
+    {
+      term : term;
+      result : actual_append_result;
+    }
+
+  and actual_append_result =
+      Append_success of index (* last log entry included in msg we respond to *)
+    | Append_failure of index (* index of log entry preceding those in
+                                 message we respond to *)
 
   type 'a action =
       Apply of (index * 'a * term) list

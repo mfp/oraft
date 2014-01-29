@@ -209,20 +209,13 @@ struct
   and append_result =
     {
       term : term;
-      success : bool;
-
-      (* extra information relative to the fields on the RAFT paper *)
-
-      (* index of log entry immediately preceding new ones in AppendEntries msg
-       * this responds to; used for fast next_index rollback by the Leader
-       * and allows to receive result of concurrent AppendEntries out-of-order
-       * *)
-      prev_log_index : index;
-      (* index of last log entry included in the msg this responds to;
-       * used by the Leader to update match_index, allowing to receive results
-       * of concurrent Append_entries request out-of-order *)
-      last_log_index : index;
+      result : actual_append_result;
     }
+
+  and actual_append_result =
+      Append_success of index (* last log entry included in msg we respond to *)
+    | Append_failure of index (* index of log entry preceding those in
+                                 message we respond to *)
 
   type 'a action =
       Apply of (index * 'a * term) list
@@ -243,15 +236,13 @@ let quorum s = (1 + Array.length s.peers) / 2 + 1
 let vote_result s vote_granted =
   Vote_result { term = s.current_term; vote_granted; }
 
-let append_result s ~prev_log_index ~last_log_index success =
-  Append_result
-    { term = s.current_term; prev_log_index; last_log_index; success; }
+let append_result s result = Append_result { term = s.current_term; result }
 
-let append_ok ~prev_log_index ~last_log_index s =
-  append_result s ~prev_log_index ~last_log_index true
+let append_ok ~last_log_index s =
+  append_result s (Append_success last_log_index)
 
 let append_fail ~prev_log_index s =
-  append_result s ~prev_log_index ~last_log_index:0L false
+  append_result s (Append_failure prev_log_index)
 
 let update_commit_index s =
   (* Find last N such that log[N].term = current term AND
@@ -483,9 +474,7 @@ let receive_msg s peer = function
                 let commit_index = if leader_commit > s.commit_index then
                                      min leader_commit last_index
                                    else s.commit_index in
-                let reply        = append_ok
-                                     ~prev_log_index
-                                     ~last_log_index:last_index s in
+                let reply        = append_ok ~last_log_index:last_index s in
                 let s            = { s with commit_index; log;
                                             leader_id = Some peer; } in
                 let s, commits   = try_commit s in
@@ -556,37 +545,35 @@ let receive_msg s peer = function
 
   | Append_result { term; _ } when term < s.current_term || s.state <> Leader ->
       (s, [])
-  | Append_result { term; success; prev_log_index; last_log_index; } ->
-      if success then begin
-        let next_index  = RM.modify peer
-                            (fun idx -> max idx (Int64.succ last_log_index))
-                            s.next_index in
-        let match_index = RM.modify_def
-                            last_log_index peer
-                            (max last_log_index) s.match_index in
-        let s           = update_commit_index { s with next_index; match_index } in
-        let s, actions  = try_commit s in
-          (s, (Reset_election_timeout :: actions))
-      end else begin
-        (* "After a rejection, the leader decrements nextIndex and retries
-         * the AppendEntries RPC. Eventually nextIndex will reach a point
-         * where the leader and follower logs match." *)
-        let next_index = RM.modify peer
-                           (fun idx -> min idx prev_log_index)
-                           s.next_index in
-        let s          = { s with next_index } in
-        let idx        = RM.find peer next_index in
-          match send_entries_or_snapshot s peer idx with
-            | Snapshot ->
-                (* Must send snapshot *)
-                let config    = Array.append [| s.id |] s.peers in
-                let transfers = RS.add peer s.snapshot_transfers in
-                let s         = { s with snapshot_transfers = transfers } in
-                  (s, [Reset_election_timeout; Send_snapshot (peer, idx, config)])
-            | Snapshot_in_progress -> (s, [])
-            | Send_entries msg ->
-                (s, [Reset_election_timeout; Send (peer, msg)])
-      end
+  | Append_result { result = Append_success last_log_index; _ } ->
+      let next_index  = RM.modify peer
+                          (fun idx -> max idx (Int64.succ last_log_index))
+                          s.next_index in
+      let match_index = RM.modify_def
+                          last_log_index peer
+                          (max last_log_index) s.match_index in
+      let s           = update_commit_index { s with next_index; match_index } in
+      let s, actions  = try_commit s in
+        (s, (Reset_election_timeout :: actions))
+  | Append_result { result = Append_failure prev_log_index; _ } ->
+      (* "After a rejection, the leader decrements nextIndex and retries
+       * the AppendEntries RPC. Eventually nextIndex will reach a point
+       * where the leader and follower logs match." *)
+      let next_index = RM.modify peer
+                         (fun idx -> min idx prev_log_index)
+                         s.next_index in
+      let s          = { s with next_index } in
+      let idx        = RM.find peer next_index in
+        match send_entries_or_snapshot s peer idx with
+          | Snapshot ->
+              (* Must send snapshot *)
+              let config    = Array.append [| s.id |] s.peers in
+              let transfers = RS.add peer s.snapshot_transfers in
+              let s         = { s with snapshot_transfers = transfers } in
+                (s, [Reset_election_timeout; Send_snapshot (peer, idx, config)])
+          | Snapshot_in_progress -> (s, [])
+          | Send_entries msg ->
+              (s, [Reset_election_timeout; Send (peer, msg)])
 
 let election_timeout s = match s.state with
     (* we have the leader step down if it does not get any append_result

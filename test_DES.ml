@@ -199,9 +199,10 @@ struct
         in
           sprintf "Append_entries (%Ld, %Ld, [%s]) @ %Ld"
             prev_log_index prev_log_term payload_desc term
-    | Append_result { term; success; prev_log_index; last_log_index; _ } ->
-        sprintf "Append_result %b %Ld -- %Ld @ %Ld"
-          success prev_log_index last_log_index term
+    | Append_result { term; result = Append_success last_log_index } ->
+        sprintf "Append_result success %Ld @ %Ld" last_log_index term
+    | Append_result { term; result = Append_failure prev_log_index } ->
+        sprintf "Append_result failure %Ld @ %Ld" prev_log_index term
 
   let describe_event string_of_cmd = function
       Election_timeout -> "Election_timeout"
