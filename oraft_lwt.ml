@@ -48,6 +48,8 @@ struct
                            let compare = compare
                          end)
 
+  exception Stop_node
+
   type server =
       {
         peers                    : IO.address RM.t;
@@ -245,6 +247,7 @@ struct
             return ()
         end;
         return ()
+    | Stop -> raise_lwt Stop_node
 
   let exec_actions t l = Lwt_list.iter_s (exec_action t) l
 
@@ -300,6 +303,11 @@ struct
                 t.state <- state;
                 exec_actions t actions >>
                 run t
+
+  let run t =
+    try_lwt
+      run t
+    with Stop_node -> t.running <- false; return ()
 
   let gen_req_id t =
     let id = t.next_req_id in

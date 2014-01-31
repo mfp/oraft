@@ -168,8 +168,9 @@ struct
         ~num_nodes
         ~election_period ~heartbeat_period ~rtt
         mk_app_state =
-    let node_ids = Array.init num_nodes (sprintf "n%02d") in
-    let nodes    = Array.map (make_node mk_app_state node_ids) node_ids in
+    let node_ids = List.init num_nodes (sprintf "n%02d") in
+    let config   = Simple_config node_ids in
+    let nodes    = List.map (make_node mk_app_state config) node_ids |> Array.of_list in
       { rng; ev_queue; election_period; heartbeat_period; rtt; nodes; }
 
   let random_node_id t =
@@ -178,6 +179,13 @@ struct
   let node_ids t = Array.(to_list (map (fun n -> n.id) t.nodes))
 
   let nodes t = Array.to_list t.nodes
+
+  let string_of_config c =
+    let s_of_list l = List.map (sprintf "%S") l |> String.concat "; " in
+      match c with
+          Simple_config c -> sprintf "Simple [%s]" (s_of_list c)
+        | Joint_config (c1, c2) -> sprintf "Joint ([%s], [%s])"
+                                     (s_of_list c1) (s_of_list c2)
 
   let string_of_msg string_of_cmd = function
       Request_vote { term; candidate_id; last_log_term; last_log_index; _ } ->
@@ -188,7 +196,9 @@ struct
     | Append_entries { term; prev_log_index; prev_log_term; entries; _ } ->
         let string_of_entry = function
             Nop -> "Nop"
-          | Op cmd -> "Op " ^ Option.default (fun _ -> "<cmd>") string_of_cmd cmd in
+          | Op cmd -> "Op " ^ Option.default (fun _ -> "<cmd>") string_of_cmd cmd
+          | Config c -> "Config [" ^ string_of_config c ^ "]" in
+
         let payload_desc =
           entries |>
           List.map
@@ -258,7 +268,7 @@ struct
     type t
 
     val make : ?verbose:bool -> msg_loss_rate:float -> period:int -> RND.t -> t
-    val tick : t -> config -> int -> unit
+    val tick : t -> rep_id list -> int -> unit
     val is_msg_lost : t -> src:rep_id -> dst:rep_id -> bool
   end =
   struct
@@ -275,7 +285,7 @@ struct
     let make ?(verbose=false) ~msg_loss_rate ~period rng =
       { verbose; period; ticks_to_transition = 1000; msg_loss_rate; rng; state = `Up }
 
-    let tick t config n =
+    let tick t node_ids n =
       t.ticks_to_transition <- t.ticks_to_transition - n;
       if t.ticks_to_transition <= 0 then begin
         t.ticks_to_transition <- t.period;
@@ -284,7 +294,8 @@ struct
               if t.verbose then printf "### Node %S UP\n" id;
               t.state <- `Up
           | `Up ->
-              let id = config.(RND.int t.rng (Array.length config)) in
+              let node_ids = Array.of_list node_ids in
+              let id       = node_ids.(RND.int t.rng (Array.length node_ids)) in
                 if t.verbose then printf "### Node %S DOWN\n" id;
                 t.state <- `Down id
       end
@@ -365,7 +376,9 @@ struct
               | `State app_state ->
                   node.app_state <- app_state
             end;
-            FAILURE_SIMULATOR.tick fail_sim (C.config node.state) (List.length cmds)
+            FAILURE_SIMULATOR.tick fail_sim
+              (node.id :: C.peers node.state)
+              (List.length cmds)
         | Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat t node;
@@ -433,6 +446,8 @@ struct
                 ignore (Event_queue.schedule t.ev_queue
                           CLOCK.(10L * t.rtt) node.id (Snapshot_send_failed dst))
               end
+        | Stop -> (* FIXME: should block all events on the node *)
+            ()
 
       in
         node.state <- s;

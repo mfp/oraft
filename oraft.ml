@@ -14,9 +14,14 @@ struct
   type term      = Int64.t
   type index     = Int64.t
   type rep_id    = string
-  type config    = rep_id array
   type client_id = string
   type req_id    = client_id * Int64.t
+
+  type config =
+      Simple_config of simple_config
+    | Joint_config of simple_config * simple_config
+
+  and simple_config = rep_id list
 
   type ('a, 'b) result = [`OK of 'a | `Error of 'b]
 
@@ -24,6 +29,108 @@ struct
   module IM = Map.Make(Int64)
   module RM = Map.Make(REPID)
   module RS = Set.Make(REPID)
+
+  module Config :
+  sig
+    type t
+
+    val make         : node_id:rep_id -> config -> t
+    val status       : t -> [`Normal | `Transitional | `Joint]
+    val target       : t -> simple_config option
+    val peers        : t -> rep_id list
+    val mem          : rep_id -> t -> bool
+    val has_quorum   : rep_id list -> t -> bool
+    val join         : index -> simple_config -> t -> (t * config) option
+    val drop         : at_or_after:index -> t -> t
+
+    val all          : t -> simple_config list
+    val last_commit  : t -> config
+
+    (* returns the new config and the simple_config we must transition to (if
+     * any) when we have just committed a joint config *)
+    val commit       : index -> t -> t * simple_config option
+  end =
+  struct
+    type t   = { id : rep_id; conf : conf }
+
+    and conf =
+        Normal of simple_config
+      | Transitional of simple_config * index * simple_config
+      | Joint of simple_config * simple_config
+
+    let make ~node_id:id config =
+      let conf = match config with
+          Simple_config c -> Normal c
+        | Joint_config (c1, c2) -> Joint (c1, c2)
+      in
+        { id; conf }
+
+    let quorum c = List.length c / 2 + 1
+
+    let target t = match t.conf with
+        Normal _ -> None
+      | Transitional (_, _, c) | Joint (_, c) -> Some c
+
+    let has_quorum votes t =
+      let aux_quorum c =
+        List.fold_left (fun s x -> if List.mem x c then s + 1 else s) 0 votes >=
+        quorum c
+      in
+        match t.conf with
+          | Normal c -> aux_quorum c
+          | Joint (c1, c2) | Transitional (c1, _, c2) ->
+              aux_quorum c1 && aux_quorum c2
+
+    let join idx c2 t = match t.conf with
+        | Normal c1 ->
+            let t      = { t with conf = Transitional (c1, idx, c2) } in
+            let target = Joint_config (c1, c2) in
+              Some (t, target)
+        | _ -> None
+
+    let status t = match t.conf with
+        Normal _ -> `Normal
+      | Transitional _ -> `Transitional
+      | Joint _ -> `Joint
+
+    let drop ~at_or_after:n t = match t.conf with
+        Normal _ | Joint _ -> t
+      | Transitional (c1, m, _) when m >= n -> { t with conf = Normal c1 }
+      | Transitional _ -> t
+
+    let commit idx t = match t.conf with
+        Transitional (c1, idx', c2) when idx' <= idx ->
+          ({ t with conf = Joint (c1, c2) }, Some c2)
+      | Normal _ | Transitional _ | Joint _  -> (t, None)
+
+    module S = Set.Make(String)
+
+    let all t = match t.conf with
+        Normal c -> [c]
+      | Joint (c1, c2) | Transitional (c1, _, c2) -> [c1; c2]
+
+    let last_commit t = match t.conf with
+        Normal c | Transitional (c, _, _) -> Simple_config c
+      | Joint (c1, c2) -> Joint_config (c1, c2)
+
+    let node_set t =
+      all t |> List.concat |>
+      List.fold_left (fun s x -> S.add x s) S.empty
+
+    let peers t = node_set t |> S.remove t.id |> S.elements
+
+    let mem id t = node_set t |> S.mem id
+
+    let mem_old id t =
+      let c = match t.conf with
+        | Normal c | Joint (c, _) | Transitional (c, _, _) -> c
+      in
+        List.mem id c
+
+    let mem_new id t = match t.conf with
+        Normal _ -> true
+      | Joint (_, c) | Transitional (_, _, c) -> List.mem id c
+  end
 
   module LOG : sig
     type 'a t
@@ -34,7 +141,9 @@ struct
                         (index * 'a * term) list -> 'a t
     val append      : term:term -> 'a -> 'a t -> 'a t
     val last_index  : 'a t -> (term * index)
-    val append_many : (index * ('a * term)) list -> 'a t -> 'a t
+
+    (** @return new log and index of first conflicting entry (if any) *)
+    val append_many : (index * ('a * term)) list -> 'a t -> 'a t * index option
     val get_range   : from_inclusive:index -> to_inclusive:index -> 'a t ->
                       (index * ('a * term)) list
     val get_term    : index -> 'a t -> term option
@@ -99,9 +208,9 @@ struct
       with Not_found -> None
 
     let append_many l t = match l with
-        [] -> t
+        [] -> (t, None)
       | l ->
-          let nonconflicting =
+          let nonconflicting, conflict_idx =
             try
               let idx, term =
                 List.find
@@ -111,9 +220,9 @@ struct
                        | _ -> false)
                   l in
               let entries, _, _ = IM.split idx t.entries in
-                entries
+                (entries, Some idx)
             with Not_found ->
-              t.entries
+              (t.entries, None)
           in
             let entries =
               List.fold_left
@@ -125,7 +234,7 @@ struct
                   (idx, term)
               with _ -> t.init_index, t.init_term
             in
-              { t with last_index; last_term; entries; }
+              ({ t with last_index; last_term; entries; }, conflict_idx)
 
     let get_range ~from_inclusive ~to_inclusive t =
       if from_inclusive = t.last_index &&
@@ -156,7 +265,7 @@ struct
         voted_for    : rep_id option;
         log          : 'a entry LOG.t;
         id           : rep_id;
-        peers        : rep_id array;
+        config       : Config.t;
 
         (* volatile *)
         state        : status;
@@ -164,6 +273,9 @@ struct
         last_applied : index;
 
         leader_id : rep_id option;
+
+        (* new configuration we're transitioning to *)
+        config' : rep_id array option;
 
         (* volatile on leaders *)
         next_index  : index RM.t;
@@ -174,7 +286,7 @@ struct
         votes : RS.t;
       }
 
-  and 'a entry = Nop | Op of 'a
+  and 'a entry = Nop | Op of 'a | Config of config
 
   type 'a message =
       Request_vote of request_vote
@@ -227,11 +339,13 @@ struct
     | Reset_heartbeat
     | Send of rep_id * 'a message
     | Send_snapshot of rep_id * index * config
+    | Stop
 end
 
 include Kernel
 
-let quorum s = (1 + Array.length s.peers) / 2 + 1
+let quorum_of_config config = Array.length config / 2 + 1
+let quorum_of_peers peers   = (1 + Array.length peers) / 2 + 1
 
 let vote_result s vote_granted =
   Vote_result { term = s.current_term; vote_granted; }
@@ -244,12 +358,13 @@ let append_ok ~last_log_index s =
 let append_fail ~prev_log_index s =
   append_result s (Append_failure prev_log_index)
 
-let update_commit_index s =
+let compute_commit_index s config =
   (* Find last N such that log[N].term = current term AND
    * a majority of peers has got  match_index[peer] >= N. *)
   (* We compute it as follows: get all the match_index, sort them,
-   * and get the (M - quorum + 1)-nth as the commit index candidate, where M
-   * is the number of peers: this guarantees that a majority of all nodes
+   * and get the (M - quorum + 1)-nth ((M - quorum)-nth if the config does
+   * not include the current node) as the commit index candidate, where M is
+   * the number of peers: this guarantees that a majority of all nodes
    * (including the current leader) have least all entries up to N.
    *
    * Sample index computation and commit index candidates:
@@ -269,12 +384,23 @@ let update_commit_index s =
    * 2 committed, since it's replicated in the leader plus another node.
    *
    * *)
-  let sorted = RM.bindings s.match_index |> List.map snd |>
+  let config = Array.of_list config in
+  let sorted = RM.bindings s.match_index |>
+               List.filter_map
+                 (fun (rep_id, idx) ->
+                    if Array.mem rep_id config then Some idx else None) |>
                List.sort Int64.compare in
 
   let index  =
     try
-      List.nth sorted (Array.length s.peers + 1 - quorum s)
+      (* the index is
+       *   Npeers - quorum + 1 = len(config) - quorum      if node in config
+       *   Npeers - quorum     = len(config) - quorum - 1  if not
+       * *)
+      let n = Array.length config - quorum_of_config config -
+              (if Array.mem s.id config then 0 else 1)
+      in
+        List.nth sorted n
     with Invalid_argument _ | Not_found ->
       s.commit_index in
 
@@ -284,7 +410,17 @@ let update_commit_index s =
   let commit_index' =
     match LOG.get_term index s.log with
       | Some term when term = s.current_term -> index
-      | _ -> s.commit_index in
+      | _ -> s.commit_index
+  in
+    commit_index'
+
+let update_commit_index s =
+  (* we require majorities in both the old and the new configutation (joint
+   * consensus) *)
+  let commit_index' =
+    Config.all s.config |> List.map (compute_commit_index s) |>
+    List.fold_left min Int64.max_int
+  in
 
   (* increate monotonically *)
   let commit_index = max s.commit_index commit_index' in
@@ -304,9 +440,25 @@ let try_commit s =
       let ops     = List.filter_map
                       (function
                            (index, (Op x, term)) -> Some (index, x, term)
-                         | (_, (Nop, _)) -> None)
+                         | (_, ((Nop | Config _), _)) -> None)
                       entries in
+      let config, wanted_config = Config.commit s.commit_index s.config in
+      (* if we're the leader and wanted_config = Some conf,
+       * add a new log entry for the wanted configuration [conf]; it will be
+       * replicated on the next heartbeat *)
+      let s       = match wanted_config, s.state with
+                      | Some c, Leader ->
+                          let log = LOG.append ~term:s.current_term
+                                      (Config (Simple_config c)) s.log
+                          in
+                            { s with log; config }
+                      | _ -> { s with config } in
       let actions = match ops with [] -> [] | l -> [Apply ops] in
+      (* "In Raft the leader steps down immediately after committing a
+       * configuration entry that does not include itself." *)
+      let actions = if Config.mem s.id s.config then actions
+                    else actions @ [Stop]
+      in
         (s, actions)
 
 let heartbeat s =
@@ -343,10 +495,7 @@ let send_entries_or_snapshot s peer from =
         None -> Snapshot
       | Some x -> Send_entries x
 
-let broadcast s msg =
-  Array.to_list s.peers |>
-  List.filter_map
-    (fun p -> if p = s.id then None else Some (Send (p, msg)))
+let broadcast s msg = Config.peers s.config |> List.map (fun p -> Send (p, msg))
 
 let receive_msg s peer = function
   (* " If a server receives a request with a stale term number, it rejects the
@@ -473,13 +622,17 @@ let receive_msg s peer = function
             | Some term' when prev_log_term <> term' ->
                 (s, Send (peer, append_fail ~prev_log_index s) :: actions)
             | _ ->
-                let log          = LOG.append_many entries s.log in
+                let log, c_idx   = LOG.append_many entries s.log in
+                let config       = match c_idx with
+                                     | None -> s.config
+                                     | Some idx ->
+                                         Config.drop ~at_or_after:idx s.config in
                 let last_index   = snd (LOG.last_index log) in
                 let commit_index = if leader_commit > s.commit_index then
                                      min leader_commit last_index
                                    else s.commit_index in
                 let reply        = append_ok ~last_log_index:last_index s in
-                let s            = { s with commit_index; log;
+                let s            = { s with commit_index; log; config;
                                             leader_id = Some peer; } in
                 let s, commits   = try_commit s in
                 let actions      = List.concat
@@ -501,7 +654,8 @@ let receive_msg s peer = function
         (* "If votes received from majority of servers: become leader" *)
         let votes = RS.add peer s.votes in
         let s     = { s with votes } in
-          if RS.cardinal votes < quorum s - 1 then
+
+          if not (Config.has_quorum (RS.elements votes) s.config) then
             (s, [])
           else
             (* become leader! *)
@@ -509,10 +663,15 @@ let receive_msg s peer = function
             (* So as to have the leader know which entries are committed
              * (one of the 2 requirements to support read-only operations in
              * the leader, the other being making sure it's still the leader
-             * with a hearbeat exchange), we have it commit a blank no-op
-             * entry at the start of its term, which also serves as the
-             * initial heartbeat *)
-            let log         = LOG.append ~term:s.current_term Nop s.log in
+             * with a hearbeat exchange), we have it commit a blank
+             * no-op/config request entry at the start of its term, which also
+             * serves as the initial heartbeat. If we're in a joint consensus,
+             * we send a config request for the target configuration instead
+             * of a Nop. *)
+            let entry = match Config.target s.config with
+                          | None -> Nop
+                          | Some c -> Config (Simple_config c) in
+            let log   = LOG.append ~term:s.current_term entry s.log in
 
             (* With a regular (empty) hearbeat, this applies:
              *   "When a leader first comes to power, it initializes all
@@ -521,12 +680,12 @@ let receive_msg s peer = function
              * However, in this case we want to send the Nop too, so no Int64.succ.
              * *)
             let next_idx    = LOG.last_index log |> snd (* |> Int64.succ *) in
-            let next_index  = Array.fold_left
+            let next_index  = List.fold_left
                                 (fun m peer -> RM.add peer next_idx m)
-                                RM.empty s.peers in
-            let match_index = Array.fold_left
+                                RM.empty (Config.peers s.config) in
+            let match_index = List.fold_left
                                 (fun m peer -> RM.add peer 0L m)
-                                RM.empty s.peers in
+                                RM.empty (Config.peers s.config) in
             let s     = { s with log; next_index; match_index;
                                  state     = Leader;
                                  leader_id = Some s.id;
@@ -541,7 +700,7 @@ let receive_msg s peer = function
               let sends = broadcast s (heartbeat s) in
             *)
             let msg   = send_entries s next_idx in
-            let sends = Array.to_list s.peers |>
+            let sends = Config.peers s.config |>
                         List.filter_map
                           (fun peer -> Option.map (fun m -> Send (peer, m)) msg)
             in
@@ -571,7 +730,7 @@ let receive_msg s peer = function
         match send_entries_or_snapshot s peer idx with
           | Snapshot ->
               (* Must send snapshot *)
-              let config    = Array.append [| s.id |] s.peers in
+              let config    = Config.last_commit s.config in
               let transfers = RS.add peer s.snapshot_transfers in
               let s         = { s with snapshot_transfers = transfers } in
                 (s, [Reset_election_timeout; Send_snapshot (peer, idx, config)])
@@ -597,7 +756,7 @@ let election_timeout s = match s.state with
        * *)
       let s           = { s with current_term = Int64.succ s.current_term;
                                  state        = Candidate;
-                                 votes        = RS.empty;
+                                 votes        = RS.singleton s.id;
                                  leader_id    = None;
                                  voted_for    = Some s.id;
                         } in
@@ -616,7 +775,7 @@ let heartbeat_timeout s = match s.state with
     Follower | Candidate -> (s, [])
   | Leader ->
       let s, sends =
-        Array.to_list s.peers |>
+        Config.peers s.config |>
         List.fold_left
           (fun (s, sends) peer ->
              let idx = RM.find peer s.next_index in
@@ -629,7 +788,7 @@ let heartbeat_timeout s = match s.state with
                      (* must send snapshot if cannot send log *)
                      let transfers = RS.add peer s.snapshot_transfers in
                      let s         = { s with snapshot_transfers = transfers } in
-                     let config    = Array.append [| s.id |] s.peers in
+                     let config    = Config.last_commit s.config in
                        (s, Send_snapshot (peer, idx, config) :: sends))
           (s, [])
       in
@@ -640,7 +799,7 @@ let client_command x s = match s.state with
   | Leader ->
       let log        = LOG.append ~term:s.current_term (Op x) s.log in
       let s, actions =
-        Array.to_list s.peers |>
+        Config.peers s.config |>
         List.fold_left
           (fun (s, actions) peer ->
              let idx = RM.find peer s.next_index in
@@ -649,7 +808,7 @@ let client_command x s = match s.state with
                      (* must send snapshot if cannot send log *)
                      let transfers = RS.add peer s.snapshot_transfers in
                      let s         = { s with snapshot_transfers = transfers } in
-                     let config    = Array.append [| s.id |] s.peers in
+                     let config    = Config.last_commit s.config in
                        (s, Send_snapshot (peer, idx, config) :: actions)
                  | Snapshot_in_progress -> (s, actions)
                  | Send_entries msg -> (s, Send (peer, msg) :: actions))
@@ -663,8 +822,8 @@ let client_command x s = match s.state with
 let install_snapshot ~last_term ~last_index ~config s = match s.state with
     Leader | Candidate -> (s, false)
   | Follower ->
-      let peers = Array.filter ((<>) s.id) config in
-      let log   =
+      let config = Config.make ~node_id:s.id config in
+      let log    =
         match LOG.get_term last_index s.log with
             (* "If the follower has an entry that matches the snapshot’s last
              * included index and term, then there is no conflict: it removes only
@@ -674,11 +833,13 @@ let install_snapshot ~last_term ~last_index ~config s = match s.state with
              * *)
             Some t when t = last_term -> LOG.trim_prefix ~last_index ~last_term s.log
           | _ -> LOG.empty ~init_index:last_index ~init_term:last_term in
-      let s     = { s with log; peers;
-                           last_applied = last_index;
-                           commit_index = last_index;
-                  }
-      in (s, true)
+
+      let s = { s with log; config;
+                       last_applied = last_index;
+                       commit_index = last_index;
+              }
+      in
+        (s, true)
 
 let snapshot_sent peer ~last_index s = match s.state with
     Follower | Candidate -> (s, [])
@@ -707,6 +868,19 @@ let compact_log last_index s = match s.state with
               let log = LOG.trim_prefix ~last_index ~last_term s.log in
                 { s with log }
 
+let change_config c2 s = match s.state with
+      Follower -> `Redirect s.leader_id
+    | Candidate -> `Redirect None
+    | Leader ->
+        match
+          Config.join (LOG.last_index s.log |> snd |> Int64.succ) c2 s.config
+        with
+            None -> `Change_in_process
+          | Some (config, target) ->
+              let log    = LOG.append ~term:s.current_term (Config target) s.log in
+              let s      = { s with config; log } in
+                `Start_change s
+
 module Types = Kernel
 
 module Core =
@@ -714,14 +888,15 @@ struct
   include Types
 
   let make ~id ~current_term ~voted_for ~log ~config () =
-    let log   = LOG.of_list ~init_index:0L ~init_term:current_term log in
-    let peers = Array.filter ((<>) id) config in
+    let log    = LOG.of_list ~init_index:0L ~init_term:current_term log in
+    let config = Config.make ~node_id:id config in
       {
-        current_term; voted_for; log; id; peers;
+        current_term; voted_for; log; id; config;
         state        = Follower;
         commit_index = 0L;
         last_applied = 0L;
         leader_id    = None;
+        config'      = None;
         next_index   = RM.empty;
         match_index  = RM.empty;
         votes        = RS.empty;
@@ -734,7 +909,7 @@ struct
   let status s = s.state
   let last_index s = snd (LOG.last_index s.log)
   let last_term s  = fst (LOG.last_index s.log)
-  let config s     = Array.append [| s.id |] s.peers
+  let peers s      = Config.peers s.config
 
   let receive_msg       = receive_msg
   let election_timeout  = election_timeout
@@ -744,4 +919,5 @@ struct
   let snapshot_sent     = snapshot_sent
   let compact_log       = compact_log
   let snapshot_send_failed = snapshot_send_failed
+  let change_config     = change_config
 end

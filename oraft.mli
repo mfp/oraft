@@ -12,9 +12,14 @@ sig
   type term      = Int64.t
   type index     = Int64.t
   type rep_id    = string
-  type config    = rep_id array
   type client_id = string
   type req_id    = client_id * Int64.t
+
+  type config =
+      Simple_config of simple_config
+    | Joint_config of simple_config * simple_config
+
+  and simple_config = rep_id list
 
   type ('a, 'b) result = [`OK of 'a | `Error of 'b]
 
@@ -45,7 +50,7 @@ sig
     leader_commit : index;
   }
 
-  and 'a entry = Nop | Op of 'a
+  and 'a entry = Nop | Op of 'a | Config of config
 
   and append_result =
     {
@@ -68,6 +73,7 @@ sig
     | Reset_heartbeat
     | Send of rep_id * 'a message
     | Send_snapshot of rep_id * index * config
+    | Stop
 end
 
 module Core :
@@ -87,7 +93,7 @@ sig
 
   val last_index : 'a state -> index
   val last_term  : 'a state -> term
-  val config     : 'a state -> config
+  val peers      : 'a state -> rep_id list
 
   val receive_msg :
     'a state -> rep_id -> 'a message -> 'a state * 'a action list
@@ -106,4 +112,7 @@ sig
     'a state * bool
 
   val compact_log : index -> 'a state -> 'a state
+
+  val change_config : simple_config -> 'a state ->
+    [ `Redirect of rep_id option | `Change_in_process | `Start_change of 'a state ]
 end
