@@ -114,5 +114,6 @@ sig
   val compact_log : index -> 'a state -> 'a state
 
   val change_config : simple_config -> 'a state ->
-    [ `Redirect of rep_id option | `Change_in_process | `Start_change of 'a state ]
+    [ `Already_changed | `Redirect of rep_id option
+    | `Change_in_process | `Start_change of 'a state ]
 end

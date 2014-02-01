@@ -868,6 +868,9 @@ let compact_log last_index s = match s.state with
               let log = LOG.trim_prefix ~last_index ~last_term s.log in
                 { s with log }
 
+let config_eq c1 c2 =
+  List.sort String.compare c1 = List.sort String.compare c2
+
 let change_config c2 s = match s.state with
       Follower -> `Redirect s.leader_id
     | Candidate -> `Redirect None
@@ -877,9 +880,12 @@ let change_config c2 s = match s.state with
         with
             None -> `Change_in_process
           | Some (config, target) ->
-              let log    = LOG.append ~term:s.current_term (Config target) s.log in
-              let s      = { s with config; log } in
-                `Start_change s
+              match Config.last_commit s.config with
+                | Simple_config c when config_eq c c2 -> `Already_changed
+                | _ ->
+                    let log    = LOG.append ~term:s.current_term (Config target) s.log in
+                    let s      = { s with config; log } in
+                      `Start_change s
 
 module Types = Kernel
 
