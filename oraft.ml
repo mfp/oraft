@@ -39,11 +39,12 @@ struct
     val target       : t -> simple_config option
     val peers        : t -> rep_id list
     val mem          : rep_id -> t -> bool
-    val has_quorum   : rep_id list -> t -> bool
     val join         : index -> simple_config -> t -> (t * config) option
     val drop         : at_or_after:index -> t -> t
 
-    val all          : t -> simple_config list
+    val has_quorum   : rep_id list -> t -> bool
+    val quorum_min   : (rep_id -> Int64.t) -> t -> Int64.t
+
     val last_commit  : t -> config
 
     (* returns the new config and the simple_config we must transition to (if
@@ -80,6 +81,15 @@ struct
           | Normal c -> aux_quorum c
           | Joint (c1, c2) | Transitional (c1, _, c2) ->
               aux_quorum c1 && aux_quorum c2
+
+    let quorum_min_simple get c =
+      let vs = List.(map get c |> sort Int64.compare) in
+        try List.nth vs (quorum c - 1) with _ -> 0L
+
+    let quorum_min get t = match t.conf with
+        Normal c -> quorum_min_simple get c
+      | Joint (c1, c2) | Transitional (c1, _, c2) ->
+          min (quorum_min_simple get c1) (quorum_min_simple get c2)
 
     let join idx c2 t = match t.conf with
         | Normal c1 ->
@@ -358,69 +368,25 @@ let append_ok ~last_log_index s =
 let append_fail ~prev_log_index s =
   append_result s (Append_failure prev_log_index)
 
-let compute_commit_index s config =
+let update_commit_index s =
   (* Find last N such that log[N].term = current term AND
    * a majority of peers has got  match_index[peer] >= N. *)
-  (* We compute it as follows: get all the match_index, sort them,
-   * and get the (M - quorum + 1)-nth ((M - quorum)-nth if the config does
-   * not include the current node) as the commit index candidate, where M is
-   * the number of peers: this guarantees that a majority of all nodes
-   * (including the current leader) have least all entries up to N.
-   *
-   * Sample index computation and commit index candidates:
-   *  [1; 2; 3; 4; 5; 6] -> 4 idx 3   quorum 4    7-4
-   *  [1; 2; 3; 4; 5] -> 3    idx 2   quorum 4    6-4
-   *  [1; 2; 3; 4] -> 3       idx 2   quorum 3    5-3
-   *  [1; 2; 3] -> 2          idx 1   quorum 3    4-3
-   *  [1; 2] -> 2             idx 1   quorum 2    3-2
-   *  [1] -> 1                idx 0   quorum 2    2-2
-   *
-   * E.g., M = 3 nodes, quorum = 2, with sorted match_index array like
-   *   [ 1; 2 ]
-   * we take the  (3 - 2 + 1) = 2nd element (index 1 = 3 - 2 = M - quorum).
-   *
-   * The new commit index candidate is N = 2: if it fulfills the 2nd criterion
-   * ("restriction on commitment"), we can consider entries up to (including)
-   * 2 committed, since it's replicated in the leader plus another node.
-   *
-   * *)
-  let config = Array.of_list config in
-  let sorted = RM.bindings s.match_index |>
-               List.filter_map
-                 (fun (rep_id, idx) ->
-                    if Array.mem rep_id config then Some idx else None) |>
-               List.sort Int64.compare in
+  (* We require majorities in both the old and the new configutation during
+   * the joint consensus. *)
 
-  let index  =
-    try
-      (* the index is
-       *   Npeers - quorum + 1 = len(config) - quorum      if node in config
-       *   Npeers - quorum     = len(config) - quorum - 1  if not
-       * *)
-      let n = Array.length config - quorum_of_config config -
-              (if Array.mem s.id config then 0 else 1)
-      in
-        List.nth sorted n
-    with Invalid_argument _ | Not_found ->
-      s.commit_index in
+  let get_match_index id =
+    if id = s.id then LOG.last_index s.log |> snd
+    else try RM.find id s.match_index with Not_found -> 0L in
 
-  (* index is the largest N such that at least half of the peers have
+  let i = Config.quorum_min get_match_index s.config in
+
+  (* i is the largest N such that at least half of the peers have
    * match_Index[peer] >= N; we have to enforce the other restriction:
    * log[N].term = current *)
   let commit_index' =
-    match LOG.get_term index s.log with
-      | Some term when term = s.current_term -> index
-      | _ -> s.commit_index
-  in
-    commit_index'
-
-let update_commit_index s =
-  (* we require majorities in both the old and the new configutation (joint
-   * consensus) *)
-  let commit_index' =
-    Config.all s.config |> List.map (compute_commit_index s) |>
-    List.fold_left min Int64.max_int
-  in
+    match LOG.get_term i s.log with
+      | Some term when term = s.current_term -> i
+      | _ -> s.commit_index in
 
   (* increate monotonically *)
   let commit_index = max s.commit_index commit_index' in
