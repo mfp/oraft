@@ -37,8 +37,17 @@ struct
     val make         : node_id:rep_id -> config -> t
     val status       : t -> [`Normal | `Transitional | `Joint]
     val target       : t -> (simple_config * passive_peers) option
+
+    (** Returns all peers (including passive). *)
     val peers        : t -> rep_id list
+
+    (** Returns whether the node is included in the configuration (including
+      * passive peers). *)
     val mem          : rep_id -> t -> bool
+
+    (** Returns whether the node is an active member of the configuration. *)
+    val mem_active   : rep_id -> t -> bool
+
     val join         : index -> ?passive:passive_peers -> simple_config ->
                          t -> (t * config) option
     val drop         : at_or_after:index -> t -> t
@@ -54,19 +63,24 @@ struct
     val commit       : index -> t -> t * (simple_config * passive_peers) option
   end =
   struct
-    type t   = { id : rep_id; conf : conf }
+    module S = Set.Make(String)
+    type t   = { id : rep_id; conf : conf; active : S.t; }
 
     and conf =
         Normal of simple_config * passive_peers
       | Transitional of simple_config * index * simple_config * passive_peers
       | Joint of simple_config * simple_config * passive_peers
 
+    let s_of_list = List.fold_left (fun s x -> S.add x s) S.empty
+
     let make ~node_id:id config =
-      let conf = match config with
-          Simple_config (c, passive) -> Normal (c, passive)
-        | Joint_config (c1, c2, passive) -> Joint (c1, c2, passive)
+      let conf, active = match config with
+          Simple_config (c, passive) ->
+            (Normal (c, passive), s_of_list c)
+        | Joint_config (c1, c2, passive) ->
+            (Joint (c1, c2, passive), s_of_list (c1 @ c2))
       in
-        { id; conf }
+        { id; conf; active; }
 
     let quorum c = List.length c / 2 + 1
 
@@ -96,7 +110,9 @@ struct
     let join idx ?passive:p c2 t = match t.conf with
         | Normal (c1, passive) ->
             let p      = Option.default passive p in
-            let t      = { t with conf = Transitional (c1, idx, c2, p) } in
+            let active = s_of_list (c1 @ c2) in
+            let conf   = Transitional (c1, idx, c2, p) in
+            let t      = { t with conf; active; } in
             let target = Joint_config (c1, c2, p) in
               Some (t, target)
         | _ -> None
@@ -109,15 +125,15 @@ struct
     let drop ~at_or_after:n t = match t.conf with
         Normal _ | Joint _ -> t
       | Transitional (c1, m, _, passive) when m >= n ->
-          { t with conf = Normal (c1, passive) }
+          { t with conf = Normal (c1, passive); active = s_of_list c1 }
       | Transitional _ -> t
 
     let commit idx t = match t.conf with
         Transitional (c1, idx', c2, passive) when idx' <= idx ->
-          ({ t with conf = Joint (c1, c2, passive) }, Some (c2, passive))
+          let conf   = Joint (c1, c2, passive) in
+          let active = s_of_list (c1 @ c2) in
+            ({ t with conf; active; }, Some (c2, passive))
       | Normal _ | Transitional _ | Joint _  -> (t, None)
-
-    module S = Set.Make(String)
 
     let last_commit t = match t.conf with
         Normal (c, passive) | Transitional (c, _, _, passive) ->
@@ -141,6 +157,8 @@ struct
     let peers t = node_set t |> S.remove t.id |> S.elements
 
     let mem id t = node_set t |> S.mem id
+
+    let mem_active id t = S.mem id t.active
   end
 
   module LOG : sig
@@ -472,6 +490,13 @@ let send_entries_or_snapshot s peer from =
 let broadcast s msg = CONFIG.peers s.config |> List.map (fun p -> Send (p, msg))
 
 let receive_msg s peer = function
+  (* Reject vote requests/results and Append_entries (which should not be
+   * received anyway since passive members cannot become leaders) from passive
+   * members *)
+  | Append_entries _
+  | Request_vote _ | Vote_result _ when not (CONFIG.mem_active peer s.config) ->
+      (s, [])
+
   (* " If a server receives a request with a stale term number, it rejects the
    * request." *)
   | Request_vote { term; _ } when term < s.current_term ->
