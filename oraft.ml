@@ -738,9 +738,12 @@ let receive_msg s peer = function
               (s, [Reset_election_timeout; Send (peer, msg)])
 
 let election_timeout s = match s.state with
+    (* passive nodes do not trigger elections *)
+  | _ when not (CONFIG.mem_active s.id s.config) -> (s, [])
+
     (* we have the leader step down if it does not get any append_result
      * within an election timeout *)
-    Leader
+  | Leader
 
   (* "If election timeout elapses without receiving AppendEntries RPC from
    * current leader or granting vote to candidate: convert to candidate" *)
