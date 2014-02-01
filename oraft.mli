@@ -68,6 +68,7 @@ sig
     | Become_candidate
     | Become_follower of rep_id option
     | Become_leader
+    | Changed_config
     | Redirect of rep_id option * 'a
     | Reset_election_timeout
     | Reset_heartbeat

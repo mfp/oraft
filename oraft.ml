@@ -345,6 +345,7 @@ struct
     | Become_candidate
     | Become_follower of rep_id option
     | Become_leader
+    | Changed_config
     | Redirect of rep_id option * 'a
     | Reset_election_timeout
     | Reset_heartbeat
@@ -409,7 +410,11 @@ let try_commit s =
                            (index, (Op x, term)) -> Some (index, x, term)
                          | (_, ((Nop | Config _), _)) -> None)
                       entries in
+
       let config, wanted_config = CONFIG.commit s.commit_index s.config in
+      let changed_config        = List.exists
+                                    (function (_, (Config _, _)) -> true | _ -> false)
+                                    entries in
       (* if we're the leader and wanted_config = Some conf,
        * add a new log entry for the wanted configuration [conf]; it will be
        * replicated on the next heartbeat *)
@@ -424,7 +429,9 @@ let try_commit s =
       (* "In Raft the leader steps down immediately after committing a
        * configuration entry that does not include itself." *)
       let actions = if CONFIG.mem s.id s.config then actions
-                    else actions @ [Stop]
+                    else actions @ [Stop] in
+      let actions = if changed_config then Changed_config :: actions
+                    else actions
       in
         (s, actions)
 

@@ -201,6 +201,7 @@ struct
         Lwt_condition.broadcast t.leader_signal ();
         exec_action t Reset_election_timeout >>
         exec_action t Reset_heartbeat
+    | Changed_config -> return_unit
     | Apply l ->
         Lwt_list.iter_s
           (fun (index, (req_id, op), term) ->

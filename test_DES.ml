@@ -398,6 +398,8 @@ struct
             unschedule_election t node;
             schedule_election t node;
             schedule_heartbeat t node
+        | Changed_config ->
+            if verbose then printf " Changed config\n"
         | Redirect (Some leader, cmd) ->
             if verbose then printf " Redirect %s\n" leader;
             send_cmd ~dst:leader cmd
