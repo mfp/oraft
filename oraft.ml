@@ -18,10 +18,10 @@ struct
   type req_id    = client_id * Int64.t
 
   type config =
-      Simple_config of simple_config
-    | Joint_config of simple_config * simple_config
-
+      Simple_config of simple_config * passive_peers
+    | Joint_config of simple_config * simple_config * passive_peers
   and simple_config = rep_id list
+  and passive_peers = rep_id list
 
   type ('a, 'b) result = [`OK of 'a | `Error of 'b]
 
@@ -36,33 +36,35 @@ struct
 
     val make         : node_id:rep_id -> config -> t
     val status       : t -> [`Normal | `Transitional | `Joint]
-    val target       : t -> simple_config option
+    val target       : t -> (simple_config * passive_peers) option
     val peers        : t -> rep_id list
     val mem          : rep_id -> t -> bool
-    val join         : index -> simple_config -> t -> (t * config) option
+    val join         : index -> ?passive:passive_peers -> simple_config ->
+                         t -> (t * config) option
     val drop         : at_or_after:index -> t -> t
 
     val has_quorum   : rep_id list -> t -> bool
     val quorum_min   : (rep_id -> Int64.t) -> t -> Int64.t
 
     val last_commit  : t -> config
+    val current      : t -> config
 
     (* returns the new config and the simple_config we must transition to (if
      * any) when we have just committed a joint config *)
-    val commit       : index -> t -> t * simple_config option
+    val commit       : index -> t -> t * (simple_config * passive_peers) option
   end =
   struct
     type t   = { id : rep_id; conf : conf }
 
     and conf =
-        Normal of simple_config
-      | Transitional of simple_config * index * simple_config
-      | Joint of simple_config * simple_config
+        Normal of simple_config * passive_peers
+      | Transitional of simple_config * index * simple_config * passive_peers
+      | Joint of simple_config * simple_config * passive_peers
 
     let make ~node_id:id config =
       let conf = match config with
-          Simple_config c -> Normal c
-        | Joint_config (c1, c2) -> Joint (c1, c2)
+          Simple_config (c, passive) -> Normal (c, passive)
+        | Joint_config (c1, c2, passive) -> Joint (c1, c2, passive)
       in
         { id; conf }
 
@@ -70,7 +72,7 @@ struct
 
     let target t = match t.conf with
         Normal _ -> None
-      | Transitional (_, _, c) | Joint (_, c) -> Some c
+      | Transitional (_, _, c, passive) | Joint (_, c, passive) -> Some (c, passive)
 
     let has_quorum votes t =
       let aux_quorum c =
@@ -78,8 +80,8 @@ struct
         quorum c
       in
         match t.conf with
-          | Normal c -> aux_quorum c
-          | Joint (c1, c2) | Transitional (c1, _, c2) ->
+          | Normal (c, _) -> aux_quorum c
+          | Joint (c1, c2, _) | Transitional (c1, _, c2, _) ->
               aux_quorum c1 && aux_quorum c2
 
     let quorum_min_simple get c =
@@ -87,14 +89,15 @@ struct
         try List.nth vs (quorum c - 1) with _ -> 0L
 
     let quorum_min get t = match t.conf with
-        Normal c -> quorum_min_simple get c
-      | Joint (c1, c2) | Transitional (c1, _, c2) ->
+        Normal (c, _) -> quorum_min_simple get c
+      | Joint (c1, c2, _) | Transitional (c1, _, c2, _) ->
           min (quorum_min_simple get c1) (quorum_min_simple get c2)
 
-    let join idx c2 t = match t.conf with
-        | Normal c1 ->
-            let t      = { t with conf = Transitional (c1, idx, c2) } in
-            let target = Joint_config (c1, c2) in
+    let join idx ?passive:p c2 t = match t.conf with
+        | Normal (c1, passive) ->
+            let p      = Option.default passive p in
+            let t      = { t with conf = Transitional (c1, idx, c2, p) } in
+            let target = Joint_config (c1, c2, p) in
               Some (t, target)
         | _ -> None
 
@@ -105,23 +108,31 @@ struct
 
     let drop ~at_or_after:n t = match t.conf with
         Normal _ | Joint _ -> t
-      | Transitional (c1, m, _) when m >= n -> { t with conf = Normal c1 }
+      | Transitional (c1, m, _, passive) when m >= n ->
+          { t with conf = Normal (c1, passive) }
       | Transitional _ -> t
 
     let commit idx t = match t.conf with
-        Transitional (c1, idx', c2) when idx' <= idx ->
-          ({ t with conf = Joint (c1, c2) }, Some c2)
+        Transitional (c1, idx', c2, passive) when idx' <= idx ->
+          ({ t with conf = Joint (c1, c2, passive) }, Some (c2, passive))
       | Normal _ | Transitional _ | Joint _  -> (t, None)
 
     module S = Set.Make(String)
 
-    let all t = match t.conf with
-        Normal c -> [c]
-      | Joint (c1, c2) | Transitional (c1, _, c2) -> [c1; c2]
-
     let last_commit t = match t.conf with
-        Normal c | Transitional (c, _, _) -> Simple_config c
-      | Joint (c1, c2) -> Joint_config (c1, c2)
+        Normal (c, passive) | Transitional (c, _, _, passive) ->
+            Simple_config (c, passive)
+      | Joint (c1, c2, passive) -> Joint_config (c1, c2, passive)
+
+    let current t = match t.conf with
+        Normal (c, passive) -> Simple_config (c, passive)
+      | Transitional (c1, _, c2, passive)
+      | Joint (c1, c2, passive) -> Joint_config (c1, c2, passive)
+
+    let all t = match t.conf with
+        Normal (c, passive) -> [c; passive]
+      | Joint (c1, c2, passive) | Transitional (c1, _, c2, passive) ->
+          [c1; c2; passive]
 
     let node_set t =
       all t |> List.concat |>
@@ -133,13 +144,13 @@ struct
 
     let mem_old id t =
       let c = match t.conf with
-        | Normal c | Joint (c, _) | Transitional (c, _, _) -> c
+        | Normal (c, _) | Joint (c, _, _) | Transitional (c, _, _, _) -> c
       in
         List.mem id c
 
     let mem_new id t = match t.conf with
         Normal _ -> true
-      | Joint (_, c) | Transitional (_, _, c) -> List.mem id c
+      | Joint (_, c, _) | Transitional (_, _, c, _) -> List.mem id c
   end
 
   module LOG : sig
@@ -413,9 +424,9 @@ let try_commit s =
        * add a new log entry for the wanted configuration [conf]; it will be
        * replicated on the next heartbeat *)
       let s       = match wanted_config, s.state with
-                      | Some c, Leader ->
+                      | Some (c, passive), Leader ->
                           let log = LOG.append ~term:s.current_term
-                                      (Config (Simple_config c)) s.log
+                                      (Config (Simple_config (c, passive))) s.log
                           in
                             { s with log; config }
                       | _ -> { s with config } in
@@ -636,7 +647,7 @@ let receive_msg s peer = function
              * of a Nop. *)
             let entry = match Config.target s.config with
                           | None -> Nop
-                          | Some c -> Config (Simple_config c) in
+                          | Some (c, passive) -> Config (Simple_config (c, passive)) in
             let log   = LOG.append ~term:s.current_term entry s.log in
 
             (* With a regular (empty) hearbeat, this applies:
@@ -837,17 +848,19 @@ let compact_log last_index s = match s.state with
 let config_eq c1 c2 =
   List.sort String.compare c1 = List.sort String.compare c2
 
-let change_config c2 s = match s.state with
+let change_config ?passive c2 s = match s.state with
       Follower -> `Redirect s.leader_id
     | Candidate -> `Redirect None
     | Leader ->
         match
-          Config.join (LOG.last_index s.log |> snd |> Int64.succ) c2 s.config
+          Config.join (LOG.last_index s.log |> snd |> Int64.succ) ?passive c2 s.config
         with
             None -> `Change_in_process
           | Some (config, target) ->
               match Config.last_commit s.config with
-                | Simple_config c when config_eq c c2 -> `Already_changed
+                | Simple_config (c, p)
+                    when config_eq c c2 && config_eq p (Option.default p passive) ->
+                    `Already_changed
                 | _ ->
                     let log    = LOG.append ~term:s.current_term (Config target) s.log in
                     let s      = { s with config; log } in
@@ -879,6 +892,7 @@ struct
 
   let id s     = s.id
   let status s = s.state
+  let config s = Config.current s.config
   let last_index s = snd (LOG.last_index s.log)
   let last_term s  = fst (LOG.last_index s.log)
   let peers s      = Config.peers s.config

@@ -169,7 +169,7 @@ struct
         ~election_period ~heartbeat_period ~rtt
         mk_app_state =
     let node_ids = List.init num_nodes (sprintf "n%02d") in
-    let config   = Simple_config node_ids in
+    let config   = Simple_config (node_ids, []) in
     let nodes    = List.map (make_node mk_app_state config) node_ids |> Array.of_list in
       { rng; ev_queue; election_period; heartbeat_period; rtt; nodes; }
 
@@ -183,9 +183,11 @@ struct
   let string_of_config c =
     let s_of_list l = List.map (sprintf "%S") l |> String.concat "; " in
       match c with
-          Simple_config c -> sprintf "Simple [%s]" (s_of_list c)
-        | Joint_config (c1, c2) -> sprintf "Joint ([%s], [%s])"
-                                     (s_of_list c1) (s_of_list c2)
+          Simple_config (c, passive) ->
+            sprintf "Simple ([%s], [%s])" (s_of_list c) (s_of_list passive)
+        | Joint_config (c1, c2, passive) ->
+            sprintf "Joint ([%s], [%s], [%s])"
+              (s_of_list c1) (s_of_list c2) (s_of_list passive)
 
   let string_of_msg string_of_cmd = function
       Request_vote { term; candidate_id; last_log_term; last_log_index; _ } ->

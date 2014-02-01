@@ -16,10 +16,10 @@ sig
   type req_id    = client_id * Int64.t
 
   type config =
-      Simple_config of simple_config
-    | Joint_config of simple_config * simple_config
-
+      Simple_config of simple_config * passive_peers
+    | Joint_config of simple_config * simple_config * passive_peers
   and simple_config = rep_id list
+  and passive_peers = rep_id list
 
   type ('a, 'b) result = [`OK of 'a | `Error of 'b]
 
@@ -90,6 +90,7 @@ sig
   val leader_id : 'a state -> rep_id option
   val id        : 'a state -> rep_id
   val status    : 'a state -> status
+  val config    : 'a state -> config
 
   val last_index : 'a state -> index
   val last_term  : 'a state -> term
@@ -113,7 +114,14 @@ sig
 
   val compact_log : index -> 'a state -> 'a state
 
-  val change_config : simple_config -> 'a state ->
+  (* Start a safe configuration change by using the joint consensus protocol.
+   *
+   * @param passive the passive peers (replicated to, but not participating in
+   * commit/vote decisions). Kept as-is if [None].
+   * *)
+  val change_config :
+    ?passive:passive_peers ->
+    simple_config -> 'a state ->
     [ `Already_changed | `Redirect of rep_id option
     | `Change_in_process | `Start_change of 'a state ]
 end
