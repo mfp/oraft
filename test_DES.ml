@@ -325,70 +325,74 @@ struct
       try Some (Array.find (fun n -> n.id = id) des.active)
       with Not_found -> None
 
+    let add_passive_node t des =
+      if Array.length des.passive <> 0 then
+        t.state <- Passive
+      else begin
+        let newnode = des.make_node () in
+        let passive = Array.to_list des.passive @ [ newnode ] in
+
+          let rec try_to_change (node : (_, _) node) =
+            match
+              C.change_config
+                ~passive:(List.map (fun n -> n.id) passive)
+                (List.map (fun n -> n.id) (Array.to_list des.active))
+                node.state
+            with
+                `Already_changed | `Change_in_process ->
+                    t.state <- Passive
+              | `Redirect None -> ()
+              | `Start_change state ->
+                  if t.verbose then
+                    printf "!! Adding passive node %S\n" newnode.id;
+                  des.passive <- Array.of_list passive;
+                  node.state <- state;
+                  t.state <- Passive
+
+              | `Redirect (Some leader_id) ->
+                  match get_active_node des leader_id with
+                      None -> ()
+                    | Some node -> try_to_change node
+          in try_to_change des.active.(0)
+      end
+
+    let replace_node_with_standby t des =
+      (* replace one active node by a passive standby *)
+      match Array.to_list des.passive, C.config des.active.(0).state with
+        | added :: passive, Simple_config (dropped :: active, _) ->
+            let rec try_to_change (node : (_, _) node) =
+              match
+                C.change_config
+                  ~passive:(List.map (fun n -> n.id) passive)
+                  (active @ [added.id]) node.state
+              with
+                  `Already_changed | `Change_in_process
+                | `Redirect None ->
+                    t.state <- Wait
+
+                | `Start_change state ->
+                    if t.verbose then
+                      printf "!! Replacing node %S with %S\n" dropped added.id;
+                    des.active <- Array.append des.active [| added |];
+                    des.passive <- Array.of_list passive;
+                    node.state <- state;
+                    t.state <- Wait
+
+                | `Redirect (Some leader_id) ->
+                    match get_active_node des leader_id with
+                        None -> ()
+                      | Some node -> try_to_change node
+            in try_to_change des.active.(0)
+        | [], _ | _, Simple_config ([], _) | _, Joint_config _ -> ()
+
     let tick ({ des = DES des; _ } as t) n =
       t.ticks <- t.ticks + n;
       (* printf "TICK %d\n" n; *)
       if t.ticks > t.period then begin
         t.ticks <- 0;
         match t.state with
-            Wait ->
-              if Array.length des.passive <> 0 then
-                t.state <- Passive
-              else begin
-                let newnode = des.make_node () in
-                let passive = Array.to_list des.passive @ [ newnode ] in
-
-                  let rec try_to_change (node : (_, _) node) =
-                    match
-                      C.change_config
-                        ~passive:(List.map (fun n -> n.id) passive)
-                        (List.map (fun n -> n.id) (Array.to_list des.active))
-                        node.state
-                    with
-                        `Already_changed | `Change_in_process ->
-                            t.state <- Passive
-                      | `Redirect None -> ()
-                      | `Start_change state ->
-                          if t.verbose then
-                            printf "!! Adding passive node %S\n" newnode.id;
-                          des.passive <- Array.of_list passive;
-                          node.state <- state;
-                          t.state <- Passive
-
-                      | `Redirect (Some leader_id) ->
-                          match get_active_node des leader_id with
-                              None -> ()
-                            | Some node -> try_to_change node
-                  in try_to_change des.active.(0)
-              end
-          | Passive ->
-              (* replace one active node by a passive standby *)
-              match Array.to_list des.passive, C.config des.active.(0).state with
-                | added :: passive, Simple_config (dropped :: active, _) ->
-                    let rec try_to_change (node : (_, _) node) =
-                      match
-                        C.change_config
-                          ~passive:(List.map (fun n -> n.id) passive)
-                          (active @ [added.id]) node.state
-                      with
-                          `Already_changed | `Change_in_process
-                        | `Redirect None ->
-                            t.state <- Wait
-
-                        | `Start_change state ->
-                            if t.verbose then
-                              printf "!! Replacing node %S with %S\n" dropped added.id;
-                            des.active <- Array.append des.active [| added |];
-                            des.passive <- Array.of_list passive;
-                            node.state <- state;
-                            t.state <- Wait
-
-                        | `Redirect (Some leader_id) ->
-                            match get_active_node des leader_id with
-                                None -> ()
-                              | Some node -> try_to_change node
-                    in try_to_change des.active.(0)
-                | [], _ | _, Simple_config ([], _) | _, Joint_config _ -> ()
+            Wait -> add_passive_node t des
+          | Passive -> replace_node_with_standby t des
       end
   end
 
