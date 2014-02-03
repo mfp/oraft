@@ -321,6 +321,10 @@ struct
     let make ?(verbose=false) ~period des =
       { verbose; state = Wait; ticks = 0; period; des = DES des; }
 
+    let get_active_node des id =
+      try Some (Array.find (fun n -> n.id = id) des.active)
+      with Not_found -> None
+
     let tick ({ des = DES des; _ } as t) n =
       t.ticks <- t.ticks + n;
       (* printf "TICK %d\n" n; *)
@@ -328,20 +332,39 @@ struct
         t.ticks <- 0;
         match t.state with
             Wait ->
-              if Array.length des.passive = 0 then begin
-                let node = des.make_node () in
-                  if t.verbose then printf "!! Adding passive node %S\n" node.id;
-                  des.passive <- Array.append des.passive [|node|];
-              end;
-              t.state <- Passive
+              if Array.length des.passive <> 0 then
+                t.state <- Passive
+              else begin
+                let node    = des.make_node () in
+                let passive = Array.to_list des.passive @ [ node ] in
+
+                  let rec try_to_change (node : (_, _) node) =
+                    match
+                      C.change_config
+                        ~passive:(List.map (fun n -> n.id) passive)
+                        (List.map (fun n -> n.id) (Array.to_list des.active))
+                        node.state
+                    with
+                        `Already_changed | `Change_in_process ->
+                            t.state <- Passive
+                      | `Redirect None -> ()
+                      | `Start_change state ->
+                          if t.verbose then
+                            printf "!! Adding passive node %S\n" node.id;
+                          des.passive <- Array.of_list passive;
+                          node.state <- state;
+                          t.state <- Passive
+
+                      | `Redirect (Some leader_id) ->
+                          match get_active_node des leader_id with
+                              None -> ()
+                            | Some node -> try_to_change node
+                  in try_to_change des.active.(0)
+              end
           | Passive ->
               (* replace one active node by a passive standby *)
               match Array.to_list des.passive, C.config des.active.(0).state with
                 | added :: passive, Simple_config (dropped :: active, _) ->
-                    let get_active_node id =
-                      try Some (Array.find (fun n -> n.id = id) des.active)
-                      with Not_found -> None in
-
                     let rec try_to_change (node : (_, _) node) =
                       match
                         C.change_config
@@ -361,7 +384,7 @@ struct
                             t.state <- Wait
 
                         | `Redirect (Some leader_id) ->
-                            match get_active_node leader_id with
+                            match get_active_node des leader_id with
                                 None -> ()
                               | Some node -> try_to_change node
                     in try_to_change des.active.(0)
