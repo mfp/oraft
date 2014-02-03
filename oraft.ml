@@ -34,8 +34,8 @@ struct
   sig
     type t
 
-    val make         : node_id:rep_id -> config -> t
-    val status       : t -> [`Normal | `Transitional | `Joint]
+    val make         : node_id:rep_id -> index:index -> config -> t
+    val status       : t -> [`Normal | `Joint]
     val target       : t -> (simple_config * passive_peers) option
 
     (** Returns all peers (including passive). *)
@@ -48,6 +48,7 @@ struct
     (** Returns whether the node is an active member of the configuration. *)
     val mem_active   : rep_id -> t -> bool
 
+    val update       : (index * config) list -> t -> t
     val join         : index -> ?passive:passive_peers -> simple_config ->
                          t -> (t * config) option
     val drop         : at_or_after:index -> t -> t
@@ -64,91 +65,104 @@ struct
   end =
   struct
     module S = Set.Make(String)
-    type t   = { id : rep_id; conf : conf; active : S.t; }
-
-    and conf =
-        Normal of simple_config * passive_peers
-      | Transitional of simple_config * index * simple_config * passive_peers
-      | Joint of simple_config * simple_config * passive_peers
+    type t   =
+        { id        : rep_id;
+          committed : (index * config);
+          latest    : (index * config);
+          q         : (index * config) list;
+          active    : S.t;
+        }
 
     let s_of_list = List.fold_left (fun s x -> S.add x s) S.empty
 
-    let make ~node_id:id config =
-      let conf, active = match config with
-          Simple_config (c, passive) ->
-            (Normal (c, passive), s_of_list c)
-        | Joint_config (c1, c2, passive) ->
-            (Joint (c1, c2, passive), s_of_list (c1 @ c2))
-      in
-        { id; conf; active; }
+    let active_of_config = function
+        Simple_config (c, _) -> s_of_list c
+      | Joint_config (c1, c2, _) -> s_of_list (c1 @ c2)
+
+    let make ~node_id:id ~index config =
+      { id;
+        active    = active_of_config config;
+        committed = (index, config);
+        latest    = (index, config);
+        q         = [];
+      }
 
     let quorum c = List.length c / 2 + 1
 
-    let target t = match t.conf with
-        Normal _ -> None
-      | Transitional (_, _, c, passive) | Joint (_, c, passive) -> Some (c, passive)
+    let target t = match t.latest with
+      | (_, Simple_config _) -> None
+      | (_, Joint_config (_, c2, p)) -> Some (c2, p)
 
     let has_quorum votes t =
       let aux_quorum c =
         List.fold_left (fun s x -> if List.mem x c then s + 1 else s) 0 votes >=
         quorum c
       in
-        match t.conf with
-          | Normal (c, _) -> aux_quorum c
-          | Joint (c1, c2, _) | Transitional (c1, _, c2, _) ->
-              aux_quorum c1 && aux_quorum c2
+        match t.latest with
+          | _, Simple_config (c, _) -> aux_quorum c
+          | _, Joint_config (c1, c2, _) -> aux_quorum c1 && aux_quorum c2
 
     let quorum_min_simple get c =
       let vs = List.(map get c |> sort Int64.compare) in
         try List.nth vs (quorum c - 1) with _ -> 0L
 
-    let quorum_min get t = match t.conf with
-        Normal (c, _) -> quorum_min_simple get c
-      | Joint (c1, c2, _) | Transitional (c1, _, c2, _) ->
+    let quorum_min get t = match t.latest with
+        _, Simple_config (c, _) -> quorum_min_simple get c
+      | _, Joint_config (c1, c2, _) ->
           min (quorum_min_simple get c1) (quorum_min_simple get c2)
 
-    let join idx ?passive:p c2 t = match t.conf with
-        | Normal (c1, passive) ->
+    let join index ?passive:p c2 t = match t.latest with
+        | (idx, Simple_config (c1, passive)) when index > idx ->
             let p      = Option.default passive p in
             let active = s_of_list (c1 @ c2) in
-            let conf   = Transitional (c1, idx, c2, p) in
-            let t      = { t with conf; active; } in
-            let target = Joint_config (c1, c2, p) in
-              Some (t, target)
+            let conf   = Joint_config (c1, c2, p) in
+            let latest = (index, conf) in
+            let q      = latest :: t.q in
+            let t      = { id = t.id; committed = t.committed; latest; q; active; } in
+              Some (t, conf)
         | _ -> None
 
-    let status t = match t.conf with
-        Normal _ -> `Normal
-      | Transitional _ -> `Transitional
-      | Joint _ -> `Joint
+    let update l t =
+      let l      = List.sort (fun (i1, _) (i2, _) -> - Int64.compare i1 i2) l |>
+                   List.take_while (fun (idx, _) -> idx > fst t.latest) in
+      let q      = l @ t.q in
+      let latest = match q with
+                     | [] -> t.committed
+                     | x :: _ -> x in
+      let active = active_of_config (snd latest) in
+        { id = t.id; committed = t.committed; latest; q; active }
 
-    let drop ~at_or_after:n t = match t.conf with
-        Normal _ | Joint _ -> t
-      | Transitional (c1, m, _, passive) when m >= n ->
-          { t with conf = Normal (c1, passive); active = s_of_list c1 }
-      | Transitional _ -> t
+    let status t = match t.latest with
+      | (_, Simple_config _) -> `Normal
+      | (_, Joint_config _) -> `Joint
 
-    let commit idx t = match t.conf with
-        Transitional (c1, idx', c2, passive) when idx' <= idx ->
-          let conf   = Joint (c1, c2, passive) in
-          let active = s_of_list (c1 @ c2) in
-            ({ t with conf; active; }, Some (c2, passive))
-      | Normal _ | Transitional _ | Joint _  -> (t, None)
+    let drop ~at_or_after:n t =
+      let q      = List.drop_while (fun (idx, _) -> idx >= n) t.q in
+      let latest = match q with
+                     | [] -> t.committed
+                     | x :: _ -> x in
+      let active = active_of_config (snd latest) in
+        { id = t.id; committed = t.committed; latest; q; active }
 
-    let last_commit t = match t.conf with
-        Normal (c, passive) | Transitional (c, _, _, passive) ->
-            Simple_config (c, passive)
-      | Joint (c1, c2, passive) -> Joint_config (c1, c2, passive)
+    let commit index t =
+      try
+        let committed = List.find (fun (n, _) -> n <= index) t.q in
+        let q         = List.take_while (fun (n, _) -> n > index) t.q in
+        let target    = match q, committed with
+                          | [], (_, Joint_config (_, c2, passive)) ->
+                              Some (c2, passive)
+                          | _ -> None in
+        let t         = { t with committed; q; } in
+          (t, target)
+      with Not_found -> (t, None)
 
-    let current t = match t.conf with
-        Normal (c, passive) -> Simple_config (c, passive)
-      | Transitional (c1, _, c2, passive)
-      | Joint (c1, c2, passive) -> Joint_config (c1, c2, passive)
+    let last_commit t = snd t.committed
 
-    let all t = match t.conf with
-        Normal (c, passive) -> [c; passive]
-      | Joint (c1, c2, passive) | Transitional (c1, _, c2, passive) ->
-          [c1; c2; passive]
+    let current t = snd t.latest
+
+    let all t = match t.latest with
+        _, Simple_config (c, passive) -> [c; passive]
+      | _, Joint_config (c1, c2, passive) -> [c1; c2; passive]
 
     let node_set t =
       all t |> List.concat |>
@@ -438,9 +452,11 @@ let try_commit s =
        * replicated on the next heartbeat *)
       let s       = match wanted_config, s.state with
                       | Some (c, passive), Leader ->
-                          let log = LOG.append ~term:s.current_term
-                                      (Config (Simple_config (c, passive))) s.log
-                          in
+                          let conf   = Simple_config (c, passive) in
+                          let log    = LOG.append ~term:s.current_term
+                                         (Config conf) s.log in
+                          let index  = LOG.last_index s.log |> snd in
+                          let config = CONFIG.update [index, conf] config in
                             { s with log; config }
                       | _ -> { s with config } in
       let actions = match ops with [] -> [] | l -> [Apply ops] in
@@ -626,6 +642,14 @@ let receive_msg s peer = function
                                      | None -> s.config
                                      | Some idx ->
                                          CONFIG.drop ~at_or_after:idx s.config in
+                (* "a server always uses the latest configuration in its log,
+                 * regardless of whether the entry is committed" *)
+                let new_configs  = List.filter_map
+                                     (function
+                                          (idx, (Config c, _)) -> Some (idx, c)
+                                        | _ -> None)
+                                     entries in
+                let config       = CONFIG.update new_configs config in
                 let last_index   = snd (LOG.last_index log) in
                 let commit_index = if leader_commit > s.commit_index then
                                      min leader_commit last_index
@@ -708,7 +732,8 @@ let receive_msg s peer = function
   | Append_result { term; _ } when term < s.current_term || s.state <> Leader ->
       (s, [])
   | Append_result { result = Append_success last_log_index; _ } ->
-      let next_index  = RM.modify peer
+      let next_index  = RM.modify_def
+                          0L peer
                           (fun idx -> max idx (Int64.succ last_log_index))
                           s.next_index in
       let match_index = RM.modify_def
@@ -721,7 +746,8 @@ let receive_msg s peer = function
       (* "After a rejection, the leader decrements nextIndex and retries
        * the AppendEntries RPC. Eventually nextIndex will reach a point
        * where the leader and follower logs match." *)
-      let next_index = RM.modify peer
+      let next_index = RM.modify_def
+                         prev_log_index peer
                          (fun idx -> min idx prev_log_index)
                          s.next_index in
       let s          = { s with next_index } in
@@ -780,7 +806,9 @@ let heartbeat_timeout s = match s.state with
         CONFIG.peers s.config |>
         List.fold_left
           (fun (s, sends) peer ->
-             let idx = RM.find peer s.next_index in
+             let idx = try RM.find peer s.next_index
+                       with Not_found -> LOG.last_index s.log |> snd
+             in
                match
                  send_entries_or_snapshot s peer idx
                with
@@ -804,7 +832,10 @@ let client_command x s = match s.state with
         CONFIG.peers s.config |>
         List.fold_left
           (fun (s, actions) peer ->
-             let idx = RM.find peer s.next_index in
+             let idx =
+               try RM.find peer s.next_index
+               with Not_found -> LOG.last_index s.log |> snd
+             in
                match send_entries_or_snapshot s peer idx with
                    Snapshot ->
                      (* must send snapshot if cannot send log *)
@@ -824,7 +855,7 @@ let client_command x s = match s.state with
 let install_snapshot ~last_term ~last_index ~config s = match s.state with
     Leader | Candidate -> (s, false)
   | Follower ->
-      let config = CONFIG.make ~node_id:s.id config in
+      let config = CONFIG.make ~node_id:s.id ~index:last_index config in
       let log    =
         match LOG.get_term last_index s.log with
             (* "If the follower has an entry that matches the snapshot’s last
@@ -847,7 +878,8 @@ let snapshot_sent peer ~last_index s = match s.state with
     Follower | Candidate -> (s, [])
   | Leader ->
       let transfers  = RS.remove peer s.snapshot_transfers in
-      let next_index = RM.modify peer
+      let next_index = RM.modify_def
+                         0L peer
                          (fun idx -> max idx (Int64.succ last_index))
                          s.next_index in
       let s          = { s with snapshot_transfers = transfers; next_index } in
@@ -899,7 +931,7 @@ struct
 
   let make ~id ~current_term ~voted_for ~log ~config () =
     let log    = LOG.of_list ~init_index:0L ~init_term:current_term log in
-    let config = CONFIG.make ~node_id:id config in
+    let config = CONFIG.make ~node_id:id ~index:1L config in
       {
         current_term; voted_for; log; id; config;
         state        = Follower;
