@@ -427,6 +427,12 @@ let update_commit_index s =
     if commit_index = s.commit_index then s
     else { s with commit_index }
 
+let step_down term s =
+  { s with current_term = term;
+           voted_for    = None;
+           state        = Follower;
+  }
+
 let try_commit s =
   let prev    = s.last_applied in
     if prev = s.commit_index then
@@ -525,18 +531,12 @@ let receive_msg s peer = function
    * *)
   | Vote_result { term; _ }
   | Append_result { term; _ } when term > s.current_term ->
-      let s = { s with current_term = term;
-                       voted_for    = None;
-                       state        = Follower }
-      in (s, [Become_follower None])
+      (step_down term s, [Become_follower None])
 
   | Request_vote { term; candidate_id; last_log_index; last_log_term; }
       when term > s.current_term ->
-      let s = { s with current_term = term;
-                       voted_for    = None;
-                       state        = Follower;
-              }
-      in
+      let s = step_down term s in
+
         (* "If votedFor is null or candidateId, and candidate's log is at
          * least as up-to-date as receiver’s log, grant vote"
          *
