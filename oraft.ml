@@ -41,9 +41,9 @@ struct
     (** Returns all peers (including passive). *)
     val peers        : t -> rep_id list
 
-    (** Returns whether the node is included in the configuration (including
-      * passive peers). *)
-    val mem          : rep_id -> t -> bool
+    (** Returns whether the node is included in the last committed
+      * configuration. *)
+    val mem_committed : rep_id -> t -> [`Active | `Passive | `Not_included]
 
     (** Returns whether the node is an active member of the configuration. *)
     val mem_active   : rep_id -> t -> bool
@@ -67,10 +67,9 @@ struct
     module S = Set.Make(String)
     type t   =
         { id        : rep_id;
-          committed : (index * config);
-          latest    : (index * config);
-          q         : (index * config) list;
-          active    : S.t;
+          committed : (index * config * S.t * S.t);
+          latest    : (index * config * S.t * S.t);
+          q         : (index * config * S.t * S.t) list;
         }
 
     let s_of_list = List.fold_left (fun s x -> S.add x s) S.empty
@@ -79,19 +78,24 @@ struct
         Simple_config (c, _) -> s_of_list c
       | Joint_config (c1, c2, _) -> s_of_list (c1 @ c2)
 
+    let all_nodes_of_config = function
+        Simple_config (c, p) -> s_of_list (c @ p)
+      | Joint_config (c1, c2, p) -> s_of_list (p @ c1 @ c2)
+
     let make ~node_id:id ~index config =
+      let active = active_of_config config in
+      let all    = all_nodes_of_config config in
       { id;
-        active    = active_of_config config;
-        committed = (index, config);
-        latest    = (index, config);
+        committed = (index, config, active, all);
+        latest    = (index, config, active, all);
         q         = [];
       }
 
     let quorum c = List.length c / 2 + 1
 
     let target t = match t.latest with
-      | (_, Simple_config _) -> None
-      | (_, Joint_config (_, c2, p)) -> Some (c2, p)
+      | (_, Simple_config _, _, _) -> None
+      | (_, Joint_config (_, c2, p), _, _) -> Some (c2, p)
 
     let has_quorum votes t =
       let aux_quorum c =
@@ -99,80 +103,82 @@ struct
         quorum c
       in
         match t.latest with
-          | _, Simple_config (c, _) -> aux_quorum c
-          | _, Joint_config (c1, c2, _) -> aux_quorum c1 && aux_quorum c2
+          | _, Simple_config (c, _), _, _ -> aux_quorum c
+          | _, Joint_config (c1, c2, _), _, _ -> aux_quorum c1 && aux_quorum c2
 
     let quorum_min_simple get c =
       let vs = List.(map get c |> sort Int64.compare) in
         try List.nth vs (quorum c - 1) with _ -> 0L
 
     let quorum_min get t = match t.latest with
-        _, Simple_config (c, _) -> quorum_min_simple get c
-      | _, Joint_config (c1, c2, _) ->
+        _, Simple_config (c, _), _, _ -> quorum_min_simple get c
+      | _, Joint_config (c1, c2, _), _, _ ->
           min (quorum_min_simple get c1) (quorum_min_simple get c2)
 
     let join index ?passive:p c2 t = match t.latest with
-        | (idx, Simple_config (c1, passive)) when index > idx ->
+        | (idx, Simple_config (c1, passive), _, _) when index > idx ->
             let p      = Option.default passive p in
-            let active = s_of_list (c1 @ c2) in
             let conf   = Joint_config (c1, c2, p) in
-            let latest = (index, conf) in
+            let active = active_of_config conf in
+            let all    = all_nodes_of_config conf in
+            let latest = (index, conf, active, all) in
             let q      = latest :: t.q in
-            let t      = { id = t.id; committed = t.committed; latest; q; active; } in
+            let t      = { id = t.id; committed = t.committed; latest; q; } in
               Some (t, conf)
         | _ -> None
 
     let update l t =
+      let idx, _, _, _ = t.latest in
       let l      = List.sort (fun (i1, _) (i2, _) -> - Int64.compare i1 i2) l |>
-                   List.take_while (fun (idx, _) -> idx > fst t.latest) in
+                   List.take_while (fun (idx', _) -> idx' > idx) |>
+                   List.map
+                     (fun (idx, c) ->
+                        (idx, c, active_of_config c, all_nodes_of_config c)) in
       let q      = l @ t.q in
       let latest = match q with
                      | [] -> t.committed
-                     | x :: _ -> x in
-      let active = active_of_config (snd latest) in
-        { id = t.id; committed = t.committed; latest; q; active }
+                     | x :: _ -> x
+      in
+        { id = t.id; committed = t.committed; latest; q; }
 
     let status t = match t.latest with
-      | (_, Simple_config _) -> `Normal
-      | (_, Joint_config _) -> `Joint
+      | (_, Simple_config _, _, _) -> `Normal
+      | (_, Joint_config _, _, _) -> `Joint
 
     let drop ~at_or_after:n t =
-      let q      = List.drop_while (fun (idx, _) -> idx >= n) t.q in
+      let q      = List.drop_while (fun (idx, _, _, _) -> idx >= n) t.q in
       let latest = match q with
                      | [] -> t.committed
-                     | x :: _ -> x in
-      let active = active_of_config (snd latest) in
-        { id = t.id; committed = t.committed; latest; q; active }
+                     | x :: _ -> x
+      in
+        { id = t.id; committed = t.committed; latest; q; }
 
     let commit index t =
       try
-        let committed = List.find (fun (n, _) -> n <= index) t.q in
-        let q         = List.take_while (fun (n, _) -> n > index) t.q in
+        let committed = List.find (fun (n, _, _, _) -> n <= index) t.q in
+        let q         = List.take_while (fun (n, _, _, _) -> n > index) t.q in
         let target    = match q, committed with
-                          | [], (_, Joint_config (_, c2, passive)) ->
+                          | [], (_, Joint_config (_, c2, passive), _, _) ->
                               Some (c2, passive)
                           | _ -> None in
         let t         = { t with committed; q; } in
           (t, target)
       with Not_found -> (t, None)
 
-    let last_commit t = snd t.committed
+    let last_commit { committed = (_, c, _, _); _ } = c
 
-    let current t = snd t.latest
+    let current { latest = (_, c, _, _); _ } = c
 
-    let all t = match t.latest with
-        _, Simple_config (c, passive) -> [c; passive]
-      | _, Joint_config (c1, c2, passive) -> [c1; c2; passive]
+    let peers { id; latest = (_, _, _, all); _ } =
+      S.remove id all |> S.elements
 
-    let node_set t =
-      all t |> List.concat |>
-      List.fold_left (fun s x -> S.add x s) S.empty
+    let mem_committed id { committed = (_, _, active, all); _ } =
+      if S.mem id active then `Active
+      else if S.mem id all then `Passive
+      else `Not_included
 
-    let peers t = node_set t |> S.remove t.id |> S.elements
-
-    let mem id t = node_set t |> S.mem id
-
-    let mem_active id t = S.mem id t.active
+    let mem_active id { latest = (_, _, active, _); _ } =
+      S.mem id active
   end
 
   module LOG : sig
@@ -468,8 +474,14 @@ let try_commit s =
       let actions = match ops with [] -> [] | l -> [Apply ops] in
       (* "In Raft the leader steps down immediately after committing a
        * configuration entry that does not include itself." *)
-      let actions = if CONFIG.mem s.id s.config then actions
-                    else actions @ [Stop] in
+      let s, actions = match s.state, CONFIG.mem_committed s.id s.config with
+                         | Leader, `Passive ->
+                             let actions = actions @ [Become_follower None] in
+                               (step_down s.current_term s, actions)
+                         | _, `Not_included ->
+                             let actions = actions @ [Become_follower None; Stop] in
+                               (step_down s.current_term s, actions)
+                         | _, (`Active | `Passive) -> (s, actions) in
       let actions = if changed_config then Changed_config :: actions
                     else actions
       in
