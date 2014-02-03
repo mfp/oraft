@@ -92,6 +92,7 @@ sig
   val id        : 'a state -> rep_id
   val status    : 'a state -> status
   val config    : 'a state -> config
+  val committed_config : 'a state -> config
 
   val last_index : 'a state -> index
   val last_term  : 'a state -> term

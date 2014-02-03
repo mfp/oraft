@@ -176,7 +176,7 @@ struct
         (* we pick an arbitrary config *)
         t.active.(0)
     in
-      C.config node.state
+      C.committed_config node.state
 
   let make
         ?(rng = RND.make_self_init ())
@@ -335,8 +335,8 @@ struct
               if Array.length des.passive <> 0 then
                 t.state <- Passive
               else begin
-                let node    = des.make_node () in
-                let passive = Array.to_list des.passive @ [ node ] in
+                let newnode = des.make_node () in
+                let passive = Array.to_list des.passive @ [ newnode ] in
 
                   let rec try_to_change (node : (_, _) node) =
                     match
@@ -350,7 +350,7 @@ struct
                       | `Redirect None -> ()
                       | `Start_change state ->
                           if t.verbose then
-                            printf "!! Adding passive node %S\n" node.id;
+                            printf "!! Adding passive node %S\n" newnode.id;
                           des.passive <- Array.of_list passive;
                           node.state <- state;
                           t.state <- Passive
@@ -538,7 +538,7 @@ struct
             schedule_election t node;
             schedule_heartbeat t node
         | Changed_config ->
-            let config = C.config node.state in
+            let config = C.committed_config node.state in
               if verbose then
                 printf " Changed config to %s\n" (string_of_config config);
               (* if a Simple_config has been committed, remove nodes no longer

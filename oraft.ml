@@ -962,6 +962,7 @@ struct
   let id s     = s.id
   let status s = s.state
   let config s = CONFIG.current s.config
+  let committed_config s = CONFIG.last_commit s.config
   let last_index s = snd (LOG.last_index s.log)
   let last_term s  = fst (LOG.last_index s.log)
   let peers s      = CONFIG.peers s.config
