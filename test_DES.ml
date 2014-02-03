@@ -4,6 +4,7 @@ module List   = BatList
 module Map    = BatMap
 module Int64  = BatInt64
 module Option = BatOption
+module Array  = BatArray
 module RND    = Random.State
 module C      = Oraft.Core
 
@@ -53,8 +54,7 @@ sig
     (unit -> 'app_state) -> ('op, 'app_state, 'snapshot) t
 
   val random_node_id : (_, _, _) t -> rep_id
-  val node_ids       : (_, _, _) t -> rep_id list
-  val nodes          : ('op, 'app_state, _) t -> ('op, 'app_state) node list
+  val active_nodes   : ('op, 'app_state, _) t -> ('op, 'app_state) node list
 
   val node_id       : (_, _) node -> rep_id
   val app_state     : (_, 'app_state) node -> 'app_state
@@ -138,29 +138,45 @@ struct
         mutable next_heartbeat : CLOCK.t option;
         mutable next_election  : CLOCK.t option;
         mutable app_state      : 'app_state;
+        mutable stopped        : bool;
       }
 
   type ('op, 'app_state, 'snapshot) t =
       {
         rng              : RND.t;
         ev_queue         : ('op, 'snapshot) event Event_queue.t;
-        nodes            : ('op, 'app_state) node array;
+        mutable active   : ('op, 'app_state) node array;
+        mutable passive  : ('op, 'app_state) node array;
         election_period  : CLOCK.t;
         heartbeat_period : CLOCK.t;
         rtt              : CLOCK.t;
+        make_node        : unit -> ('op, 'app_state) node;
       }
 
-  let make_node mk_app_state config id =
+  let mk_node mk_app_state config id =
     let state     = C.make
                       ~id ~current_term:0L ~voted_for:None
                       ~log:[] ~config () in
     let app_state = mk_app_state () in
-      { id; state; next_heartbeat = None; next_election = None; app_state; }
+      { id; state; app_state;
+        stopped = false; next_heartbeat = None; next_election = None;
+      }
 
   let node_id n         = n.id
   let leader_id n       = C.leader_id n.state
   let app_state n       = n.app_state
   let set_app_state n x = n.app_state <- x
+
+
+  let get_leader_conf t =
+    let node =
+      try
+        Array.find (fun node -> C.status node.state = Leader) t.active
+      with Not_found ->
+        (* we pick an arbitrary config *)
+        t.active.(0)
+    in
+      C.config node.state
 
   let make
         ?(rng = RND.make_self_init ())
@@ -168,17 +184,35 @@ struct
         ~num_nodes
         ~election_period ~heartbeat_period ~rtt
         mk_app_state =
-    let node_ids = List.init num_nodes (sprintf "n%02d") in
-    let config   = Simple_config (node_ids, []) in
-    let nodes    = List.map (make_node mk_app_state config) node_ids |> Array.of_list in
-      { rng; ev_queue; election_period; heartbeat_period; rtt; nodes; }
+    let active   = List.init num_nodes (sprintf "n%02d") in
+    let passive  = [] in
+    let config   = Simple_config (active, passive) in
+
+    let mk_nodes l = List.map (mk_node mk_app_state config) l |> Array.of_list in
+
+    let next_node_id =
+      let n = ref (num_nodes - 1) in
+        (fun () -> incr n; sprintf "n%02d" !n) in
+
+    let active   = mk_nodes active in
+    let passive  = mk_nodes passive in
+
+    let rec make_node () =
+      let id     = next_node_id () in
+      let config = get_leader_conf t in
+        mk_node mk_app_state config id
+
+    and t =
+      { rng; ev_queue; election_period; heartbeat_period; rtt; active; passive;
+        make_node;
+      }
+    in
+      t
 
   let random_node_id t =
-    t.nodes.(RND.int t.rng (Array.length t.nodes)).id
+    t.active.(RND.int t.rng (Array.length t.active)).id
 
-  let node_ids t = Array.(to_list (map (fun n -> n.id) t.nodes))
-
-  let nodes t = Array.to_list t.nodes
+  let active_nodes t = Array.to_list t.active
 
   let string_of_config c =
     let s_of_list l = List.map (sprintf "%S") l |> String.concat "; " in
@@ -264,6 +298,76 @@ struct
     | Command _ | Message _ | Install_snapshot _
     | Snapshot_sent _ | Snapshot_send_failed _ -> true
 
+  module CONFIG_MANAGER :
+  sig
+    type config_manager
+
+    val make :
+      ?verbose:bool -> period:int ->
+      ('op, 'app_state, 'snapshot) t -> config_manager
+
+    val tick : config_manager -> int -> unit
+  end =
+  struct
+    type config_manager =
+        { verbose : bool; mutable state : state; mutable ticks : int;
+          period : int; des : des;
+        }
+
+    and state = Wait | Passive
+
+    and des   = DES : (_, _, _) t -> des
+
+    let make ?(verbose=false) ~period des =
+      { verbose; state = Wait; ticks = 0; period; des = DES des; }
+
+    let tick ({ des = DES des; _ } as t) n =
+      t.ticks <- t.ticks + n;
+      (* printf "TICK %d\n" n; *)
+      if t.ticks > t.period then begin
+        t.ticks <- 0;
+        match t.state with
+            Wait ->
+              if Array.length des.passive = 0 then begin
+                let node = des.make_node () in
+                  if t.verbose then printf "!! Adding passive node %S\n" node.id;
+                  des.passive <- Array.append des.passive [|node|];
+              end;
+              t.state <- Passive
+          | Passive ->
+              (* replace one active node by a passive standby *)
+              match Array.to_list des.passive, C.config des.active.(0).state with
+                | added :: passive, Simple_config (dropped :: active, _) ->
+                    let get_active_node id =
+                      try Some (Array.find (fun n -> n.id = id) des.active)
+                      with Not_found -> None in
+
+                    let rec try_to_change (node : (_, _) node) =
+                      match
+                        C.change_config
+                          ~passive:(List.map (fun n -> n.id) passive)
+                          (active @ [added.id]) node.state
+                      with
+                          `Already_changed | `Change_in_process
+                        | `Redirect None ->
+                            t.state <- Wait
+
+                        | `Start_change state ->
+                            if t.verbose then
+                              printf "!! Replacing node %S with %S\n" dropped added.id;
+                            des.active <- Array.append des.active [| added |];
+                            des.passive <- Array.of_list passive;
+                            node.state <- state;
+                            t.state <- Wait
+
+                        | `Redirect (Some leader_id) ->
+                            match get_active_node leader_id with
+                                None -> ()
+                              | Some node -> try_to_change node
+                    in try_to_change des.active.(0)
+                | [], _ | _, Simple_config ([], _) | _, Joint_config _ -> ()
+      end
+  end
 
   module FAILURE_SIMULATOR :
   sig
@@ -312,14 +416,26 @@ struct
         ~on_apply ~take_snapshot ~install_snapshot ?(steps = max_int) t =
 
     let node_of_id =
-      let h = Hashtbl.create 13 in
-        Array.iter (fun node -> Hashtbl.add h node.id node) t.nodes;
-        (fun node_id -> Hashtbl.find h node_id) in
+      let h       = Hashtbl.create 13 in
+      let init () =
+        Array.iter
+          (fun node -> Hashtbl.replace h node.id node)
+          (Array.append t.active t.passive);
+      in
+        init ();
+        (fun node_id ->
+           try Hashtbl.find h node_id
+           with Not_found ->
+             (* it's a node that was added at a later time *)
+             init ();
+             Hashtbl.find h node_id) in
 
     let send_cmd ?(dst = random_node_id t) cmd =
       send_cmd t dst cmd in
 
-    let fail_sim = FAILURE_SIMULATOR.make ~verbose ~msg_loss_rate ~period:1000 t.rng in
+    let fail_sim  = FAILURE_SIMULATOR.make
+                      ~verbose ~msg_loss_rate ~period:1000 t.rng in
+    let configmgr = CONFIG_MANAGER.make ~verbose:true t ~period:1500 in
 
     let react_to_event time node ev =
       let considered = must_account time node ev in
@@ -378,9 +494,9 @@ struct
               | `State app_state ->
                   node.app_state <- app_state
             end;
-            FAILURE_SIMULATOR.tick fail_sim
-              (node.id :: C.peers node.state)
-              (List.length cmds)
+            let ncmds = List.length cmds in
+              FAILURE_SIMULATOR.tick fail_sim (node.id :: C.peers node.state) ncmds;
+              CONFIG_MANAGER.tick configmgr ncmds
         | Become_candidate ->
             if verbose then printf " Become_candidate\n";
             unschedule_heartbeat t node;
@@ -399,7 +515,25 @@ struct
             schedule_election t node;
             schedule_heartbeat t node
         | Changed_config ->
-            if verbose then printf " Changed config\n"
+            let config = C.config node.state in
+              if verbose then
+                printf " Changed config to %s\n" (string_of_config config);
+              (* if a Simple_config has been committed, remove nodes no longer
+               * active from t.active *)
+              begin match config with
+                  Joint_config _ -> ()
+                | Simple_config (c, _) ->
+                    (* Stop nodes removed from configuration. Needed when the
+                    * node removed was not the leader and thus never gets the
+                    * Stop action, since it is no longer in the configuration
+                    * by the time the leader sends the Append_entries message
+                    * that would let it commit the configuration change. *)
+                    Array.iter
+                      (fun n -> if not (List.mem n.id c) then n.stopped <- true)
+                      t.active;
+                    (* and now remove them from active list *)
+                    t.active <- Array.filter (fun n -> List.mem n.id c) t.active
+              end
         | Redirect (Some leader, cmd) ->
             if verbose then printf " Redirect %s\n" leader;
             send_cmd ~dst:leader cmd
@@ -450,7 +584,11 @@ struct
                 ignore (Event_queue.schedule t.ev_queue
                           CLOCK.(10L * t.rtt) node.id (Snapshot_send_failed dst))
               end
-        | Stop -> (* FIXME: should block all events on the node *)
+        | Stop ->
+            if verbose then printf " Stop\n";
+            t.active <- Array.filter ((!=) node) t.active;
+            (* block events on this node *)
+            node.stopped <- true;
             ()
 
       in
@@ -461,15 +599,17 @@ struct
 
     let steps = ref 0 in
       (* schedule initial election timeouts *)
-      Array.iter (schedule_election t) t.nodes;
+      Array.(iter (schedule_election t) (append t.passive t.active));
 
       try
         let rec loop () =
           match Event_queue.next t.ev_queue with
               None -> !steps
             | Some (time, rep_id, ev) ->
-                if react_to_event time (node_of_id rep_id) ev then incr steps;
-                loop ()
+                let node    = node_of_id rep_id in
+                let blocked = match ev with Func _ -> false | _ -> node.stopped in
+                  if not blocked && react_to_event time node ev then incr steps;
+                  loop ()
         in loop ()
       with Exit -> !steps
 end
@@ -524,11 +664,13 @@ let run ?(seed = 2) ?(verbose=false) () =
      * and reschedule if needed *)
     let f _  = if not (BatBitSet.mem applied cmd) then schedule 100L node cmd in
     let _    = DES.Event_queue.schedule ev_queue
-                 CLOCK.(dt + retry_period) node (DES.Func f)
+                 CLOCK.(dt + retry_period)
+                 (DES.random_node_id des) (DES.Func f)
     in () in
 
   let check_if_finished node len =
-    if len >= num_cmds then begin
+    if len >= num_cmds && List.mem node (DES.active_nodes des) then begin
+      printf "XXX completed %S %d\n" (DES.node_id node) len;
       completed := S.add (DES.node_id node) !completed;
       if S.cardinal !completed >= num_nodes then
         raise Exit
@@ -590,13 +732,14 @@ let run ?(seed = 2) ?(verbose=false) () =
                 ~on_apply ~take_snapshot ~install_snapshot
                 des in
   let dt    = Unix.gettimeofday () -. t0 in
-  let ncmds = DES.nodes des |>
+  let ncmds = DES.active_nodes des |>
               List.map
                 (fun node ->
                    let _, q, _ = DES.app_state node in
+                     printf "%S: len %d\n" (DES.node_id node) (FQueue.length q);
                      FQueue.length q) |>
               List.fold_left min max_int in
-  let logs  = DES.nodes des |>
+  let logs  = DES.active_nodes des |>
               List.map
                 (fun node ->
                    let _, q, _ = DES.app_state node in
