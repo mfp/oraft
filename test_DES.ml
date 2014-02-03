@@ -662,7 +662,11 @@ let run ?(seed = 2) ?(verbose=false) () =
     let _    = DES.Event_queue.schedule ev_queue dt node (DES.Command cmd) in
     (* after the retry_period, check if the cmd has been executed
      * and reschedule if needed *)
-    let f _  = if not (BatBitSet.mem applied cmd) then schedule 100L node cmd in
+
+    let f _  =
+      if not (BatBitSet.mem applied cmd) then
+        schedule 100L (DES.random_node_id des) cmd in
+
     let _    = DES.Event_queue.schedule ev_queue
                  CLOCK.(dt + retry_period)
                  (DES.random_node_id des) (DES.Func f)
