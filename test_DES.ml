@@ -543,25 +543,26 @@ struct
             schedule_election t node;
             schedule_heartbeat t node
         | Changed_config ->
-            let config = C.committed_config node.state in
-              if verbose then
-                printf " Changed config to %s\n" (string_of_config config);
-              (* if a Simple_config has been committed, remove nodes no longer
-               * active from t.active *)
-              begin match config with
-                  Joint_config _ -> ()
-                | Simple_config (c, _) ->
-                    (* Stop nodes removed from configuration. Needed when the
-                    * node removed was not the leader and thus never gets the
-                    * Stop action, since it is no longer in the configuration
-                    * by the time the leader sends the Append_entries message
-                    * that would let it commit the configuration change. *)
-                    Array.iter
-                      (fun n -> if not (List.mem n.id c) then n.stopped <- true)
-                      t.active;
-                    (* and now remove them from active list *)
-                    t.active <- Array.filter (fun n -> List.mem n.id c) t.active
-              end
+            if verbose then
+              printf " Changed config to %s (committed %s)\n"
+                (C.config node.state |> string_of_config)
+                (C.committed_config node.state |> string_of_config);
+            (* if a Simple_config has been committed, remove nodes no longer
+             * active from t.active *)
+            begin match C.committed_config node.state with
+                Joint_config _ -> ()
+              | Simple_config (c, _) ->
+                  (* Stop nodes removed from configuration. Needed when the
+                  * node removed was not the leader and thus never gets the
+                  * Stop action, since it is no longer in the configuration
+                  * by the time the leader sends the Append_entries message
+                  * that would let it commit the configuration change. *)
+                  Array.iter
+                    (fun n -> if not (List.mem n.id c) then n.stopped <- true)
+                    t.active;
+                  (* and now remove them from active list *)
+                  t.active <- Array.filter (fun n -> List.mem n.id c) t.active
+            end
         | Redirect (Some leader, cmd) ->
             if verbose then printf " Redirect %s\n" leader;
             send_cmd ~dst:leader cmd
@@ -702,7 +703,6 @@ let run ?(seed = 2) ?(verbose=false) () =
 
   let check_if_finished node len =
     if len >= num_cmds && List.mem node (DES.active_nodes des) then begin
-      printf "XXX completed %S %d\n" (DES.node_id node) len;
       completed := S.add (DES.node_id node) !completed;
       if S.cardinal !completed >= num_nodes then
         raise Exit
