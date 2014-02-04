@@ -330,22 +330,27 @@ struct
         t.state <- Passive
       else begin
         let newnode = des.make_node () in
-        let passive = Array.to_list des.passive @ [ newnode ] in
 
-          let rec try_to_change (node : (_, _) node) =
-            match
-              C.change_config
-                ~passive:(List.map (fun n -> n.id) passive)
-                (List.map (fun n -> n.id) (Array.to_list des.active))
-                node.state
-            with
+        (* let () = printf "INTRODUCE %s\n" newnode.id; *)
+
+        let rec try_to_change (node : (_, _) node) =
+          let active, passive =
+            match C.committed_config node.state with
+              | Simple_config (c, p)
+              | Joint_config (c, _, p) -> (c, p @ [newnode.id])
+          in
+            match C.change_config ~passive active node.state with
                 `Already_changed | `Change_in_process ->
                     t.state <- Passive
               | `Redirect None -> ()
               | `Start_change state ->
                   if t.verbose then
-                    printf "!! Adding passive node %S\n" newnode.id;
-                  des.passive <- Array.of_list passive;
+                    printf
+                      "!! Adding passive node %S (active: %s)\n"
+                      newnode.id
+                      (des.active |> Array.map (fun n -> n.id) |>
+                       Array.to_list |> List.map (sprintf "%S") |> String.concat ", ");
+                  des.passive <- Array.append des.passive [| newnode |];
                   node.state <- state;
                   t.state <- Passive
 
@@ -353,7 +358,7 @@ struct
                   match get_active_node des leader_id with
                       None -> ()
                     | Some node -> try_to_change node
-          in try_to_change des.active.(0)
+        in try_to_change des.active.(0)
       end
 
     let replace_node_with_standby t des =
@@ -379,6 +384,7 @@ struct
                     t.state <- Wait
 
                 | `Redirect (Some leader_id) ->
+                    (* printf "Retry configuration change in %S\n" leader_id; *)
                     match get_active_node des leader_id with
                         None -> ()
                       | Some node -> try_to_change node
