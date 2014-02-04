@@ -551,17 +551,21 @@ struct
              * active from t.active *)
             begin match C.committed_config node.state with
                 Joint_config _ -> ()
-              | Simple_config (c, _) ->
+              | Simple_config (c, p) ->
                   (* Stop nodes removed from configuration. Needed when the
-                  * node removed was not the leader and thus never gets the
-                  * Stop action, since it is no longer in the configuration
-                  * by the time the leader sends the Append_entries message
-                  * that would let it commit the configuration change. *)
-                  Array.iter
-                    (fun n -> if not (List.mem n.id c) then n.stopped <- true)
-                    t.active;
-                  (* and now remove them from active list *)
-                  t.active <- Array.filter (fun n -> List.mem n.id c) t.active
+                   * node removed was not the leader and thus never gets the
+                   * Stop action, since it is no longer in the configuration
+                   * by the time the leader sends the Append_entries message
+                   * that would let it commit the configuration change. *)
+                  let must_be_kept n =
+                    if List.mem n.id c || List.mem n.id p then
+                      true
+                    else begin
+                      n.stopped <- true;
+                      false
+                    end
+                  in
+                    t.active <- Array.filter must_be_kept t.active
             end
         | Redirect (Some leader, cmd) ->
             if verbose then printf " Redirect %s\n" leader;
