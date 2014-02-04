@@ -467,7 +467,7 @@ let try_commit s =
                           let conf   = Simple_config (c, passive) in
                           let log    = LOG.append ~term:s.current_term
                                          (Config conf) s.log in
-                          let index  = LOG.last_index s.log |> snd in
+                          let index  = LOG.last_index log |> snd in
                           let config = CONFIG.update [index, conf] config in
                             { s with log; config }
                       | _ -> { s with config } in
