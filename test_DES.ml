@@ -383,7 +383,8 @@ struct
                         None -> ()
                       | Some node -> try_to_change node
             in try_to_change des.active.(0)
-        | [], _ | _, Simple_config ([], _) | _, Joint_config _ -> ()
+        | [], _ -> t.state <- Wait
+        | _, Simple_config ([], _) | _, Joint_config _ -> ()
 
     let tick ({ des = DES des; _ } as t) n =
       t.ticks <- t.ticks + n;
