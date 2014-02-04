@@ -436,6 +436,7 @@ let update_commit_index s =
 let step_down term s =
   { s with current_term = term;
            voted_for    = None;
+           leader_id    = None;
            state        = Follower;
   }
 
