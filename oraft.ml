@@ -456,13 +456,17 @@ let try_commit s =
                          | (_, ((Nop | Config _), _)) -> None)
                       entries in
 
+      (* We check whether the node was included in the configuration before
+       * the commit. We make it stop only if it was, and it is no longer in
+       * the newly committed one *)
+      let was_included          = CONFIG.mem_committed s.id s.config <> `Not_included in
       let config, wanted_config = CONFIG.commit s.commit_index s.config in
       let changed_config        = List.exists
                                     (function (_, (Config _, _)) -> true | _ -> false)
                                     entries in
-      (* if we're the leader and wanted_config = Some conf,
-       * add a new log entry for the wanted configuration [conf]; it will be
-       * replicated on the next heartbeat *)
+      (* if we're the leader and wanted_config = Some conf, add a new log
+       * entry for the wanted configuration [conf]; it will be replicated on
+       * the next heartbeat *)
       let s       = match wanted_config, s.state with
                       | Some (c, passive), Leader ->
                           let conf   = Simple_config (c, passive) in
@@ -476,13 +480,13 @@ let try_commit s =
       (* "In Raft the leader steps down immediately after committing a
        * configuration entry that does not include itself." *)
       let s, actions = match s.state, CONFIG.mem_committed s.id s.config with
-                         | Leader, `Passive ->
+                         | (Leader | Candidate), `Passive ->
                              let actions = actions @ [Become_follower None] in
                                (step_down s.current_term s, actions)
-                         | _, `Not_included ->
+                         | _, `Not_included when was_included ->
                              let actions = actions @ [Become_follower None; Stop] in
                                (step_down s.current_term s, actions)
-                         | _, (`Active | `Passive) -> (s, actions) in
+                         | _, _ -> (s, actions) in
       let actions = if changed_config then Changed_config :: actions
                     else actions
       in
