@@ -469,7 +469,7 @@ struct
 
     let fail_sim  = FAILURE_SIMULATOR.make
                       ~verbose ~msg_loss_rate ~period:1000 t.rng in
-    let configmgr = CONFIG_MANAGER.make ~verbose:true t ~period:1500 in
+    let configmgr = CONFIG_MANAGER.make ~verbose t ~period:1500 in
 
     let react_to_event time node ev =
       (* Tick at least once per event so that fallen nodes eventually come
