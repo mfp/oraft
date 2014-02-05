@@ -106,14 +106,20 @@ struct
           | _, Simple_config (c, _), _, _ -> aux_quorum c
           | _, Joint_config (c1, c2, _), _, _ -> aux_quorum c1 && aux_quorum c2
 
-    let quorum_min_simple get c =
-      let vs = List.(map get c |> sort Int64.compare) in
+    let quorum_min_simple get ?only c =
+      let vs = List.(map get (Option.default c only) |> sort Int64.compare |> rev) in
         try List.nth vs (quorum c - 1) with _ -> 0L
+
+    let set_diff l1 l2 =
+      List.filter (fun x -> not (List.mem x l2)) l1
 
     let quorum_min get t = match t.latest with
         _, Simple_config (c, _), _, _ -> quorum_min_simple get c
       | _, Joint_config (c1, c2, _), _, _ ->
-          min (quorum_min_simple get c1) (quorum_min_simple get c2)
+          (* we require a quorum (len (c1) / 2 + 1) amongst the nodes that are
+           * not removed when going from c1 to c2, i.e. set(c1) - (set(c1) - set(c2)) *)
+          let only = set_diff c1 (set_diff c1 c2) in
+            min (quorum_min_simple get ~only c1) (quorum_min_simple get c2)
 
     let join index ?passive:p c2 t = match t.latest with
         | (idx, Simple_config (c1, passive), _, _) when index > idx ->
