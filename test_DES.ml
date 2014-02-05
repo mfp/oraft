@@ -472,6 +472,12 @@ struct
     let configmgr = CONFIG_MANAGER.make ~verbose:true t ~period:1500 in
 
     let react_to_event time node ev =
+      (* Tick at least once per event so that fallen nodes eventually come
+       * back even if the cluster is making no progress (i.e. in absence of
+       * commits by other nodes). Avoids getting stuck when commits are
+       * blocked because there's no safe quorum (only nodes that will not be
+       * decommissioned) during a configuration change. *)
+      FAILURE_SIMULATOR.tick fail_sim (node.id :: C.peers node.state) 1;
       let considered = must_account time node ev in
       let () =
         if considered && verbose then
