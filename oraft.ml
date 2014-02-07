@@ -190,9 +190,9 @@ struct
   module LOG : sig
     type 'a t
 
-    val empty       : init_index:index -> init_term:term -> 'a t
+    val empty       : prev_log_index:index -> prev_log_term:term -> 'a t
     val to_list     : 'a t -> (index * 'a * term) list
-    val of_list     : init_index:index -> init_term:term ->
+    val of_list     : prev_log_index:index -> prev_log_term:term ->
                         (index * 'a * term) list -> 'a t
     val append      : term:term -> 'a -> 'a t -> 'a t
     val last_index  : 'a t -> (term * index)
@@ -203,7 +203,7 @@ struct
                       (index * ('a * term)) list
     val get_term    : index -> 'a t -> term option
 
-    val trim_prefix : last_index:index -> last_term:term -> 'a t -> 'a t
+    val trim_prefix : prev_log_index:index -> prev_log_term:term -> 'a t -> 'a t
 
     val prev_log_index : 'a t -> index
     val prev_log_term  : 'a t -> term
@@ -211,44 +211,40 @@ struct
   struct
     type 'a t =
         {
-          init_index : index;
-          init_term  : term;
-          last_index : index;
-          last_term  : term;
-          entries    : ('a * term) IM.t;
+          prev_log_index : index;
+          prev_log_term  : term;
+          last_index     : index;
+          last_term      : term;
+          entries        : ('a * term) IM.t;
         }
 
-    let empty ~init_index ~init_term =
-      { init_index; init_term;
-        last_index = init_index;
-        last_term  = init_term;
+    let empty ~prev_log_index ~prev_log_term =
+      { prev_log_index; prev_log_term;
+        last_index = prev_log_index;
+        last_term  = prev_log_term;
         entries    = IM.empty;
       }
 
-    let trim_prefix ~last_index ~last_term t =
-      let _, _, entries = IM.split last_index t.entries in
-        {
-          t with entries;
-                 init_index = last_index;
-                 init_term  = last_term;
-        }
+    let trim_prefix ~prev_log_index ~prev_log_term t =
+      let _, _, entries = IM.split prev_log_index t.entries in
+        { t with entries; prev_log_index; prev_log_term; }
 
-    let prev_log_index t = t.init_index
-    let prev_log_term  t = t.init_term
+    let prev_log_index t = t.prev_log_index
+    let prev_log_term  t = t.prev_log_term
 
     let to_list t =
       IM.bindings t.entries |> List.map (fun (i, (x, t)) -> (i, x, t))
 
-    let of_list ~init_index ~init_term = function
-        [] -> empty ~init_index ~init_term
+    let of_list ~prev_log_index ~prev_log_term = function
+        [] -> empty ~prev_log_index ~prev_log_term
       | l ->
           let entries =
             List.fold_left
               (fun m (idx, x, term) -> IM.add idx (x, term) m)
               IM.empty l in
-          let (init_index, (_, init_term)) = IM.min_binding entries in
-          let (last_index, (_, last_term)) = IM.max_binding entries in
-            { init_index; init_term; last_index; last_term; entries; }
+          let (prev_log_index, (_, prev_log_term)) = IM.min_binding entries in
+          let (last_index, (_, last_term))         = IM.max_binding entries in
+            { prev_log_index; prev_log_term; last_index; last_term; entries; }
 
     let append ~term:last_term x t =
       let last_index = Int64.succ t.last_index in
@@ -287,7 +283,7 @@ struct
               try
                 let idx, (_, term) = IM.max_binding entries in
                   (idx, term)
-              with _ -> t.init_index, t.init_term
+              with _ -> t.prev_log_index, t.prev_log_term
             in
               ({ t with last_index; last_term; entries; }, conflict_idx)
 
@@ -310,7 +306,7 @@ struct
         try
           Some (snd (IM.find idx t.entries))
         with Not_found ->
-          if idx = t.init_index then Some t.init_term else None
+          if idx = t.prev_log_index then Some t.prev_log_term else None
   end
 
   type 'a state =
@@ -634,7 +630,7 @@ let receive_msg s peer = function
         (* In the presence of snapshots, prev_log_index might refer to a log
          * entry that was removed (subsumed by the snapshot), in which case
          * we must use as prev_log_index the index of the latest entry in
-         * the snapshot (equal to the init_index of the log), and as
+         * the snapshot (equal to the prev_log_index of the log), and as
          * prev_log_term the term of the corresponding entry in the
          * Append_entries message. *)
         let prev_log_index, prev_log_term, entries =
@@ -887,8 +883,9 @@ let install_snapshot ~last_term ~last_index ~config s = match s.state with
              * follower removes its entire log; it is all superseded by the
              * snapshot."
              * *)
-            Some t when t = last_term -> LOG.trim_prefix ~last_index ~last_term s.log
-          | _ -> LOG.empty ~init_index:last_index ~init_term:last_term in
+            Some t when t = last_term ->
+              LOG.trim_prefix ~prev_log_index:last_index ~prev_log_term:last_term s.log
+          | _ -> LOG.empty ~prev_log_index:last_index ~prev_log_term:last_term in
 
       let s = { s with log; config;
                        last_applied = last_index;
@@ -922,7 +919,10 @@ let compact_log last_index s = match s.state with
         match LOG.get_term last_index s.log with
             None -> s
           | Some last_term ->
-              let log = LOG.trim_prefix ~last_index ~last_term s.log in
+              let log = LOG.trim_prefix
+                          ~prev_log_index:last_index
+                          ~prev_log_term:last_term s.log
+              in
                 { s with log }
 
 module Types = Kernel
@@ -932,7 +932,7 @@ struct
   include Types
 
   let make ~id ~current_term ~voted_for ~log ~config () =
-    let log    = LOG.of_list ~init_index:0L ~init_term:current_term log in
+    let log    = LOG.of_list ~prev_log_index:0L ~prev_log_term:current_term log in
     let config = CONFIG.make ~node_id:id ~index:1L config in
       {
         current_term; voted_for; log; id; config;
