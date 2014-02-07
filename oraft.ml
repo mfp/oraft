@@ -925,27 +925,6 @@ let compact_log last_index s = match s.state with
               let log = LOG.trim_prefix ~last_index ~last_term s.log in
                 { s with log }
 
-let config_eq c1 c2 =
-  List.sort String.compare c1 = List.sort String.compare c2
-
-let change_config ?passive c2 s = match s.state with
-      Follower -> `Redirect s.leader_id
-    | Candidate -> `Redirect None
-    | Leader ->
-        match
-          CONFIG.join (LOG.last_index s.log |> snd |> Int64.succ) ?passive c2 s.config
-        with
-            None -> `Change_in_process
-          | Some (config, target) ->
-              match CONFIG.last_commit s.config with
-                | Simple_config (c, p)
-                    when config_eq c c2 && config_eq p (Option.default p passive) ->
-                    `Already_changed
-                | _ ->
-                    let log    = LOG.append ~term:s.current_term (Config target) s.log in
-                    let s      = { s with config; log } in
-                      `Start_change s
-
 module Types = Kernel
 
 module Core =
@@ -986,5 +965,96 @@ struct
   let snapshot_sent     = snapshot_sent
   let compact_log       = compact_log
   let snapshot_send_failed = snapshot_send_failed
-  let change_config     = change_config
+
+  module Config =
+  struct
+    let config_eq c1 c2 =
+      List.sort String.compare c1 = List.sort String.compare c2
+
+    type 'a result =
+      [
+      | `Already_changed
+      | `Cannot_change
+      | `Change_in_process
+      | `Redirect of rep_id option
+      | `Start_change of 'a state
+      | `Unsafe_change of simple_config * passive_peers
+      ]
+
+    let config_change_aux s f =  match s.state with
+        Follower -> `Redirect s.leader_id
+      | Candidate -> `Redirect None
+      | Leader ->
+          match CONFIG.current s.config with
+              Joint_config _ -> `Change_in_process
+            | Simple_config (c, p) ->
+                match f c p with
+                    #result as x -> x
+                  | `Perform_change (c, passive) ->
+                      match
+                        CONFIG.join
+                          (LOG.last_index s.log |> snd |> Int64.succ)
+                          ~passive c s.config
+                      with
+                          None -> `Change_in_process
+                        | Some (config, target) ->
+                            let log    = LOG.append ~term:s.current_term
+                                           (Config target) s.log in
+                            let s      = { s with config; log } in
+                              `Start_change s
+
+    let add_failover id s =
+      config_change_aux s
+        (fun c p ->
+           if List.mem id c || List.mem id p then `Already_changed
+           else `Perform_change (c, id :: p))
+
+    let remove_failover id s =
+      config_change_aux s
+        (fun c p ->
+           if not (List.mem id p) then `Already_changed
+           else `Perform_change (c, List.remove p id))
+
+    let decommission id s =
+      config_change_aux s
+        (fun c p ->
+           let len    = List.length c in
+           let quorum = len / 2 + 1 in
+             if List.mem id c && len - 1 < quorum then `Unsafe_change (c, p)
+             else if not (List.mem id c) && not (List.mem id p) then `Already_changed
+             else `Perform_change (List.remove c id, List.remove p id))
+
+    let demote id s =
+      config_change_aux s
+        (fun c p ->
+           let len    = List.length c in
+           let quorum = len / 2 + 1 in
+             if List.mem id c && len - 1 < quorum then `Unsafe_change (c, p)
+             else if not (List.mem id c) then `Cannot_change
+             else `Perform_change (List.remove c id, id :: p))
+
+    let promote id s =
+      config_change_aux s
+        (fun c p ->
+             if List.mem id c then `Already_changed
+             else if not (List.mem id p) then `Cannot_change
+             else `Perform_change (List.remove c id, id :: p))
+
+    let replace ~replacee ~failover s =
+      config_change_aux s
+        (fun c p ->
+           let len    = List.length c in
+           let quorum = len / 2 + 1 in
+             match List.mem replacee c, List.mem failover p with
+                 true, true when len - 1 < quorum -> `Unsafe_change (c, p)
+               | true, true ->
+                   `Perform_change
+                     (failover :: List.remove c replacee, List.remove p failover)
+               | false, true ->
+                   `Perform_change (failover :: c, List.remove p failover)
+               | true, false ->
+                   if len - 1 < quorum then `Unsafe_change (c, p)
+                   else `Cannot_change
+               | false, false -> `Cannot_change)
+  end
 end

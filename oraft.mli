@@ -116,14 +116,22 @@ sig
 
   val compact_log : index -> 'a state -> 'a state
 
-  (* Start a safe configuration change by using the joint consensus protocol.
-   *
-   * @param passive the passive peers (replicated to, but not participating in
-   * commit/vote decisions). Kept as-is if [None].
-   * *)
-  val change_config :
-    ?passive:passive_peers ->
-    simple_config -> 'a state ->
-    [ `Already_changed | `Redirect of rep_id option
-    | `Change_in_process | `Start_change of 'a state ]
+  module Config :
+  sig
+    type 'a result =
+      [
+      | `Already_changed
+      | `Cannot_change
+      | `Change_in_process
+      | `Redirect of rep_id option
+      | `Start_change of 'a state
+      | `Unsafe_change of simple_config * passive_peers
+      ]
+
+    val add_failover    : rep_id -> 'a state -> 'a result
+    val remove_failover : rep_id -> 'a state -> 'a result
+    val decommission    : rep_id -> 'a state -> 'a result
+    val demote          : rep_id -> 'a state -> 'a result
+    val replace : replacee:rep_id -> failover:rep_id -> 'a state -> 'a result
+  end
 end
