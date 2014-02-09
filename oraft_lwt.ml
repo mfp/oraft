@@ -7,6 +7,7 @@ open Oraft_util
 module Map    = BatMap
 module List   = BatList
 module Option = BatOption
+module Queue  = BatQueue
 
 module REPID = struct type t = rep_id let compare = String.compare end
 module RM = Map.Make(REPID)
@@ -65,8 +66,12 @@ struct
         mutable heartbeat        : th_res Lwt.t;
         mutable abort            : th_res Lwt.t * th_res Lwt.u;
         mutable get_cmd          : th_res Lwt.t;
+        mutable get_ro_op        : th_res Lwt.t;
         push_cmd                 : (req_id * PROC.op) -> unit;
         cmd_stream               : (req_id * PROC.op) Lwt_stream.t;
+        push_ro_op               : ro_op_res Lwt.u -> unit;
+        ro_op_stream             : ro_op_res Lwt.u Lwt_stream.t;
+        pending_ro_ops           : (Int64.t * ro_op_res Lwt.u) Queue.t;
         mutable pending_cmds     : (cmd_res Lwt.t * cmd_res Lwt.u) CMDM.t;
         leader_signal            : unit Lwt_condition.t;
         snapshot_sent_stream     : (rep_id * index) Lwt_stream.t;
@@ -81,17 +86,22 @@ struct
     | Election_timeout
     | Heartbeat_timeout
     | Snapshots_sent of (rep_id * index) list
+    | Readonly_op of ro_op_res Lwt.u
 
   and cmd_res =
       Redirect of rep_id option
     | Executed of (PROC.resp, exn) result
 
-  type result =
-      [ `OK of PROC.resp
-      | `Error of exn
+  and ro_op_res = OK | Retry
+
+  type gen_result =
+      [ `Error of exn
       | `Redirect of rep_id * IO.address
       | `Redirect_randomized of rep_id * IO.address
       | `Retry_later ]
+
+  type cmd_result   = [ gen_result | `OK of PROC.resp ]
+  type ro_op_result = [ gen_result | `OK ]
 
   let get_sent_snapshots stream =
     match_lwt Lwt_stream.get stream with
@@ -103,10 +113,11 @@ struct
 
   let make
         ?(election_period = 2.)
-        ?(heartbeat_period = election_period /. 2.)
-        state peers =
-    let stream, push      = Lwt_stream.create () in
-    let push x            = push (Some x) in
+        ?(heartbeat_period = election_period /. 2.) state peers =
+    let cmd_stream, p     = Lwt_stream.create () in
+    let push_cmd x        = p (Some x) in
+    let ro_op_stream, p   = Lwt_stream.create () in
+    let push_ro_op x      = p (Some x) in
     let election_timeout  = match Core.status state with
                               | Follower | Candidate ->
                                   Lwt_unix.sleep election_period >>
@@ -130,6 +141,10 @@ struct
         heartbeat;
         snapshot_sent_stream;
         snapshots_sent;
+        cmd_stream;
+        push_cmd;
+        ro_op_stream;
+        push_ro_op;
         peers         = List.fold_left
                           (fun m (k, v) -> RM.add k v m) RM.empty
                           (List.filter (fun (id, _) -> id <> Core.id state) peers);
@@ -143,12 +158,14 @@ struct
         running       = true;
         msg_threads   = [];
         abort         = Lwt.task ();
-        get_cmd       = (match_lwt Lwt_stream.get stream with
+        get_cmd       = (match_lwt Lwt_stream.get cmd_stream with
                            | None -> fst (Lwt.wait ())
                            | Some (req_id, op) ->
                                return (Client_command (req_id, op)));
-        push_cmd      = push;
-        cmd_stream    = stream;
+        get_ro_op     = (match_lwt Lwt_stream.get ro_op_stream with
+                           | None -> fst (Lwt.wait ())
+                           | Some x -> return (Readonly_op x));
+        pending_ro_ops= Queue.create ();
         pending_cmds  = CMDM.empty;
         leader_signal = Lwt_condition.create ();
         snapshot_sent = (fun x -> push_snapshot_ok (Some x));
@@ -180,6 +197,12 @@ struct
     in
       make_thread 5
 
+  let rec clear_pending_ro_ops t =
+    match Queue.Exceptionless.take t.pending_ro_ops with
+        None -> ()
+      | Some (_, u) -> (try Lwt.wakeup_later u Retry with _ -> ());
+                       clear_pending_ro_ops t
+
   let rec exec_action t : _ action -> unit Lwt.t = function
     | Reset_election_timeout ->
         t.election_timeout <- (Lwt_unix.sleep t.election_period >>
@@ -191,13 +214,16 @@ struct
         return ()
     | Become_candidate
     | Become_follower None ->
+        clear_pending_ro_ops t;
         t.heartbeat <- fst (Lwt.wait ());
         exec_action t Reset_election_timeout
     | Become_follower (Some _) ->
+        clear_pending_ro_ops t;
         Lwt_condition.broadcast t.leader_signal ();
         t.heartbeat <- fst (Lwt.wait ());
         exec_action t Reset_election_timeout
     | Become_leader ->
+        clear_pending_ro_ops t;
         Lwt_condition.broadcast t.leader_signal ();
         exec_action t Reset_election_timeout >>
         exec_action t Reset_heartbeat
@@ -249,6 +275,15 @@ struct
         end;
         return ()
     | Stop -> raise_lwt Stop_node
+    | Exec_readonly n ->
+        (* can execute all RO ops whose ID is >= n *)
+        let rec notify_ok () =
+          match Queue.Exceptionless.peek t.pending_ro_ops with
+              None -> return_unit
+            | Some (m, _) when m > n -> return_unit
+            | Some (_, u) -> Lwt.wakeup_later u OK; notify_ok ()
+        in
+          notify_ok ()
 
   let exec_actions t l = Lwt_list.iter_s (exec_action t) l
 
@@ -266,12 +301,23 @@ struct
             ([ t.election_timeout;
                fst t.abort;
                t.get_cmd;
+               t.get_ro_op;
                t.heartbeat;
                t.snapshots_sent;
              ] @
              t.msg_threads)
         with
           | Abort -> t.running <- false; return ()
+          | Readonly_op u -> begin
+              match Core.readonly_operation t.state with
+                  (s, None) -> Lwt.wakeup_later u Retry;
+                               return_unit
+                | (s, Some (id, actions)) ->
+                    Queue.push (id, u) t.pending_ro_ops;
+                    t.state <- s;
+                    exec_actions t actions >>
+                    run t
+            end
           | Client_command (req_id, op) ->
               let state, actions = Core.client_command (req_id, op) t.state in
                 t.state <- state;
@@ -343,6 +389,35 @@ struct
             t.pending_cmds <- CMDM.add req_id task t.pending_cmds;
             t.push_cmd (req_id, cmd);
             match_lwt fst task with
-                Executed res -> return (res :> result)
+                Executed res -> return (res :> cmd_result)
               | Redirect _ -> execute t cmd
+
+  let rec readonly_operation t =
+    match Core.status t.state, Core.leader_id t.state with
+      | Follower, Some leader_id -> begin
+          match maybe_nf (RM.find leader_id) t.peers with
+              Some address -> return (`Redirect (leader_id, address))
+            | None ->
+                (* redirect to a random server, hoping it knows better *)
+                try_lwt
+                  let leader_id, address =
+                    RM.bindings t.peers |>
+                    Array.of_list |>
+                    (fun x -> if x = [||] then failwith "empty"; x) |>
+                    (fun a -> a.(Random.int (Array.length a)))
+                  in
+                    return (`Redirect_randomized (leader_id, address))
+                with _ ->
+                  return `Retry_later
+        end
+      | Candidate, _ | Follower, _ ->
+          (* await leader, retry *)
+          Lwt_condition.wait t.leader_signal >>
+          readonly_operation t
+      | Leader, _ ->
+          let th, u = Lwt.task () in
+            t.push_ro_op u;
+            match_lwt th with
+                OK -> return `OK
+              | Retry -> readonly_operation t
 end

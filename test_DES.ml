@@ -282,6 +282,8 @@ struct
         sprintf "Append_result success %Ld @ %Ld" last_log_index term
     | Append_result { term; result = Append_failure prev_log_index } ->
         sprintf "Append_result failure %Ld @ %Ld" prev_log_index term
+    | Pong { term; n } -> sprintf "Pong %Ld @ %Ld" n term
+    | Ping { term; n } -> sprintf "Ping %Ld @ %Ld" n term
 
   let describe_event string_of_cmd = function
       Election_timeout -> "Election_timeout"
@@ -568,6 +570,8 @@ struct
                   let () = NODES.iter collect_removee t.nodes in
                     List.iter (NODES.remove t.nodes) !to_be_removed
             end
+        | Exec_readonly n ->
+            if verbose then printf " Exec_readonly %Ld\n" n
         | Redirect (Some leader, cmd) ->
             if verbose then printf " Redirect %s\n" leader;
             send_cmd ~dst:leader cmd

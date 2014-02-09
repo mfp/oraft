@@ -331,6 +331,9 @@ struct
         (* volatile on leaders *)
         next_index  : index RM.t;
         match_index : index RM.t;
+        pongs       : index RM.t;
+        ping_index  : Int64.t;
+        acked_ro_op : Int64.t;
 
         snapshot_transfers : RS.t;
 
@@ -344,6 +347,8 @@ struct
     | Vote_result of vote_result
     | Append_entries of 'a append_entries
     | Append_result of append_result
+    | Ping of ping
+    | Pong of ping
 
   and request_vote =
       {
@@ -380,12 +385,15 @@ struct
     | Append_failure of index (* index of log entry preceding those in
                                  message we respond to *)
 
+  and ping = { term : term; n : Int64.t; }
+
   type 'a action =
       Apply of (index * 'a * term) list
     | Become_candidate
     | Become_follower of rep_id option
     | Become_leader
     | Changed_config
+    | Exec_readonly of Int64.t
     | Redirect of rep_id option * 'a
     | Reset_election_timeout
     | Reset_heartbeat
@@ -534,14 +542,16 @@ let receive_msg s peer = function
   (* Reject vote requests/results and Append_entries (which should not be
    * received anyway since passive members cannot become leaders) from passive
    * members *)
-  | Append_entries _
+  | Append_entries _ | Ping _ | Pong _
   | Request_vote _ | Vote_result _ when not (CONFIG.mem_active peer s.config) ->
       (s, [])
 
   (* " If a server receives a request with a stale term number, it rejects the
    * request." *)
-  | Request_vote { term; _ } when term < s.current_term ->
+  | Request_vote { term; _ } | Ping { term; _ } when term < s.current_term ->
       (s, [Send (peer, vote_result s false)])
+
+  | Pong { term; _ } when term <> s.current_term -> (s, [])
 
   (* "Current terms are exchanged whenever servers communicate; if one
    * server’s current term is smaller than the other, then it updates its
@@ -549,8 +559,33 @@ let receive_msg s peer = function
    * its term is out of date, it immediately reverts to follower state."
    * *)
   | Vote_result { term; _ }
-  | Append_result { term; _ } when term > s.current_term ->
+  | Append_result { term; _ }
+  | Ping { term; _ } when term > s.current_term ->
       (step_down term s, [Become_follower None])
+
+  | Ping { term; n; } (* term = current_term *) -> begin
+      match s.leader_id with
+          Some leader when leader = peer ->
+            (s, [Send (peer, Pong { term; n; })])
+        | _ ->
+            (* We ignore Ping messages not coming from the leader.
+             * They should not happen, since followers/candidates do not send
+             * Pings. *)
+            (s, [])
+    end
+
+  | Pong { term; n; } ->
+      let pongs = RM.modify_def 0L peer (max n) s.pongs in
+
+      let get_last_pong id =
+        if id = s.id then s.ping_index
+        else Option.default 0L (RM.Exceptionless.find id pongs) in
+
+      let acked   = CONFIG.quorum_min get_last_pong s.config in
+      let actions = if acked > s.acked_ro_op then [ Exec_readonly acked ]
+                    else [] in
+      let s       = { s with pongs; acked_ro_op = max s.acked_ro_op acked; } in
+        (s, actions)
 
   | Request_vote { term; candidate_id; last_log_index; last_log_term; }
       when term > s.current_term ->
@@ -729,8 +764,11 @@ let receive_msg s peer = function
                                 (fun m peer -> RM.add peer 0L m)
                                 RM.empty (CONFIG.peers s.config) in
             let s     = { s with log; next_index; match_index;
-                                 state     = Leader;
-                                 leader_id = Some s.id;
+                                 state       = Leader;
+                                 leader_id   = Some s.id;
+                                 pongs       = RM.empty;
+                                 ping_index  = 1L;
+                                 acked_ro_op = 0L;
                                  snapshot_transfers = RS.empty;
                         } in
             (* This heartbeat is replaced by the broadcast of the no-op
@@ -925,6 +963,14 @@ let compact_log last_index s = match s.state with
               in
                 { s with log }
 
+let readonly_operation s = match s.state with
+  | Follower | Candidate -> (s, None)
+  | Leader ->
+      let n    = s.ping_index in
+      let ping = Ping { term = s.current_term; n; } in
+      let s    = { s with ping_index = Int64.succ s.ping_index; } in
+        (s, Some (n, broadcast s ping))
+
 module Types = Kernel
 
 module Core =
@@ -943,6 +989,9 @@ struct
         config'      = None;
         next_index   = RM.empty;
         match_index  = RM.empty;
+        pongs        = RM.empty;
+        ping_index   = 1L;
+        acked_ro_op  = 0L;
         votes        = RS.empty;
         snapshot_transfers = RS.empty;
       }
@@ -964,6 +1013,8 @@ struct
   let install_snapshot  = install_snapshot
   let snapshot_sent     = snapshot_sent
   let compact_log       = compact_log
+
+  let readonly_operation   = readonly_operation
   let snapshot_send_failed = snapshot_send_failed
 
   module Config =

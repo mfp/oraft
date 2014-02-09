@@ -28,6 +28,8 @@ sig
     | Vote_result of vote_result
     | Append_entries of 'a append_entries
     | Append_result of append_result
+    | Ping of ping
+    | Pong of ping
 
   and request_vote = {
     term : term;
@@ -63,12 +65,15 @@ sig
     | Append_failure of index (* index of log entry preceding those in
                                  message we respond to *)
 
+  and ping = { term : term; n : Int64.t; }
+
   type 'a action =
       Apply of (index * 'a * term) list
     | Become_candidate
     | Become_follower of rep_id option
     | Become_leader
     | Changed_config
+    | Exec_readonly of Int64.t
     | Redirect of rep_id option * 'a
     | Reset_election_timeout
     | Reset_heartbeat
@@ -104,6 +109,15 @@ sig
   val election_timeout  : 'a state -> 'a state * 'a action list
   val heartbeat_timeout : 'a state -> 'a state * 'a action list
   val client_command    : 'a -> 'a state -> 'a state * 'a action list
+
+  (** @return [(state, None)] if the node is not the leader,
+    * [(state, Some (id, actions))] otherwise, where [id] identifies the
+    * requested read-only operation, which can be executed once an
+    * [Exec_readonly m] action with [m >= id] is returned within the same term
+    * (i.e., with no intermediate [Become_candidate], [Become_follower] or
+    * [Become_leader]). *)
+  val readonly_operation :
+    'a state -> 'a state * (Int64.t * 'a action list) option
 
   val snapshot_sent :
     rep_id -> last_index:index -> 'a state -> ('a state * 'a action list)
