@@ -361,7 +361,7 @@ struct
       t.next_req_id <- Int64.succ id;
       (Core.id t.state, id)
 
-  let rec execute t cmd =
+  let rec exec_aux t f =
     match Core.status t.state, Core.leader_id t.state with
       | Follower, Some leader_id -> begin
           match maybe_nf (RM.find leader_id) t.peers with
@@ -382,42 +382,27 @@ struct
       | Candidate, _ | Follower, _ ->
           (* await leader, retry *)
           Lwt_condition.wait t.leader_signal >>
-          execute t cmd
+          exec_aux t f
       | Leader, _ ->
+          f t
+
+  let rec execute t cmd =
+    exec_aux t
+      (fun t ->
           let req_id = gen_req_id t in
           let task   = Lwt.task () in
             t.pending_cmds <- CMDM.add req_id task t.pending_cmds;
             t.push_cmd (req_id, cmd);
             match_lwt fst task with
                 Executed res -> return (res :> cmd_result)
-              | Redirect _ -> execute t cmd
+              | Redirect _ -> execute t cmd)
 
   let rec readonly_operation t =
-    match Core.status t.state, Core.leader_id t.state with
-      | Follower, Some leader_id -> begin
-          match maybe_nf (RM.find leader_id) t.peers with
-              Some address -> return (`Redirect (leader_id, address))
-            | None ->
-                (* redirect to a random server, hoping it knows better *)
-                try_lwt
-                  let leader_id, address =
-                    RM.bindings t.peers |>
-                    Array.of_list |>
-                    (fun x -> if x = [||] then failwith "empty"; x) |>
-                    (fun a -> a.(Random.int (Array.length a)))
-                  in
-                    return (`Redirect_randomized (leader_id, address))
-                with _ ->
-                  return `Retry_later
-        end
-      | Candidate, _ | Follower, _ ->
-          (* await leader, retry *)
-          Lwt_condition.wait t.leader_signal >>
-          readonly_operation t
-      | Leader, _ ->
-          let th, u = Lwt.task () in
-            t.push_ro_op u;
-            match_lwt th with
-                OK -> return `OK
-              | Retry -> readonly_operation t
+    exec_aux t
+      (fun t ->
+         let th, u = Lwt.task () in
+           t.push_ro_op u;
+           match_lwt th with
+               OK -> return `OK
+             | Retry -> readonly_operation t)
 end
