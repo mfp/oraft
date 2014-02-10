@@ -45,6 +45,8 @@ sig
   val execute : 'a server -> IO.op -> 'a cmd_result Lwt.t
   val readonly_operation : _ server -> ro_op_result Lwt.t
 
+  val compact_log : _ server -> index -> unit
+
   module Config :
   sig
     type result =

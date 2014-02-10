@@ -463,6 +463,9 @@ struct
                OK -> return `OK
              | Retry -> readonly_operation t)
 
+  let compact_log t index =
+    t.state <- Core.compact_log index t.state
+
   module Config =
   struct
     type result =
