@@ -146,6 +146,7 @@ sig
     val remove_failover : rep_id -> 'a state -> 'a result
     val decommission    : rep_id -> 'a state -> 'a result
     val demote          : rep_id -> 'a state -> 'a result
+    val promote         : rep_id -> 'a state -> 'a result
     val replace : replacee:rep_id -> failover:rep_id -> 'a state -> 'a result
   end
 end

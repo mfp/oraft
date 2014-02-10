@@ -53,8 +53,7 @@ struct
 
   type server =
       {
-        peers                    : IO.address RM.t;
-        peer_ids                 : rep_id list;
+        mutable peers            : IO.address RM.t;
         election_period          : float;
         heartbeat_period         : float;
         mutable next_req_id      : Int64.t;
@@ -77,7 +76,19 @@ struct
         snapshot_sent_stream     : (rep_id * index) Lwt_stream.t;
         mutable snapshots_sent   : th_res Lwt.t;
         snapshot_sent            : ((rep_id * index) -> unit);
+        mutable config_change    : config_change;
       }
+
+  and config_change =
+    | No_change
+    | New_failover of change_result Lwt.u * rep_id * IO.address
+    | Remove_failover of change_result Lwt.u * rep_id
+    | Decommission of change_result Lwt.u * rep_id
+    | Promote of change_result Lwt.u * rep_id
+    | Demote of change_result Lwt.u * rep_id
+    | Replace of change_result Lwt.u * rep_id * rep_id
+
+  and change_result = OK | Retry
 
   and th_res =
       Message of rep_id * (req_id * PROC.op) message
@@ -148,11 +159,6 @@ struct
         peers         = List.fold_left
                           (fun m (k, v) -> RM.add k v m) RM.empty
                           (List.filter (fun (id, _) -> id <> Core.id state) peers);
-        peer_ids      = List.filter_map
-                          (function
-                             | (id, _) when id <> Core.id state -> Some id
-                             | _ -> None)
-                          peers;
         next_req_id   = 42L;
         conns         = RM.empty;
         running       = true;
@@ -169,6 +175,7 @@ struct
         pending_cmds  = CMDM.empty;
         leader_signal = Lwt_condition.create ();
         snapshot_sent = (fun x -> push_snapshot_ok (Some x));
+        config_change = No_change;
       }
 
   let abort t =
@@ -203,6 +210,58 @@ struct
       | Some (_, u) -> (try Lwt.wakeup_later u Retry with _ -> ());
                        clear_pending_ro_ops t
 
+  let abort_ongoing_config_change t =
+    match t.config_change with
+        No_change -> ()
+      | New_failover (u, _, _)
+      | Remove_failover (u, _)
+      | Decommission (u, _)
+      | Promote (u, _)
+      | Demote (u, _)
+      | Replace (u, _, _) ->
+          try Lwt.wakeup_later u Retry with _ -> ()
+
+  let notify_config_result t task result =
+    t.config_change <- No_change;
+    try Lwt.wakeup_later task result with _ -> ()
+
+  let check_config_change_completion t =
+    match Core.committed_config t.state with
+        Joint_config _ -> (* wait for the final Simple_config *) ()
+      | Simple_config (active, passive) ->
+          match t.config_change with
+            | No_change -> ()
+            | New_failover (u, rep_id, addr) ->
+                if not (List.mem rep_id active || List.mem rep_id passive) then
+                  notify_config_result t u Retry
+                else begin
+                  t.peers <- RM.add rep_id addr t.peers;
+                  notify_config_result t u OK
+                end
+            | Remove_failover (u, rep_id) ->
+                if List.mem rep_id passive then notify_config_result t u Retry
+                else notify_config_result t u OK
+            | Decommission (u, rep_id) ->
+                if List.mem rep_id active || List.mem rep_id passive then
+                  notify_config_result t u Retry
+                else begin
+                  t.peers <- RM.remove rep_id t.peers;
+                  notify_config_result t u OK
+                end
+            | Promote (u, rep_id) ->
+                if List.mem rep_id active then notify_config_result t u OK
+                else notify_config_result t u Retry
+            | Demote (u, rep_id) ->
+                if List.mem rep_id active then notify_config_result t u Retry
+                else notify_config_result t u OK
+            | Replace (u, replacee, failover) ->
+                if not (List.mem failover active) then
+                  notify_config_result t u Retry
+                else begin
+                  t.peers <- RM.remove replacee t.peers;
+                  notify_config_result t u OK
+                end
+
   let rec exec_action t : _ action -> unit Lwt.t = function
     | Reset_election_timeout ->
         t.election_timeout <- (Lwt_unix.sleep t.election_period >>
@@ -215,19 +274,24 @@ struct
     | Become_candidate
     | Become_follower None ->
         clear_pending_ro_ops t;
+        abort_ongoing_config_change t;
         t.heartbeat <- fst (Lwt.wait ());
         exec_action t Reset_election_timeout
     | Become_follower (Some _) ->
         clear_pending_ro_ops t;
+        abort_ongoing_config_change t;
         Lwt_condition.broadcast t.leader_signal ();
         t.heartbeat <- fst (Lwt.wait ());
         exec_action t Reset_election_timeout
     | Become_leader ->
         clear_pending_ro_ops t;
+        abort_ongoing_config_change t;
         Lwt_condition.broadcast t.leader_signal ();
         exec_action t Reset_election_timeout >>
         exec_action t Reset_heartbeat
-    | Changed_config -> return_unit
+    | Changed_config ->
+        check_config_change_completion t;
+        return_unit
     | Apply l ->
         Lwt_list.iter_s
           (fun (index, (req_id, op), term) ->
@@ -405,4 +469,71 @@ struct
            match_lwt th with
                OK -> return `OK
              | Retry -> readonly_operation t)
+
+  module Config =
+  struct
+    type result =
+      [
+      | `OK
+      | `Redirect of rep_id option
+      | `Retry
+      | `Cannot_change
+      | `Unsafe_change of simple_config * passive_peers
+      ]
+
+    let retry_delay = 0.05
+
+    let rec perform_change t perform mk_change : result Lwt.t =
+      match t.config_change with
+          New_failover _ | Remove_failover _ | Decommission _
+        | Promote _ | Demote _ | Replace _ ->
+            Lwt_unix.sleep retry_delay >>
+            perform_change t perform mk_change
+        | No_change ->
+            match perform t.state with
+                `Already_changed -> return `OK
+              | `Cannot_change | `Unsafe_change _ | `Redirect _ as x -> return x
+              | `Change_in_process ->
+                  Lwt_unix.sleep retry_delay >>
+                  perform_change t perform mk_change
+              | `Start_change state ->
+                  t.state <- state;
+                  let th, u = Lwt.task () in
+                    t.config_change <- mk_change u;
+                    match_lwt th with
+                        OK -> return `OK
+                      | Retry ->
+                          Lwt_unix.sleep retry_delay >>
+                          perform_change t perform mk_change
+
+    let rec add_failover t rep_id addr =
+      perform_change t
+        (Core.Config.add_failover rep_id)
+        (fun u -> New_failover (u, rep_id, addr))
+
+    let remove_failover t rep_id =
+      perform_change t
+        (Core.Config.remove_failover rep_id)
+        (fun u -> Remove_failover (u, rep_id))
+
+    let decommission t rep_id =
+      perform_change t
+        (Core.Config.decommission rep_id)
+        (fun u -> Decommission (u, rep_id))
+
+    let promote t rep_id =
+      perform_change t
+        (Core.Config.promote rep_id)
+        (fun u -> Promote (u, rep_id))
+
+    let demote t rep_id =
+      perform_change t
+        (Core.Config.demote rep_id)
+        (fun u -> Demote (u, rep_id))
+
+    let replace t ~replacee ~failover =
+      perform_change t
+        (Core.Config.replace ~replacee ~failover)
+        (fun u -> Replace (u, replacee, failover))
+  end
 end

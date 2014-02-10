@@ -52,4 +52,23 @@ sig
   val abort   : server -> unit Lwt.t
   val execute : server -> PROC.op -> cmd_result Lwt.t
   val readonly_operation : server -> ro_op_result Lwt.t
+
+  module Config :
+  sig
+    type result =
+      [
+      | `OK
+      | `Redirect of rep_id option
+      | `Retry
+      | `Cannot_change
+      | `Unsafe_change of simple_config * passive_peers
+      ]
+
+    val add_failover    : server -> rep_id -> IO.address -> result Lwt.t
+    val remove_failover : server -> rep_id -> result Lwt.t
+    val decommission    : server -> rep_id -> result Lwt.t
+    val demote          : server -> rep_id -> result Lwt.t
+    val promote         : server -> rep_id -> result Lwt.t
+    val replace         : server -> replacee:rep_id -> failover:rep_id -> result Lwt.t
+  end
 end
