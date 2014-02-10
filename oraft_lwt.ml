@@ -225,6 +225,12 @@ struct
     t.config_change <- No_change;
     try Lwt.wakeup_later task result with _ -> ()
 
+  let notify_ok_if_mem t u rep_id l =
+    notify_config_result t u (if List.mem rep_id l then OK else Retry)
+
+  let notify_ok_if_not_mem t u rep_id l =
+    notify_config_result t u (if List.mem rep_id l then Retry else OK)
+
   let check_config_change_completion t =
     match Core.committed_config t.state with
         Joint_config _ -> (* wait for the final Simple_config *) ()
@@ -238,9 +244,7 @@ struct
                   t.peers <- RM.add rep_id addr t.peers;
                   notify_config_result t u OK
                 end
-            | Remove_failover (u, rep_id) ->
-                if List.mem rep_id passive then notify_config_result t u Retry
-                else notify_config_result t u OK
+            | Remove_failover (u, rep_id) -> notify_ok_if_not_mem t u rep_id passive
             | Decommission (u, rep_id) ->
                 if List.mem rep_id active || List.mem rep_id passive then
                   notify_config_result t u Retry
@@ -248,12 +252,8 @@ struct
                   t.peers <- RM.remove rep_id t.peers;
                   notify_config_result t u OK
                 end
-            | Promote (u, rep_id) ->
-                if List.mem rep_id active then notify_config_result t u OK
-                else notify_config_result t u Retry
-            | Demote (u, rep_id) ->
-                if List.mem rep_id active then notify_config_result t u Retry
-                else notify_config_result t u OK
+            | Promote (u, rep_id) -> notify_ok_if_mem t u rep_id active
+            | Demote (u, rep_id) -> notify_ok_if_not_mem t u rep_id active
             | Replace (u, replacee, failover) ->
                 if not (List.mem failover active) then
                   notify_config_result t u Retry
