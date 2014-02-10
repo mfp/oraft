@@ -17,7 +17,7 @@ sig
   val prepare_snapshot :
     connection -> index -> config -> snapshot_transfer option Lwt.t
 
-  val send_snapshot : snapshot_transfer -> unit Lwt.t
+  val send_snapshot : snapshot_transfer -> bool Lwt.t
 end
 
 module Make_server : functor(IO : LWTIO) ->

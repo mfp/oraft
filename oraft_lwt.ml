@@ -28,7 +28,7 @@ sig
   val prepare_snapshot :
     connection -> index -> config -> snapshot_transfer option Lwt.t
 
-  val send_snapshot : snapshot_transfer -> unit Lwt.t
+  val send_snapshot : snapshot_transfer -> bool Lwt.t
 end
 
 module Make_server(IO : LWTIO) =
@@ -64,9 +64,12 @@ struct
         pending_ro_ops           : (Int64.t * ro_op_res Lwt.u) Queue.t;
         mutable pending_cmds     : ('a cmd_res Lwt.t * 'a cmd_res Lwt.u) CMDM.t;
         leader_signal            : unit Lwt_condition.t;
-        snapshot_sent_stream     : (rep_id * index) Lwt_stream.t;
-        mutable snapshots_sent   : th_res Lwt.t;
+        sent_snapshots           : (rep_id * index) Lwt_stream.t;
+        mutable sent_snapshots_th  : th_res Lwt.t;
         snapshot_sent            : ((rep_id * index) -> unit);
+        failed_snapshots         : rep_id Lwt_stream.t;
+        mutable failed_snapshot_th : th_res Lwt.t;
+        snapshot_failed          : rep_id -> unit;
         mutable config_change    : config_change;
       }
 
@@ -88,6 +91,7 @@ struct
     | Election_timeout
     | Heartbeat_timeout
     | Snapshots_sent of (rep_id * index) list
+    | Snapshot_send_failed of rep_id
     | Readonly_op of ro_op_res Lwt.u
 
   and 'a cmd_res =
@@ -105,13 +109,18 @@ struct
   type 'a cmd_result   = [ gen_result | `OK of 'a ]
   type ro_op_result = [ gen_result | `OK ]
 
-  let get_sent_snapshots stream =
-    match_lwt Lwt_stream.get stream with
+  let get_sent_snapshots t =
+    match_lwt Lwt_stream.get t.sent_snapshots with
         None -> fst (Lwt.wait ())
       | Some (peer, last_index) ->
-          let l = Lwt_stream.get_available stream in
-            Lwt_stream.njunk (List.length l) stream >>
+          let l = Lwt_stream.get_available t.sent_snapshots in
+            Lwt_stream.njunk (List.length l) t.sent_snapshots >>
             return (Snapshots_sent ((peer, last_index) :: l))
+
+  let get_failed_snapshot t =
+    match_lwt Lwt_stream.get t.failed_snapshots with
+        None -> fst (Lwt.wait ())
+      | Some rep_id -> return (Snapshot_send_failed rep_id)
 
   let make
         execute
@@ -131,11 +140,15 @@ struct
                               | Leader ->
                                   Lwt_unix.sleep heartbeat_period >>
                                   return Heartbeat_timeout in
-    let snapshot_sent_stream,
-        push_snapshot_ok  = Lwt_stream.create () in
-    let snapshots_sent    = get_sent_snapshots snapshot_sent_stream
+    let sent_snapshots, p = Lwt_stream.create () in
+    let snapshot_sent x   = p (Some x) in
+    let sent_snapshots_th = fst (Lwt.wait ()) in
 
-    in
+    let failed_snapshots, p = Lwt_stream.create () in
+    let snapshot_failed x   = p (Some x) in
+    let failed_snapshot_th  = fst (Lwt.wait ()) in
+
+    let t =
       {
         execute;
         heartbeat_period;
@@ -143,8 +156,12 @@ struct
         state;
         election_timeout;
         heartbeat;
-        snapshot_sent_stream;
-        snapshots_sent;
+        sent_snapshots;
+        snapshot_sent;
+        sent_snapshots_th;
+        failed_snapshots;
+        snapshot_failed;
+        failed_snapshot_th;
         cmd_stream;
         push_cmd;
         ro_op_stream;
@@ -167,9 +184,12 @@ struct
         pending_ro_ops= Queue.create ();
         pending_cmds  = CMDM.empty;
         leader_signal = Lwt_condition.create ();
-        snapshot_sent = (fun x -> push_snapshot_ok (Some x));
         config_change = No_change;
       }
+    in
+      t.sent_snapshots_th   <- get_sent_snapshots  t;
+      t.failed_snapshot_th  <- get_failed_snapshot t;
+      t
 
   let abort t =
     if not t.running then
@@ -322,13 +342,17 @@ struct
         return ()
     | Send_snapshot (rep_id, idx, config) ->
         ignore begin
-          try_lwt
-            match_lwt IO.prepare_snapshot (RM.find rep_id t.conns) idx config with
-              | None -> return ()
-              | Some transfer -> IO.send_snapshot transfer
-          finally
-            t.snapshot_sent (rep_id, idx);
-            return ()
+          match_lwt IO.prepare_snapshot (RM.find rep_id t.conns) idx config with
+            | None -> return ()
+            | Some transfer ->
+                try_lwt
+                  match_lwt IO.send_snapshot transfer with
+                      true -> t.snapshot_sent (rep_id, idx);
+                              return ()
+                    | false -> failwith "error"
+                with _ ->
+                  t.snapshot_failed rep_id;
+                  return ()
         end;
         return ()
     | Stop -> raise_lwt Stop_node
@@ -363,7 +387,7 @@ struct
                t.get_cmd;
                t.get_ro_op;
                t.heartbeat;
-               t.snapshots_sent;
+               t.sent_snapshots_th;
              ] @
              t.msg_threads)
         with
@@ -407,6 +431,13 @@ struct
                   (t.state, [])
                   data
               in
+                t.sent_snapshots_th <- get_sent_snapshots t;
+                t.state <- state;
+                exec_actions t actions >>
+                run t
+          | Snapshot_send_failed rep_id ->
+              let state, actions = Core.snapshot_send_failed rep_id t.state in
+                t.failed_snapshot_th <- get_failed_snapshot t;
                 t.state <- state;
                 exec_actions t actions >>
                 run t
