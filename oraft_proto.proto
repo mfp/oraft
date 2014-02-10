@@ -1,0 +1,27 @@
+type rep_id = string
+type simple_config = [rep_id]
+type passive_peers = simple_config
+type term  = long
+type index = long
+
+type config =
+    Simple_config simple_config
+  | Joint_config (simple_config * simple_config * passive_peers)
+
+type actual_append_result = Append_success index | Append_failure index
+
+type ping_msg = { term : term; n : long }
+
+message raft_message =
+    Request_vote { term : term; candidate_id : rep_id;
+                   last_log_index : index; last_log_term : term }
+  | Vote_result { term : term; vote_granted : bool }
+  | Append_entries { term : term; leader_id : rep_id;
+                     prev_log_index : index; prev_log_term : term;
+                     entries : [ (index * string * term) ];
+                     leader_commit : index }
+  | Append_result { term : term; result : actual_append_result }
+  | Ping ping_msg
+  | Pong ping_msg
+
+(* vim: set ft=omlet: *)

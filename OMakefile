@@ -11,6 +11,7 @@ OCAMLPACKS[] =
    batteries
    lwt.unix
    lwt.syntax
+   extprot
 
 if $(not $(OCAMLFIND_EXISTS))
    eprintln(This project requires ocamlfind, but is was not found.)
@@ -20,6 +21,12 @@ if $(not $(OCAMLFIND_EXISTS))
 OBJECTS[] =
     oraft
     oraft_lwt
+    oraft_proto
+
+OCamlGeneratedFiles(oraft_proto)
+
+oraft_proto.ml: oraft_proto.proto
+        extprotc $<
 
 LIBS     = $(OCamlLibrary oraft, $(OBJECTS))
 
