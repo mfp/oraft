@@ -23,8 +23,6 @@ struct
   and simple_config = rep_id list
   and passive_peers = rep_id list
 
-  type ('a, 'b) result = [`OK of 'a | `Error of 'b]
-
   module REPID = struct type t = rep_id let compare = String.compare end
   module IM = Map.Make(Int64)
   module RM = Map.Make(REPID)

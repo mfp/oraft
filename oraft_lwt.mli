@@ -20,21 +20,11 @@ sig
   val send_snapshot : snapshot_transfer -> unit Lwt.t
 end
 
-module type LWTPROC =
-sig
-  type op
-  type resp
-
-  val execute : op -> (resp, exn) Oraft.Types.result Lwt.t
-end
-
-module Make_server :
-  functor(PROC : LWTPROC) ->
-  functor(IO : LWTIO with type op = PROC.op) ->
+module Make_server : functor(IO : LWTIO) ->
 sig
   open Oraft.Types
 
-  type server
+  type 'a server
 
   type gen_result =
       [ `Error of exn
@@ -42,16 +32,18 @@ sig
       | `Redirect_randomized of rep_id * IO.address
       | `Retry_later ]
 
-  type cmd_result   = [ gen_result | `OK of PROC.resp ]
+  type 'a cmd_result   = [ gen_result | `OK of 'a ]
   type ro_op_result = [ gen_result | `OK ]
 
-  val make : ?election_period:float -> ?heartbeat_period:float ->
-    (req_id * IO.op) Oraft.Core.state -> (rep_id * IO.address) list -> server
+  val make :
+    ('a server -> IO.op -> [`OK of 'a | `Error of exn] Lwt.t) ->
+    ?election_period:float -> ?heartbeat_period:float ->
+    (req_id * IO.op) Oraft.Core.state -> (rep_id * IO.address) list -> 'a server
 
-  val run     : server -> unit Lwt.t
-  val abort   : server -> unit Lwt.t
-  val execute : server -> PROC.op -> cmd_result Lwt.t
-  val readonly_operation : server -> ro_op_result Lwt.t
+  val run     : _ server -> unit Lwt.t
+  val abort   : _ server -> unit Lwt.t
+  val execute : 'a server -> IO.op -> 'a cmd_result Lwt.t
+  val readonly_operation : _ server -> ro_op_result Lwt.t
 
   module Config :
   sig
@@ -64,11 +56,11 @@ sig
       | `Unsafe_change of simple_config * passive_peers
       ]
 
-    val add_failover    : server -> rep_id -> IO.address -> result Lwt.t
-    val remove_failover : server -> rep_id -> result Lwt.t
-    val decommission    : server -> rep_id -> result Lwt.t
-    val demote          : server -> rep_id -> result Lwt.t
-    val promote         : server -> rep_id -> result Lwt.t
-    val replace         : server -> replacee:rep_id -> failover:rep_id -> result Lwt.t
+    val add_failover    : _ server -> rep_id -> IO.address -> result Lwt.t
+    val remove_failover : _ server -> rep_id -> result Lwt.t
+    val decommission    : _ server -> rep_id -> result Lwt.t
+    val demote          : _ server -> rep_id -> result Lwt.t
+    val promote         : _ server -> rep_id -> result Lwt.t
+    val replace         : _ server -> replacee:rep_id -> failover:rep_id -> result Lwt.t
   end
 end

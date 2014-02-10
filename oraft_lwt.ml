@@ -31,17 +31,7 @@ sig
   val send_snapshot : snapshot_transfer -> unit Lwt.t
 end
 
-module type LWTPROC =
-sig
-  type op
-  type resp
-
-  val execute : op -> (resp, exn) result Lwt.t
-end
-
-module Make_server
-  (PROC : LWTPROC)
-  (IO : LWTIO with type op = PROC.op) =
+module Make_server(IO : LWTIO) =
 struct
   module S    = Set.Make(String)
   module CMDM = Map.Make(struct
@@ -51,14 +41,15 @@ struct
 
   exception Stop_node
 
-  type server =
+  type 'a server =
       {
+        execute : 'a server -> IO.op -> [`OK of 'a | `Error of exn] Lwt.t;
         mutable peers            : IO.address RM.t;
         election_period          : float;
         heartbeat_period         : float;
         mutable next_req_id      : Int64.t;
         mutable conns            : IO.connection RM.t;
-        mutable state            : (req_id * PROC.op) Core.state;
+        mutable state            : (req_id * IO.op) Core.state;
         mutable running          : bool;
         mutable msg_threads      : th_res Lwt.t list;
         mutable election_timeout : th_res Lwt.t;
@@ -66,12 +57,12 @@ struct
         mutable abort            : th_res Lwt.t * th_res Lwt.u;
         mutable get_cmd          : th_res Lwt.t;
         mutable get_ro_op        : th_res Lwt.t;
-        push_cmd                 : (req_id * PROC.op) -> unit;
-        cmd_stream               : (req_id * PROC.op) Lwt_stream.t;
+        push_cmd                 : (req_id * IO.op) -> unit;
+        cmd_stream               : (req_id * IO.op) Lwt_stream.t;
         push_ro_op               : ro_op_res Lwt.u -> unit;
         ro_op_stream             : ro_op_res Lwt.u Lwt_stream.t;
         pending_ro_ops           : (Int64.t * ro_op_res Lwt.u) Queue.t;
-        mutable pending_cmds     : (cmd_res Lwt.t * cmd_res Lwt.u) CMDM.t;
+        mutable pending_cmds     : ('a cmd_res Lwt.t * 'a cmd_res Lwt.u) CMDM.t;
         leader_signal            : unit Lwt_condition.t;
         snapshot_sent_stream     : (rep_id * index) Lwt_stream.t;
         mutable snapshots_sent   : th_res Lwt.t;
@@ -91,17 +82,17 @@ struct
   and change_result = OK | Retry
 
   and th_res =
-      Message of rep_id * (req_id * PROC.op) message
-    | Client_command of req_id * PROC.op
+      Message of rep_id * (req_id * IO.op) message
+    | Client_command of req_id * IO.op
     | Abort
     | Election_timeout
     | Heartbeat_timeout
     | Snapshots_sent of (rep_id * index) list
     | Readonly_op of ro_op_res Lwt.u
 
-  and cmd_res =
+  and 'a cmd_res =
       Redirect of rep_id option
-    | Executed of (PROC.resp, exn) result
+    | Executed of [`OK of 'a | `Error of exn]
 
   and ro_op_res = OK | Retry
 
@@ -111,7 +102,7 @@ struct
       | `Redirect_randomized of rep_id * IO.address
       | `Retry_later ]
 
-  type cmd_result   = [ gen_result | `OK of PROC.resp ]
+  type 'a cmd_result   = [ gen_result | `OK of 'a ]
   type ro_op_result = [ gen_result | `OK ]
 
   let get_sent_snapshots stream =
@@ -123,6 +114,7 @@ struct
             return (Snapshots_sent ((peer, last_index) :: l))
 
   let make
+        execute
         ?(election_period = 2.)
         ?(heartbeat_period = election_period /. 2.) state peers =
     let cmd_stream, p     = Lwt_stream.create () in
@@ -145,6 +137,7 @@ struct
 
     in
       {
+        execute;
         heartbeat_period;
         election_period;
         state;
@@ -297,7 +290,7 @@ struct
           (fun (index, (req_id, op), term) ->
              (* TODO: allow to run this in parallel with rest RAFT algorithm.
               * Must make sure that Apply actions are not reordered. *)
-             lwt resp = try_lwt PROC.execute op
+             lwt resp = try_lwt t.execute t op
                         with exn -> return (`Error exn)
              in begin
                try_lwt
@@ -458,7 +451,7 @@ struct
             t.pending_cmds <- CMDM.add req_id task t.pending_cmds;
             t.push_cmd (req_id, cmd);
             match_lwt fst task with
-                Executed res -> return (res :> cmd_result)
+                Executed res -> return (res :> _ cmd_result)
               | Redirect _ -> execute t cmd)
 
   let rec readonly_operation t =

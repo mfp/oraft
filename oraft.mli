@@ -21,8 +21,6 @@ sig
   and simple_config = rep_id list
   and passive_peers = rep_id list
 
-  type ('a, 'b) result = [`OK of 'a | `Error of 'b]
-
   type 'a message =
       Request_vote of request_vote
     | Vote_result of vote_result
