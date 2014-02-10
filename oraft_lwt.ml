@@ -338,7 +338,10 @@ struct
           match Queue.Exceptionless.peek t.pending_ro_ops with
               None -> return_unit
             | Some (m, _) when m > n -> return_unit
-            | Some (_, u) -> Lwt.wakeup_later u OK; notify_ok ()
+            | Some (_, u) ->
+                ignore (Queue.Exceptionless.take t.pending_ro_ops);
+                Lwt.wakeup_later u OK;
+                notify_ok ()
         in
           notify_ok ()
 
