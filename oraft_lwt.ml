@@ -135,6 +135,9 @@ struct
         mutable failed_snapshot_th : th_res Lwt.t;
         snapshot_failed          : rep_id -> unit;
         mutable config_change    : config_change;
+
+        apply_stream             : (req_id * IO.op) Lwt_stream.t;
+        push_apply               : (req_id * IO.op) -> unit;
       }
 
   and config_change =
@@ -212,6 +215,9 @@ struct
     let snapshot_failed x   = p (Some x) in
     let failed_snapshot_th  = fst (Lwt.wait ()) in
 
+    let apply_stream, p = Lwt_stream.create () in
+    let push_apply x    = p (Some x) in
+
     let t =
       {
         execute;
@@ -231,6 +237,8 @@ struct
         push_cmd;
         ro_op_stream;
         push_ro_op;
+        apply_stream;
+        push_apply;
         peers         = List.fold_left
                           (fun m (k, v) -> RM.add k v m) RM.empty
                           (List.filter (fun (id, _) -> id <> Core.id state) peers);
@@ -254,6 +262,30 @@ struct
     in
       t.sent_snapshots_th   <- get_sent_snapshots  t;
       t.failed_snapshot_th  <- get_failed_snapshot t;
+
+      ignore begin
+        try_lwt
+          let rec apply_loop () =
+            match_lwt Lwt_stream.get t.apply_stream with
+                None -> return ()
+              | Some (req_id, op) ->
+                  lwt resp = try_lwt t.execute t op
+                             with exn -> return (`Error exn)
+                  in
+                    begin
+                      try_lwt
+                        let (_, u), pending = CMDM.extract req_id t.pending_cmds in
+                          t.pending_cmds <- pending;
+                          Lwt.wakeup_later u (Executed resp);
+                          return ()
+                      with _ -> return ()
+                    end >>
+                    apply_loop ()
+          in
+            apply_loop ()
+        with exn ->
+          Lwt_log.error_f ~exn ~section "Error in Oraft_lwt apply loop."
+      end;
       t
 
   let abort t =
@@ -371,20 +403,8 @@ struct
         check_config_change_completion t;
         return_unit
     | Apply l ->
-        Lwt_list.iter_s
-          (fun (index, (req_id, op), term) ->
-             (* TODO: allow to run this in parallel with rest RAFT algorithm.
-              * Must make sure that Apply actions are not reordered. *)
-             lwt resp = try_lwt t.execute t op
-                        with exn -> return (`Error exn)
-             in begin
-               try_lwt
-                 let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
-                   Lwt.wakeup_later u (Executed resp);
-                   return ()
-               with _ -> return ()
-             end)
-          l
+        List.iter (fun (index, (req_id, op), term) -> t.push_apply (req_id, op)) l;
+        return_unit
     | Redirect (rep_id, (req_id, _)) -> begin
         try_lwt
           let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
