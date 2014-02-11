@@ -9,17 +9,25 @@ module List   = BatList
 module Option = BatOption
 module Queue  = BatQueue
 
+let section = Lwt_log.Section.make "oraft_lwt"
+
 module REPID = struct type t = rep_id let compare = String.compare end
 module RM = Map.Make(REPID)
 
-module type LWTIO =
+module type LWTIO_TYPES =
 sig
   type address
   type op
   type connection
+  type conn_manager
+end
 
-  val connect : address -> connection option Lwt.t
-  val send    : connection -> (req_id * op) message -> bool Lwt.t
+module type LWTIO =
+sig
+  include LWTIO_TYPES
+
+  val connect : conn_manager -> rep_id -> address -> connection option Lwt.t
+  val send    : connection -> (req_id * op) message -> unit Lwt.t
   val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
 
@@ -29,6 +37,56 @@ sig
     connection -> index -> config -> snapshot_transfer option Lwt.t
 
   val send_snapshot : snapshot_transfer -> bool Lwt.t
+end
+
+module type SERVER_GENERIC =
+sig
+  open Oraft.Types
+
+  include LWTIO_TYPES
+
+  type 'a server
+
+  type gen_result =
+      [ `Error of exn
+      | `Redirect of rep_id * address
+      | `Redirect_randomized of rep_id * address
+      | `Retry_later ]
+
+  type 'a cmd_result   = [ gen_result | `OK of 'a ]
+  type ro_op_result = [ gen_result | `OK ]
+
+  val make :
+    ('a server -> op -> [`OK of 'a | `Error of exn] Lwt.t) ->
+    ?election_period:float -> ?heartbeat_period:float ->
+    (req_id * op) Oraft.Core.state -> (rep_id * address) list ->
+    conn_manager -> 'a server
+
+  val run     : _ server -> unit Lwt.t
+  val abort   : _ server -> unit Lwt.t
+  val execute : 'a server -> op -> 'a cmd_result Lwt.t
+  val readonly_operation : _ server -> ro_op_result Lwt.t
+
+  val compact_log : _ server -> index -> unit
+
+  module Config :
+  sig
+    type result =
+      [
+      | `OK
+      | `Redirect of rep_id option
+      | `Retry
+      | `Cannot_change
+      | `Unsafe_change of simple_config * passive_peers
+      ]
+
+    val add_failover    : _ server -> rep_id -> address -> result Lwt.t
+    val remove_failover : _ server -> rep_id -> result Lwt.t
+    val decommission    : _ server -> rep_id -> result Lwt.t
+    val demote          : _ server -> rep_id -> result Lwt.t
+    val promote         : _ server -> rep_id -> result Lwt.t
+    val replace         : _ server -> replacee:rep_id -> failover:rep_id -> result Lwt.t
+  end
 end
 
 module Make_server(IO : LWTIO) =
@@ -41,9 +99,15 @@ struct
 
   exception Stop_node
 
+  type address      = IO.address
+  type op           = IO.op
+  type connection   = IO.connection
+  type conn_manager = IO.conn_manager
+
   type 'a server =
       {
-        execute : 'a server -> IO.op -> [`OK of 'a | `Error of exn] Lwt.t;
+        execute      : 'a server -> IO.op -> [`OK of 'a | `Error of exn] Lwt.t;
+        conn_manager : IO.conn_manager;
         mutable peers            : IO.address RM.t;
         election_period          : float;
         heartbeat_period         : float;
@@ -125,7 +189,7 @@ struct
   let make
         execute
         ?(election_period = 2.)
-        ?(heartbeat_period = election_period /. 2.) state peers =
+        ?(heartbeat_period = election_period /. 2.) state peers conn_manager =
     let cmd_stream, p     = Lwt_stream.create () in
     let push_cmd x        = p (Some x) in
     let ro_op_stream, p   = Lwt_stream.create () in
@@ -151,6 +215,7 @@ struct
     let t =
       {
         execute;
+        conn_manager;
         heartbeat_period;
         election_period;
         state;
@@ -207,7 +272,7 @@ struct
     let rec make_thread = function
         0 -> Lwt_unix.sleep 5. >> make_thread 5
       | n ->
-          match_lwt IO.connect addr with
+          match_lwt IO.connect t.conn_manager peer addr with
             | None -> Lwt_unix.sleep 0.1 >> make_thread (n - 1)
             | Some conn ->
                 t.conns <- RM.add peer conn t.conns;
@@ -333,8 +398,7 @@ struct
         (* TODO: limit the number of msgs in outboung queue.
          * Drop after the nth? *)
         ignore begin try_lwt
-          lwt _ = IO.send (RM.find rep_id t.conns) msg in
-            return ()
+          IO.send (RM.find rep_id t.conns) msg
         with _ ->
           (* cannot send -- partition *)
           return ()
@@ -567,3 +631,170 @@ struct
         (fun u -> Replace (u, replacee, failover))
   end
 end
+
+module type OP =
+sig
+  type op
+  val string_of_op : op -> string
+  val op_of_string : string -> op
+end
+
+module Simple_IO(OP : OP) =
+struct
+  module EC = Extprot.Conv
+
+  type address = Unix.sockaddr
+  type op = OP.op
+
+  type connection = Lwt_io.input_channel * Lwt_io.output_channel
+
+  module M = Map.Make(String)
+
+  type conn_manager =
+      {
+        id            : string;
+        sock          : Lwt_unix.file_descr;
+        mutable conns : connection M.t;
+        conn_signal   : unit Lwt_condition.t;
+      }
+
+  let make id addr =
+    let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr addr) Unix.SOCK_STREAM 0) in
+      Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
+      Lwt_unix.bind sock addr;
+      Lwt_unix.listen sock 256;
+
+      let rec accept_loop t =
+        lwt (fd, addr) = Lwt_unix.accept sock in
+          ignore begin try_lwt
+            (* the following are not supported for ADDR_UNIX sockets, so catch
+             * possible exceptions *)
+            (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+            (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
+            let ich = Lwt_io.of_fd Lwt_io.input fd in
+            let och = Lwt_io.of_fd Lwt_io.output fd in
+            lwt id  = Lwt_io.read_line ich in
+              t.conns <- M.add id (ich, och) t.conns;
+              Lwt_condition.broadcast t.conn_signal ();
+              return ()
+          with _ ->
+            Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
+            Lwt_unix.close fd
+          end;
+          accept_loop t in
+
+      let conn_signal = Lwt_condition.create () in
+      let t           = { id; sock; conn_signal; conns = M.empty; } in
+        ignore begin
+          try_lwt
+            accept_loop t
+          with
+            | Exit -> return ()
+            | exn -> Lwt_log.error_f ~exn ~section
+                       "Error in connection manager accept loop"
+        end;
+        t
+
+  let connect t dst_id addr =
+    match M.Exceptionless.find dst_id t.conns with
+        Some _ as x -> return x
+      | None when dst_id < t.id -> (* wait for other end to connect *)
+          let rec await_conn () =
+            match M.Exceptionless.find dst_id t.conns with
+                Some _ as x -> return x
+              | None -> Lwt_condition.wait t.conn_signal >>
+                       await_conn ()
+          in
+            await_conn ()
+      | None -> (* we must connect ourselves *)
+          try_lwt
+            lwt ich, och = Lwt_io.open_connection addr in
+            Lwt_io.write och (t.id ^ "\n") >>
+            Lwt_io.flush och >>
+              return (Some (ich, och))
+          with _ -> return_none
+
+  open Oraft_proto
+  open Raft_message
+  open Oraft
+
+  let wrap_msg : _ Oraft.Types.message -> Raft_message.raft_message = function
+      Request_vote { term; candidate_id; last_log_index; last_log_term; } ->
+        Request_vote { Request_vote.term; candidate_id;
+                       last_log_index; last_log_term; }
+    | Vote_result { term; vote_granted; } ->
+        Vote_result { Vote_result.term; vote_granted; }
+    | Ping { term; n } -> Ping { Ping_msg.term; n; }
+    | Pong { term; n } -> Pong { Ping_msg.term; n; }
+    | Append_result { term; result; } ->
+        Append_result { Append_result.term; result }
+    | Append_entries { term; leader_id; prev_log_index; prev_log_term;
+                       entries; leader_commit; } ->
+        let map_entry = function
+            (index, (Nop, term)) -> (index, Entry.Nop, term)
+          | (index, (Config c, term)) -> (index, Entry.Config c, term)
+          | (index, (Op (req_id, x), term)) ->
+              (index, Entry.Op (req_id, OP.string_of_op x), term) in
+
+        let entries = List.map map_entry entries in
+          Append_entries { Append_entries.term; leader_id; prev_log_index;
+                           prev_log_term; entries; leader_commit; }
+
+  let unwrap_msg : Raft_message.raft_message -> _ Oraft.Types.message = function
+    | Request_vote { Request_vote.term; candidate_id; last_log_index;
+                     last_log_term } ->
+        Request_vote { term; candidate_id; last_log_index; last_log_term }
+    | Vote_result { Vote_result.term; vote_granted; } ->
+        Vote_result { term; vote_granted; }
+    | Ping { Ping_msg.term; n } -> Ping { term; n; }
+    | Pong { Ping_msg.term; n } -> Pong { term; n; }
+    | Append_result { Append_result.term; result; } ->
+        Append_result { term; result }
+    | Append_entries { Append_entries.term; leader_id;
+                       prev_log_index; prev_log_term;
+                       entries; leader_commit; } ->
+        let map_entry = function
+          | (index, Entry.Nop, term) -> (index, (Nop, term))
+          | (index, Entry.Config c, term) -> (index, (Config c, term))
+          | (index, Entry.Op (req_id, x), term) ->
+              let op = OP.op_of_string x in
+                (index, (Op (req_id, op), term))
+        in
+          Append_entries
+            { term; leader_id; prev_log_index; prev_log_term;
+              entries = List.map map_entry entries;
+              leader_commit;
+            }
+
+  let send (_, och) msg =
+    let payload = EC.serialize Raft_message.write (wrap_msg msg) in
+      Lwt_io.atomic
+        (fun och ->
+           Lwt_io.LE.write_int och (String.length payload) >>
+           Lwt_io.write och payload)
+        och
+
+  let receive (ich, _) =
+    try_lwt
+      Lwt_io.atomic
+        (fun ich ->
+           lwt len = Lwt_io.LE.read_int ich in
+           let s   = String.create len in
+           lwt ()  = Lwt_io.read_into_exactly ich s 0 len in
+             return (Some (EC.deserialize Raft_message.read s |> unwrap_msg)))
+        ich
+    with _ ->
+      Lwt_io.abort ich >>
+      return None
+
+  let abort (ich, och) =
+    Lwt_io.abort ich
+
+  type snapshot_transfer = unit
+
+  let prepare_snapshot conn index config = return None
+  let send_snapshot () = return false
+end
+
+module Simple_server(OP : OP) =
+  Make_server(Simple_IO(OP))

@@ -1,16 +1,26 @@
-type rep_id = string
+type rep_id    = string
+type client_id = string
+
 type simple_config = [rep_id]
 type passive_peers = simple_config
-type term  = long
-type index = long
+
+type term   = long
+type index  = long
+
+type req_id = (client_id * long)
 
 type config =
-    Simple_config simple_config
-  | Joint_config (simple_config * simple_config * passive_peers)
+    Simple_config simple_config passive_peers
+  | Joint_config simple_config simple_config passive_peers
+      options "ocaml.type_equals" = "Oraft.Types.config"
 
-type actual_append_result = Append_success index | Append_failure index
+type actual_append_result =
+    Append_success index | Append_failure index
+    options "ocaml.type_equals" = "Oraft.Types.actual_append_result"
 
 type ping_msg = { term : term; n : long }
+
+type entry = Nop | Op (req_id * string) | Config config
 
 message raft_message =
     Request_vote { term : term; candidate_id : rep_id;
@@ -18,7 +28,7 @@ message raft_message =
   | Vote_result { term : term; vote_granted : bool }
   | Append_entries { term : term; leader_id : rep_id;
                      prev_log_index : index; prev_log_term : term;
-                     entries : [ (index * string * term) ];
+                     entries : [ (index * entry * term) ];
                      leader_commit : index }
   | Append_result { term : term; result : actual_append_result }
   | Ping ping_msg
