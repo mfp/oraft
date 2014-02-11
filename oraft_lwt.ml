@@ -408,6 +408,7 @@ struct
     | Redirect (rep_id, (req_id, _)) -> begin
         try_lwt
           let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
+            t.pending_cmds <- pending_cmds;
             Lwt.wakeup_later u (Redirect rep_id);
             return ()
         with _ -> return ()
