@@ -160,6 +160,7 @@ struct
   type ('op, 'app_state) node =
       {
         id                     : rep_id;
+        addr                   : address;
         mutable state          : 'op C.state;
         mutable next_heartbeat : CLOCK.t option;
         mutable next_election  : CLOCK.t option;
@@ -178,12 +179,12 @@ struct
         make_node        : unit -> ('op, 'app_state) node;
       }
 
-  let mk_node mk_app_state config id =
+  let mk_node mk_app_state config (id, addr) =
     let state     = C.make
                       ~id ~current_term:0L ~voted_for:None
                       ~log:[] ~config () in
     let app_state = mk_app_state () in
-      { id; state; app_state;
+      { id; addr; state; app_state;
         stopped = false; next_heartbeat = None; next_election = None;
       }
 
@@ -211,7 +212,8 @@ struct
         ~num_nodes
         ~election_period ~heartbeat_period ~rtt
         mk_app_state =
-    let active   = List.init num_nodes (sprintf "n%03d") in
+    let active   = List.init num_nodes
+                     (fun n -> let s = sprintf "n%03d" n in (s, s)) in
     let passive  = [] in
     let config   = Simple_config (active, passive) in
 
@@ -230,8 +232,9 @@ struct
 
     let rec make_node () =
       let id     = next_node_id () in
+      let addr   = "proto://" ^ id in
       let config = get_leader_conf t in
-        mk_node mk_app_state config id
+        mk_node mk_app_state config (id, addr)
 
     and t =
       { rng; ev_queue; election_period; heartbeat_period; rtt;
@@ -247,14 +250,18 @@ struct
       NODES.iter (fun _ n -> if not n.stopped then l := n :: !l) t.nodes;
       !l
 
+  let s_of_simple_config l =
+    List.map (fun (id, addr) -> sprintf "%S:%S" id addr) l |> String.concat "; "
+
   let string_of_config c =
-    let s_of_list l = List.map (sprintf "%S") l |> String.concat "; " in
       match c with
           Simple_config (c, passive) ->
-            sprintf "Simple ([%s], [%s])" (s_of_list c) (s_of_list passive)
+            sprintf "Simple ([%s], [%s])"
+              (s_of_simple_config c) (s_of_simple_config passive)
         | Joint_config (c1, c2, passive) ->
             sprintf "Joint ([%s], [%s], [%s])"
-              (s_of_list c1) (s_of_list c2) (s_of_list passive)
+              (s_of_simple_config c1) (s_of_simple_config c2)
+              (s_of_simple_config passive)
 
   let string_of_msg string_of_cmd = function
       Request_vote { term; candidate_id; last_log_term; last_log_index; _ } ->
@@ -363,8 +370,9 @@ struct
             begin
               let newnode = des.make_node () in
               let leader  = get_leader des in
+              let addr    = "proto://" ^ newnode.id in
 
-                match C.Config.add_failover newnode.id leader.state with
+                match C.Config.add_failover newnode.id addr leader.state with
                     `Already_changed | `Change_in_process
                   | `Redirect _ | `Unsafe_change _ | `Cannot_change -> ()
                   | `Start_change state ->
@@ -380,8 +388,8 @@ struct
         | Joint_config _ | Simple_config ([], _) -> ()
 
         | Simple_config ((_ :: _ as active), (_ :: _ as passive)) ->
-            let replacee = List.sort String.compare active |> List.hd in
-            let failover = List.sort String.compare passive |> List.hd in
+            let replacee = List.sort compare active |> List.hd |> fst in
+            let failover = List.sort compare passive |> List.hd |> fst in
 
             let leader   = get_leader des in
 
@@ -462,7 +470,8 @@ struct
        * commits by other nodes). Avoids getting stuck when commits are
        * blocked because there's no safe quorum (only nodes that will not be
        * decommissioned) during a configuration change. *)
-      FAILURE_SIMULATOR.tick fail_sim (node.id :: C.peers node.state) 1;
+      FAILURE_SIMULATOR.tick fail_sim
+        (node.id :: (C.peers node.state |> List.map fst)) 1;
       CONFIG_MANAGER.tick configmgr 1;
       let considered = must_account time node ev in
       let () =
@@ -557,7 +566,8 @@ struct
                    * by the time the leader sends the Append_entries message
                    * that would let it commit the configuration change. *)
                   let module S = Set.Make(String) in
-                  let all = List.(fold_right S.add (concat [c1; p1; c2; p2]) S.empty) in
+                  let all = List.concat [c1; p1; c2; p2] |> List.map fst |>
+                            List.fold_left (fun s x -> S.add x s) S.empty in
 
                   let to_be_removed = ref [] in
 
@@ -587,7 +597,7 @@ struct
             if verbose then printf " Reset_heartbeat\n";
             unschedule_heartbeat t node;
             schedule_heartbeat t node
-        | Send (rep_id, msg) ->
+        | Send (rep_id, addr, msg) ->
             let dropped = FAILURE_SIMULATOR.is_msg_lost fail_sim
                             ~src:node.id ~dst:rep_id
             in
@@ -602,7 +612,7 @@ struct
                   ignore (Event_queue.schedule t.ev_queue dt rep_id
                             (Message (node.id, msg)))
               end
-        | Send_snapshot (dst, idx, config) ->
+        | Send_snapshot (dst, addr, idx, config) ->
             if verbose then
               printf " Send_snapshot (%S, %Ld)\n" dst idx;
             let dropped = FAILURE_SIMULATOR.is_msg_lost fail_sim

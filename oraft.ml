@@ -16,12 +16,13 @@ struct
   type rep_id    = string
   type client_id = string
   type req_id    = client_id * Int64.t
+  type address   = string
 
   type config =
       Simple_config of simple_config * passive_peers
     | Joint_config of simple_config * simple_config * passive_peers
-  and simple_config = rep_id list
-  and passive_peers = rep_id list
+  and simple_config = (rep_id * address) list
+  and passive_peers = (rep_id * address) list
 
   module REPID = struct type t = rep_id let compare = String.compare end
   module IM = Map.Make(Int64)
@@ -37,7 +38,9 @@ struct
     val target       : t -> (simple_config * passive_peers) option
 
     (** Returns all peers (including passive). *)
-    val peers        : t -> rep_id list
+    val peers        : t -> (rep_id * address) list
+
+    val address      : rep_id -> t -> address option
 
     (** Returns whether the node is included in the last committed
       * configuration. *)
@@ -62,23 +65,27 @@ struct
     val commit       : index -> t -> t * (simple_config * passive_peers) option
   end =
   struct
-    module S = Set.Make(String)
+    module M = Map.Make(String)
+
     type t   =
         { id        : rep_id;
-          committed : (index * config * S.t * S.t);
-          latest    : (index * config * S.t * S.t);
-          q         : (index * config * S.t * S.t) list;
+          committed : (index * config * addr_map * addr_map);
+          latest    : (index * config * addr_map * addr_map);
+          q         : (index * config * addr_map * addr_map) list;
         }
 
-    let s_of_list = List.fold_left (fun s x -> S.add x s) S.empty
+    and addr_map = address M.t
+
+    let addr_map_of_config =
+      List.fold_left (fun s (id, addr) -> M.add id addr s) M.empty
 
     let active_of_config = function
-        Simple_config (c, _) -> s_of_list c
-      | Joint_config (c1, c2, _) -> s_of_list (c1 @ c2)
+        Simple_config (c, _) -> addr_map_of_config c
+      | Joint_config (c1, c2, _) -> addr_map_of_config (c1 @ c2)
 
     let all_nodes_of_config = function
-        Simple_config (c, p) -> s_of_list (c @ p)
-      | Joint_config (c1, c2, p) -> s_of_list (p @ c1 @ c2)
+        Simple_config (c, p) -> addr_map_of_config (c @ p)
+      | Joint_config (c1, c2, p) -> addr_map_of_config (p @ c1 @ c2)
 
     let make ~node_id:id ~index config =
       let active = active_of_config config in
@@ -97,7 +104,7 @@ struct
 
     let has_quorum votes t =
       let aux_quorum c =
-        List.fold_left (fun s x -> if List.mem x c then s + 1 else s) 0 votes >=
+        List.fold_left (fun s x -> if List.mem_assoc x c then s + 1 else s) 0 votes >=
         quorum c
       in
         match t.latest with
@@ -105,7 +112,9 @@ struct
           | _, Joint_config (c1, c2, _), _, _ -> aux_quorum c1 && aux_quorum c2
 
     let quorum_min_simple get ?only c =
-      let vs = List.(map get (Option.default c only) |> sort Int64.compare |> rev) in
+      let vs = List.map (fun (id, _) -> get id) (Option.default c only) |>
+               List.sort Int64.compare |> List.rev
+      in
         try List.nth vs (quorum c - 1) with _ -> 0L
 
     let set_diff l1 l2 =
@@ -115,7 +124,8 @@ struct
         _, Simple_config (c, _), _, _ -> quorum_min_simple get c
       | _, Joint_config (c1, c2, _), _, _ ->
           (* we require a quorum (len (c1) / 2 + 1) amongst the nodes that are
-           * not removed when going from c1 to c2, i.e. set(c1) - (set(c1) - set(c2)) *)
+           * not removed when going from c1 to c2, i.e.
+           * set(c1) - (set(c1) - set(c2)) *)
           let only = set_diff c1 (set_diff c1 c2) in
             min (quorum_min_simple get ~only c1) (quorum_min_simple get c2)
 
@@ -174,15 +184,18 @@ struct
     let current { latest = (_, c, _, _); _ } = c
 
     let peers { id; latest = (_, _, _, all); _ } =
-      S.remove id all |> S.elements
+      M.remove id all |> M.bindings
+
+    let address id { latest = (_, _, _, all); } =
+      M.Exceptionless.find id all
 
     let mem_committed id { committed = (_, _, active, all); _ } =
-      if S.mem id active then `Active
-      else if S.mem id all then `Passive
+      if M.mem id active then `Active
+      else if M.mem id all then `Passive
       else `Not_included
 
     let mem_active id { latest = (_, _, active, _); _ } =
-      S.mem id active
+      M.mem id active
   end
 
   module LOG : sig
@@ -395,8 +408,8 @@ struct
     | Redirect of rep_id option * 'a
     | Reset_election_timeout
     | Reset_heartbeat
-    | Send of rep_id * 'a message
-    | Send_snapshot of rep_id * index * config
+    | Send of rep_id * address * 'a message
+    | Send_snapshot of rep_id * address * index * config
     | Stop
 end
 
@@ -534,7 +547,8 @@ let send_entries_or_snapshot s peer from =
         None -> Snapshot
       | Some x -> Send_entries x
 
-let broadcast s msg = CONFIG.peers s.config |> List.map (fun p -> Send (p, msg))
+let broadcast s msg =
+  CONFIG.peers s.config |> List.map (fun (id, addr) -> Send (id, addr, msg))
 
 let receive_msg s peer = function
   (* Reject vote requests/results and Append_entries (which should not be
@@ -547,7 +561,11 @@ let receive_msg s peer = function
   (* " If a server receives a request with a stale term number, it rejects the
    * request." *)
   | Request_vote { term; _ } | Ping { term; _ } when term < s.current_term ->
-      (s, [Send (peer, vote_result s false)])
+      begin match CONFIG.address peer s.config with
+          None -> (s, [])
+        | Some addr ->
+            (s, [Send (peer, addr, vote_result s false)])
+      end
 
   | Pong { term; _ } when term <> s.current_term -> (s, [])
 
@@ -562,9 +580,9 @@ let receive_msg s peer = function
       (step_down term s, [Become_follower None])
 
   | Ping { term; n; } (* term = current_term *) -> begin
-      match s.leader_id with
-          Some leader when leader = peer ->
-            (s, [Send (peer, Pong { term; n; })])
+      match s.leader_id, CONFIG.address peer s.config with
+          Some leader, Some addr when leader = peer ->
+            (s, [Send (peer, addr, Pong { term; n; })])
         | _ ->
             (* We ignore Ping messages not coming from the leader.
              * They should not happen, since followers/candidates do not send
@@ -602,20 +620,26 @@ let receive_msg s peer = function
          * end with the same term, then whichever log is longer is
          * more up-to-date."
          * *)
-        if (last_log_term, last_log_index) < LOG.last_index s.log then
-          (s, [Become_follower None; Send (peer, vote_result s false)])
-        else
-          let s = { s with voted_for = Some candidate_id } in
-            (s, [Become_follower None; Send (peer, vote_result s true)])
+        begin match CONFIG.address peer s.config with
+            None -> (s, [ Become_follower None ])
+          | Some addr ->
+              if (last_log_term, last_log_index) < LOG.last_index s.log then
+                (s, [Become_follower None; Send (peer, addr, vote_result s false)])
+              else
+                let s = { s with voted_for = Some candidate_id } in
+                  (s, [Become_follower None; Send (peer, addr, vote_result s true)])
+        end
 
   | Request_vote { term; candidate_id; last_log_index; last_log_term; } -> begin
       (* case term = current_term *)
-      match s.state, s.voted_for with
-          _, Some candidate when candidate <> candidate_id ->
-            (s, [Send (peer, vote_result s false)])
-        | (Candidate | Leader), _ ->
-            (s, [Send (peer, vote_result s false)])
-        | Follower, _ (* None or Some candidate equal to candidate_id *) ->
+      match s.state, s.voted_for, CONFIG.address peer s.config with
+          _, Some candidate, Some addr when candidate <> candidate_id ->
+            (s, [Send (peer, addr, vote_result s false)])
+        | (Candidate | Leader), _, Some addr ->
+            (s, [Send (peer, addr, vote_result s false)])
+        | Follower, _, Some addr
+            (* voted for None or Some candidate equal to candidate_id *) ->
+
             (* "If votedFor is null or candidateId, and candidate's log is at
              * least as up-to-date as receiver’s log, grant vote"
              *
@@ -627,16 +651,20 @@ let receive_msg s peer = function
              * more up-to-date."
              * *)
             if (last_log_term, last_log_index) < LOG.last_index s.log then
-              (s, [Send (peer, vote_result s false)])
+              (s, [Send (peer, addr, vote_result s false)])
             else
               let s = { s with voted_for = Some candidate_id } in
-                (s, [Send (peer, vote_result s true)])
+                (s, [Send (peer, addr, vote_result s true)])
+        | _, _, None -> (s, [])
     end
 
   (* " If a server receives a request with a stale term number, it rejects the
    * request." *)
   | Append_entries { term; prev_log_index; _ } when term < s.current_term ->
-      (s, [Send (peer, append_fail ~prev_log_index s)])
+      begin match CONFIG.address peer s.config with
+          None -> (s, [])
+        | Some addr -> (s, [Send (peer, addr, append_fail ~prev_log_index s)])
+      end
   | Append_entries
       { term; prev_log_index; prev_log_term; entries; leader_commit; } -> begin
         (* "Current terms are exchanged whenever servers communicate; if one
@@ -679,16 +707,18 @@ let receive_msg s peer = function
                 (prev_idx, prev_term, entries)
             with _ -> (prev_log_index, prev_log_term, entries)
         in
-          match LOG.get_term prev_log_index s.log  with
-              None ->
+          match
+            LOG.get_term prev_log_index s.log, CONFIG.address peer s.config
+          with
+              None, Some addr ->
                 (* we don't have the entry at prev_log_index; we use the last
                  * entry we do have as the prev_log_index in the failure msg,
                  * thus allowing to rewind next_index in the leader quickly *)
                 let prev_log_index = LOG.last_index s.log |> snd in
-                  (s, Send (peer, append_fail ~prev_log_index s) :: actions)
-            | Some term' when prev_log_term <> term' ->
-                (s, Send (peer, append_fail ~prev_log_index s) :: actions)
-            | _ ->
+                  (s, Send (peer, addr, append_fail ~prev_log_index s) :: actions)
+            | Some term', Some addr when prev_log_term <> term' ->
+                (s, Send (peer, addr, append_fail ~prev_log_index s) :: actions)
+            | _, Some addr ->
                 let log, c_idx   = LOG.append_many entries s.log in
                 let config       = match c_idx with
                                      | None -> s.config
@@ -711,11 +741,12 @@ let receive_msg s peer = function
                                             leader_id = Some peer; } in
                 let s, commits   = try_commit s in
                 let actions      = List.concat
-                                     [ [Send (peer, reply)];
+                                     [ [Send (peer, addr, reply)];
                                        commits;
                                        actions ]
                 in
                   (s, actions)
+            | _, None -> (s, [])
       end
 
   | Vote_result { term; _ } when term < s.current_term ->
@@ -756,10 +787,10 @@ let receive_msg s peer = function
              * *)
             let next_idx    = LOG.last_index log |> snd (* |> Int64.succ *) in
             let next_index  = List.fold_left
-                                (fun m peer -> RM.add peer next_idx m)
+                                (fun m (peer, _) -> RM.add peer next_idx m)
                                 RM.empty (CONFIG.peers s.config) in
             let match_index = List.fold_left
-                                (fun m peer -> RM.add peer 0L m)
+                                (fun m (peer, _) -> RM.add peer 0L m)
                                 RM.empty (CONFIG.peers s.config) in
             let s     = { s with log; next_index; match_index;
                                  state       = Leader;
@@ -780,7 +811,8 @@ let receive_msg s peer = function
             let msg   = send_entries s next_idx in
             let sends = CONFIG.peers s.config |>
                         List.filter_map
-                          (fun peer -> Option.map (fun m -> Send (peer, m)) msg)
+                          (fun (peer, addr) ->
+                             Option.map (fun m -> Send (peer, addr, m)) msg)
             in
               (s, (Become_leader :: sends))
 
@@ -807,16 +839,17 @@ let receive_msg s peer = function
                          s.next_index in
       let s          = { s with next_index } in
       let idx        = RM.find peer next_index in
-        match send_entries_or_snapshot s peer idx with
-          | Snapshot ->
+        match send_entries_or_snapshot s peer idx, CONFIG.address peer s.config with
+          | Snapshot, Some addr ->
               (* Must send snapshot *)
               let config    = CONFIG.last_commit s.config in
               let transfers = RS.add peer s.snapshot_transfers in
               let s         = { s with snapshot_transfers = transfers } in
-                (s, [Reset_election_timeout; Send_snapshot (peer, idx, config)])
-          | Snapshot_in_progress -> (s, [])
-          | Send_entries msg ->
-              (s, [Reset_election_timeout; Send (peer, msg)])
+                (s, [Reset_election_timeout; Send_snapshot (peer, addr, idx, config)])
+          | Snapshot_in_progress, _ -> (s, [])
+          | Send_entries msg, Some addr ->
+              (s, [Reset_election_timeout; Send (peer, addr, msg)])
+          | _ , None -> (s, [])
 
 let election_timeout s = match s.state with
     (* passive nodes do not trigger elections *)
@@ -860,21 +893,19 @@ let heartbeat_timeout s = match s.state with
       let s, sends =
         CONFIG.peers s.config |>
         List.fold_left
-          (fun (s, sends) peer ->
+          (fun (s, sends) (peer, addr) ->
              let idx = try RM.find peer s.next_index
                        with Not_found -> LOG.last_index s.log |> snd
              in
-               match
-                 send_entries_or_snapshot s peer idx
-               with
+               match send_entries_or_snapshot s peer idx with
                    Snapshot_in_progress -> (s, sends)
-                 | Send_entries msg -> (s, Send (peer, msg) :: sends)
+                 | Send_entries msg -> (s, Send (peer, addr, msg) :: sends)
                  | Snapshot ->
                      (* must send snapshot if cannot send log *)
                      let transfers = RS.add peer s.snapshot_transfers in
                      let s         = { s with snapshot_transfers = transfers } in
                      let config    = CONFIG.last_commit s.config in
-                       (s, Send_snapshot (peer, idx, config) :: sends))
+                       (s, Send_snapshot (peer, addr, idx, config) :: sends))
           (s, [])
       in
         (s, (Reset_heartbeat :: sends))
@@ -886,7 +917,7 @@ let client_command x s = match s.state with
       let s, actions =
         CONFIG.peers s.config |>
         List.fold_left
-          (fun (s, actions) peer ->
+          (fun (s, actions) (peer, addr) ->
              let idx =
                try RM.find peer s.next_index
                with Not_found -> LOG.last_index s.log |> snd
@@ -897,9 +928,9 @@ let client_command x s = match s.state with
                      let transfers = RS.add peer s.snapshot_transfers in
                      let s         = { s with snapshot_transfers = transfers } in
                      let config    = CONFIG.last_commit s.config in
-                       (s, Send_snapshot (peer, idx, config) :: actions)
+                       (s, Send_snapshot (peer, addr, idx, config) :: actions)
                  | Snapshot_in_progress -> (s, actions)
-                 | Send_entries msg -> (s, Send (peer, msg) :: actions))
+                 | Send_entries msg -> (s, Send (peer, addr, msg) :: actions))
           ({ s with log }, []) in
       let actions = match actions with
                       | [] -> []
@@ -939,9 +970,11 @@ let snapshot_sent peer ~last_index s = match s.state with
                          (fun idx -> max idx (Int64.succ last_index))
                          s.next_index in
       let s          = { s with snapshot_transfers = transfers; next_index } in
-        match send_entries s (RM.find peer s.next_index) with
-            None -> (s, [])
-          | Some msg -> (s, [Send (peer, msg)])
+        match
+          send_entries s (RM.find peer s.next_index), CONFIG.address peer s.config
+        with
+            None, _ | _, None -> (s, [])
+          | Some msg, Some addr -> (s, [Send (peer, addr, msg)])
 
 let snapshot_send_failed peer s =
   let s = { s with snapshot_transfers = RS.remove peer s.snapshot_transfers } in
@@ -1052,58 +1085,67 @@ struct
                             let s      = { s with config; log } in
                               `Start_change s
 
-    let add_failover id s =
+    let add_failover id addr s =
       config_change_aux s
         (fun c p ->
-           if List.mem id c || List.mem id p then `Already_changed
-           else `Perform_change (c, id :: p))
+           if List.mem_assoc id c || List.mem_assoc id p then `Already_changed
+           else `Perform_change (c, (id, addr) :: p))
 
     let remove_failover id s =
       config_change_aux s
         (fun c p ->
-           if not (List.mem id p) then `Already_changed
-           else `Perform_change (c, List.remove p id))
+           if not (List.mem_assoc id p) then `Already_changed
+           else `Perform_change (c, List.remove_assoc id p))
+
+    let safe_assoc = List.Exceptionless.assoc
 
     let decommission id s =
       config_change_aux s
         (fun c p ->
            let len    = List.length c in
            let quorum = len / 2 + 1 in
-             if List.mem id c && len - 1 < quorum then `Unsafe_change (c, p)
-             else if not (List.mem id c) && not (List.mem id p) then `Already_changed
-             else `Perform_change (List.remove c id, List.remove p id))
+             if List.mem_assoc id c && len - 1 < quorum then `Unsafe_change (c, p)
+             else if not (List.mem_assoc id c) && not (List.mem_assoc id p) then
+               `Already_changed
+             else `Perform_change (List.remove_assoc id c, List.remove_assoc id p))
 
     let demote id s =
       config_change_aux s
         (fun c p ->
            let len    = List.length c in
            let quorum = len / 2 + 1 in
-             if List.mem id c && len - 1 < quorum then `Unsafe_change (c, p)
-             else if not (List.mem id c) then `Cannot_change
-             else `Perform_change (List.remove c id, id :: p))
+             if List.mem_assoc id c && len - 1 < quorum then `Unsafe_change (c, p)
+             else match safe_assoc id c with
+                 None -> `Cannot_change
+               | Some addr ->
+                   `Perform_change (List.remove_assoc id c, (id, addr) :: p))
 
     let promote id s =
       config_change_aux s
         (fun c p ->
-             if List.mem id c then `Already_changed
-             else if not (List.mem id p) then `Cannot_change
-             else `Perform_change (List.remove c id, id :: p))
+             if List.mem_assoc id c then `Already_changed
+             else match safe_assoc id p with
+                 None -> `Cannot_change
+               | Some addr ->
+                   `Perform_change (List.remove_assoc id c, (id, addr) :: p))
 
     let replace ~replacee ~failover s =
       config_change_aux s
         (fun c p ->
            let len    = List.length c in
            let quorum = len / 2 + 1 in
-             match List.mem replacee c, List.mem failover p with
-                 true, true when len - 1 < quorum -> `Unsafe_change (c, p)
-               | true, true ->
+             match safe_assoc replacee c, safe_assoc failover p with
+                 Some _, Some _ when len - 1 < quorum -> `Unsafe_change (c, p)
+               | Some _, Some addr2 ->
                    `Perform_change
-                     (failover :: List.remove c replacee, List.remove p failover)
-               | false, true ->
-                   `Perform_change (failover :: c, List.remove p failover)
-               | true, false ->
+                     ((failover, addr2) :: List.remove_assoc replacee c,
+                      List.remove_assoc failover p)
+               | None, Some addr ->
+                   `Perform_change ((failover, addr) :: c,
+                                    List.remove_assoc failover p)
+               | Some _, None ->
                    if len - 1 < quorum then `Unsafe_change (c, p)
                    else `Cannot_change
-               | false, false -> `Cannot_change)
+               | None, None -> `Cannot_change)
   end
 end

@@ -1,7 +1,8 @@
 type rep_id    = string
 type client_id = string
+type address   = string
 
-type simple_config = [rep_id]
+type simple_config = [(rep_id * address)]
 type passive_peers = simple_config
 
 type term   = long

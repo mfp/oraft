@@ -14,12 +14,13 @@ sig
   type rep_id    = string
   type client_id = string
   type req_id    = client_id * Int64.t
+  type address   = string
 
   type config =
       Simple_config of simple_config * passive_peers
     | Joint_config of simple_config * simple_config * passive_peers
-  and simple_config = rep_id list
-  and passive_peers = rep_id list
+  and simple_config = (rep_id * address) list
+  and passive_peers = (rep_id * address) list
 
   type 'a message =
       Request_vote of request_vote
@@ -75,8 +76,8 @@ sig
     | Redirect of rep_id option * 'a
     | Reset_election_timeout
     | Reset_heartbeat
-    | Send of rep_id * 'a message
-    | Send_snapshot of rep_id * index * config
+    | Send of rep_id * address * 'a message
+    | Send_snapshot of rep_id * address * index * config
     | Stop
 end
 
@@ -99,7 +100,7 @@ sig
 
   val last_index : 'a state -> index
   val last_term  : 'a state -> term
-  val peers      : 'a state -> rep_id list
+  val peers      : 'a state -> (rep_id * address) list
 
   val receive_msg :
     'a state -> rep_id -> 'a message -> 'a state * 'a action list
@@ -140,7 +141,7 @@ sig
       | `Unsafe_change of simple_config * passive_peers
       ]
 
-    val add_failover    : rep_id -> 'a state -> 'a result
+    val add_failover    : rep_id -> address -> 'a state -> 'a result
     val remove_failover : rep_id -> 'a state -> 'a result
     val decommission    : rep_id -> 'a state -> 'a result
     val demote          : rep_id -> 'a state -> 'a result

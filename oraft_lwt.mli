@@ -1,7 +1,6 @@
 
 module type LWTIO_TYPES =
 sig
-  type address
   type op
   type connection
   type conn_manager
@@ -46,8 +45,7 @@ sig
   val make :
     ('a server -> op -> [`OK of 'a | `Error of exn] Lwt.t) ->
     ?election_period:float -> ?heartbeat_period:float ->
-    (req_id * op) Oraft.Core.state -> (rep_id * address) list ->
-    conn_manager -> 'a server
+    (req_id * op) Oraft.Core.state -> conn_manager -> 'a server
 
   val run     : _ server -> unit Lwt.t
   val abort   : _ server -> unit Lwt.t
@@ -77,17 +75,16 @@ sig
 end
 
 module Make_server : functor(IO : LWTIO) ->
-  SERVER_GENERIC with type address    = IO.address
-                  and type op         = IO.op
+  SERVER_GENERIC with type op         = IO.op
                   and type connection = IO.connection
 
-module type OP =
+module type SERVER_CONF =
 sig
   type op
   val string_of_op : op -> string
   val op_of_string : string -> op
+  val sockaddr_of_string : string -> Unix.sockaddr
 end
 
-module Simple_server : functor(OP : OP) ->
-  SERVER_GENERIC with type address = Unix.sockaddr
-                  and type op      = OP.op
+module Simple_server : functor(C : SERVER_CONF) ->
+  SERVER_GENERIC with type op = C.op

@@ -16,7 +16,6 @@ module RM = Map.Make(REPID)
 
 module type LWTIO_TYPES =
 sig
-  type address
   type op
   type connection
   type conn_manager
@@ -59,8 +58,7 @@ sig
   val make :
     ('a server -> op -> [`OK of 'a | `Error of exn] Lwt.t) ->
     ?election_period:float -> ?heartbeat_period:float ->
-    (req_id * op) Oraft.Core.state -> (rep_id * address) list ->
-    conn_manager -> 'a server
+    (req_id * op) Oraft.Core.state -> conn_manager -> 'a server
 
   val run     : _ server -> unit Lwt.t
   val abort   : _ server -> unit Lwt.t
@@ -99,7 +97,6 @@ struct
 
   exception Stop_node
 
-  type address      = IO.address
   type op           = IO.op
   type connection   = IO.connection
   type conn_manager = IO.conn_manager
@@ -108,7 +105,6 @@ struct
       {
         execute      : 'a server -> IO.op -> [`OK of 'a | `Error of exn] Lwt.t;
         conn_manager : IO.conn_manager;
-        mutable peers            : IO.address RM.t;
         election_period          : float;
         heartbeat_period         : float;
         mutable next_req_id      : Int64.t;
@@ -142,7 +138,7 @@ struct
 
   and config_change =
     | No_change
-    | New_failover of change_result Lwt.u * rep_id * IO.address
+    | New_failover of change_result Lwt.u * rep_id * address
     | Remove_failover of change_result Lwt.u * rep_id
     | Decommission of change_result Lwt.u * rep_id
     | Promote of change_result Lwt.u * rep_id
@@ -169,8 +165,8 @@ struct
 
   type gen_result =
       [ `Error of exn
-      | `Redirect of rep_id * IO.address
-      | `Redirect_randomized of rep_id * IO.address
+      | `Redirect of rep_id * address
+      | `Redirect_randomized of rep_id * address
       | `Retry_later ]
 
   type 'a cmd_result   = [ gen_result | `OK of 'a ]
@@ -192,7 +188,7 @@ struct
   let make
         execute
         ?(election_period = 2.)
-        ?(heartbeat_period = election_period /. 2.) state peers conn_manager =
+        ?(heartbeat_period = election_period /. 2.) state conn_manager =
     let cmd_stream, p     = Lwt_stream.create () in
     let push_cmd x        = p (Some x) in
     let ro_op_stream, p   = Lwt_stream.create () in
@@ -239,9 +235,6 @@ struct
         push_ro_op;
         apply_stream;
         push_apply;
-        peers         = List.fold_left
-                          (fun m (k, v) -> RM.add k v m) RM.empty
-                          (List.filter (fun (id, _) -> id <> Core.id state) peers);
         next_req_id   = 42L;
         conns         = RM.empty;
         running       = true;
@@ -297,9 +290,6 @@ struct
       RM.bindings t.conns |> List.map snd |> Lwt_list.iter_p IO.abort
     end
 
-  let lookup_address t peer_id =
-    maybe_nf (RM.find peer_id) t.peers
-
   let connect_and_get_msgs t (peer, addr) =
     let rec make_thread = function
         0 -> Lwt_unix.sleep 5. >> make_thread 5
@@ -336,10 +326,10 @@ struct
     try Lwt.wakeup_later task result with _ -> ()
 
   let notify_ok_if_mem t u rep_id l =
-    notify_config_result t u (if List.mem rep_id l then OK else Retry)
+    notify_config_result t u (if List.mem_assoc rep_id l then OK else Retry)
 
   let notify_ok_if_not_mem t u rep_id l =
-    notify_config_result t u (if List.mem rep_id l then Retry else OK)
+    notify_config_result t u (if List.mem_assoc rep_id l then Retry else OK)
 
   let check_config_change_completion t =
     match Core.committed_config t.state with
@@ -348,29 +338,23 @@ struct
           match t.config_change with
             | No_change -> ()
             | New_failover (u, rep_id, addr) ->
-                if not (List.mem rep_id active || List.mem rep_id passive) then
-                  notify_config_result t u Retry
-                else begin
-                  t.peers <- RM.add rep_id addr t.peers;
+                if List.mem_assoc rep_id active || List.mem_assoc rep_id passive then
                   notify_config_result t u OK
-                end
+                else
+                  notify_config_result t u Retry
             | Remove_failover (u, rep_id) -> notify_ok_if_not_mem t u rep_id passive
             | Decommission (u, rep_id) ->
-                if List.mem rep_id active || List.mem rep_id passive then
+                if List.mem_assoc rep_id active || List.mem_assoc rep_id passive then
                   notify_config_result t u Retry
-                else begin
-                  t.peers <- RM.remove rep_id t.peers;
+                else
                   notify_config_result t u OK
-                end
             | Promote (u, rep_id) -> notify_ok_if_mem t u rep_id active
             | Demote (u, rep_id) -> notify_ok_if_not_mem t u rep_id active
             | Replace (u, replacee, failover) ->
-                if not (List.mem failover active) then
+                if not (List.mem_assoc failover active) then
                   notify_config_result t u Retry
-                else begin
-                  t.peers <- RM.remove replacee t.peers;
+                else
                   notify_config_result t u OK
-                end
 
   let rec exec_action t : _ action -> unit Lwt.t = function
     | Reset_election_timeout ->
@@ -413,7 +397,7 @@ struct
             return ()
         with _ -> return ()
       end
-    | Send (rep_id, msg) ->
+    | Send (rep_id, addr, msg) ->
         (* we allow to run this in parallel with rest RAFT algorithm.
          * It's OK to reorder sends. *)
         (* TODO: limit the number of msgs in outboung queue.
@@ -425,7 +409,7 @@ struct
           return ()
         end;
         return ()
-    | Send_snapshot (rep_id, idx, config) ->
+    | Send_snapshot (rep_id, addr, idx, config) ->
         ignore begin
           match_lwt IO.prepare_snapshot (RM.find rep_id t.conns) idx config with
             | None -> return ()
@@ -459,9 +443,8 @@ struct
   let rec run t =
     if not t.running then return ()
     else
-      let must_recon = RM.bindings t.peers |>
-                       List.filter
-                         (fun (peer, _) -> not (RM.mem peer t.conns)) in
+      let must_recon = Core.peers t.state |>
+                       List.filter (fun (peer, _) -> not (RM.mem peer t.conns)) in
       let new_ths    = List.map (connect_and_get_msgs t) must_recon in
         t.msg_threads <- new_ths @ t.msg_threads;
 
@@ -540,13 +523,13 @@ struct
   let rec exec_aux t f =
     match Core.status t.state, Core.leader_id t.state with
       | Follower, Some leader_id -> begin
-          match maybe_nf (RM.find leader_id) t.peers with
+          match List.Exceptionless.assoc leader_id (Core.peers t.state) with
               Some address -> return (`Redirect (leader_id, address))
             | None ->
                 (* redirect to a random server, hoping it knows better *)
                 try_lwt
                   let leader_id, address =
-                    RM.bindings t.peers |>
+                    Core.peers t.state |>
                     Array.of_list |>
                     (fun x -> if x = [||] then failwith "empty"; x) |>
                     (fun a -> a.(Random.int (Array.length a)))
@@ -623,7 +606,7 @@ struct
 
     let rec add_failover t rep_id addr =
       perform_change t
-        (Core.Config.add_failover rep_id)
+        (Core.Config.add_failover rep_id addr)
         (fun u -> New_failover (u, rep_id, addr))
 
     let remove_failover t rep_id =
@@ -653,19 +636,20 @@ struct
   end
 end
 
-module type OP =
+module type SERVER_CONF =
 sig
   type op
+
   val string_of_op : op -> string
   val op_of_string : string -> op
+  val sockaddr_of_string : string -> Unix.sockaddr
 end
 
-module Simple_IO(OP : OP) =
+module Simple_IO(C : SERVER_CONF) =
 struct
   module EC = Extprot.Conv
 
-  type address = Unix.sockaddr
-  type op = OP.op
+  type op = C.op
 
   type connection = Lwt_io.input_channel * Lwt_io.output_channel
 
@@ -729,7 +713,7 @@ struct
             await_conn ()
       | None -> (* we must connect ourselves *)
           try_lwt
-            lwt ich, och = Lwt_io.open_connection addr in
+            lwt ich, och = Lwt_io.open_connection (C.sockaddr_of_string addr) in
             Lwt_io.write och (t.id ^ "\n") >>
             Lwt_io.flush och >>
               return (Some (ich, och))
@@ -755,7 +739,7 @@ struct
             (index, (Nop, term)) -> (index, Entry.Nop, term)
           | (index, (Config c, term)) -> (index, Entry.Config c, term)
           | (index, (Op (req_id, x), term)) ->
-              (index, Entry.Op (req_id, OP.string_of_op x), term) in
+              (index, Entry.Op (req_id, C.string_of_op x), term) in
 
         let entries = List.map map_entry entries in
           Append_entries { Append_entries.term; leader_id; prev_log_index;
@@ -778,7 +762,7 @@ struct
           | (index, Entry.Nop, term) -> (index, (Nop, term))
           | (index, Entry.Config c, term) -> (index, (Config c, term))
           | (index, Entry.Op (req_id, x), term) ->
-              let op = OP.op_of_string x in
+              let op = C.op_of_string x in
                 (index, (Op (req_id, op), term))
         in
           Append_entries
@@ -817,5 +801,5 @@ struct
   let send_snapshot () = return false
 end
 
-module Simple_server(OP : OP) =
-  Make_server(Simple_IO(OP))
+module Simple_server(C : SERVER_CONF) =
+  Make_server(Simple_IO(C))
