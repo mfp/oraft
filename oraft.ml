@@ -336,9 +336,6 @@ struct
 
         leader_id : rep_id option;
 
-        (* new configuration we're transitioning to *)
-        config' : rep_id array option;
-
         (* volatile on leaders *)
         next_index  : index RM.t;
         match_index : index RM.t;
@@ -1017,7 +1014,6 @@ struct
         commit_index = 0L;
         last_applied = 0L;
         leader_id    = None;
-        config'      = None;
         next_index   = RM.empty;
         match_index  = RM.empty;
         pongs        = RM.empty;
