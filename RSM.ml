@@ -1,6 +1,8 @@
 open Printf
 open Lwt
 
+open Oraft.Types
+
 let section = Lwt_log.Section.make "RSM"
 
 module Map = BatMap
@@ -22,6 +24,15 @@ let read_msg read ich =
          Lwt_io.read_into_exactly ich s 0 len >>
          return (Extprot.Conv.deserialize read s))
     ich
+
+type config_change =
+    Oraft_proto.Config_change.config_change =
+    Add_failover of rep_id * address
+  | Remove_failover of rep_id
+  | Decommission of rep_id
+  | Demote of rep_id
+  | Promote of rep_id
+  | Replace of rep_id * rep_id
 
 module Make_client(C : Oraft_lwt.SERVER_CONF) =
 struct
@@ -157,7 +168,8 @@ struct
   module SS   = Oraft_lwt.Simple_server(C)
   module SSC  = SS.Config
   module CC   = Make_client(C)
-  module Core = Oraft.Core
+
+  module Core = SS
 
   open Oraft_proto
   open Client_msg
@@ -172,13 +184,13 @@ struct
         exec : 'a SS.server -> C.op -> [`OK of 'a | `Error of exn] Lwt.t;
       }
 
-  let make exec addr peer_addr ?election_period ?heartbeat_period id =
+  let make exec addr ~peer_addr ?election_period ?heartbeat_period id =
     let c = CC.make ~id () in
       CC.connect c "" peer_addr >>
       match_lwt CC.get_config c with
           `Error s -> raise_lwt (Failure s)
         | `OK config ->
-            let state    = Core.make
+            let state    = Oraft.Core.make
                              ~id ~current_term:0L ~voted_for:None
                              ~log:[] ~config () in
             let conn_mgr = SS.make_conn_manager ~id addr in
