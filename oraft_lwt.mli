@@ -86,5 +86,9 @@ sig
   val sockaddr_of_string : string -> Unix.sockaddr
 end
 
+val open_connection :
+  ?buffer_size : int -> Unix.sockaddr ->
+  (Lwt_unix.file_descr * Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t
+
 module Simple_server : functor(C : SERVER_CONF) ->
   SERVER_GENERIC with type op = C.op

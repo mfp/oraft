@@ -645,6 +645,33 @@ sig
   val sockaddr_of_string : string -> Unix.sockaddr
 end
 
+(* taken from lwt_io.ml *)
+let open_connection ?buffer_size sockaddr =
+  let fd = Lwt_unix.socket (Unix.domain_of_sockaddr sockaddr) Unix.SOCK_STREAM 0 in
+  let close = lazy begin
+    try_lwt
+      Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
+      return_unit
+    with Unix.Unix_error(Unix.ENOTCONN, _, _) ->
+      (* This may happen if the server closed the connection before us *)
+      return_unit
+    finally
+      Lwt_unix.close fd
+  end in
+  try_lwt
+    lwt () = Lwt_unix.connect fd sockaddr in
+    (try Lwt_unix.set_close_on_exec fd with Invalid_argument _ -> ());
+    return (fd,
+            Lwt_io.make ?buffer_size
+              ~close:(fun _ -> Lazy.force close)
+              ~mode:Lwt_io.input (Lwt_bytes.read fd),
+            Lwt_io.make ?buffer_size
+              ~close:(fun _ -> Lazy.force close)
+              ~mode:Lwt_io.output (Lwt_bytes.write fd))
+  with exn ->
+    lwt () = Lwt_unix.close fd in
+    raise_lwt exn
+
 module Simple_IO(C : SERVER_CONF) =
 struct
   module EC = Extprot.Conv
@@ -713,7 +740,9 @@ struct
             await_conn ()
       | None -> (* we must connect ourselves *)
           try_lwt
-            lwt ich, och = Lwt_io.open_connection (C.sockaddr_of_string addr) in
+            lwt fd, ich, och = open_connection (C.sockaddr_of_string addr) in
+            (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+            (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
             Lwt_io.write och (t.id ^ "\n") >>
             Lwt_io.flush och >>
               return (Some (ich, och))
