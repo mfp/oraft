@@ -161,6 +161,8 @@ struct
          | Cannot_change -> return (`Cannot_change)
          | Unsafe_change (c, p) -> return (`Unsafe_change (c, p))
          | Config _ -> raise_lwt Bad_response)
+
+  let connect t ~addr = connect t "" addr
 end
 
 module Make_server(C : Oraft_lwt.SERVER_CONF) =
@@ -182,27 +184,40 @@ struct
       {
         id       : rep_id;
         addr     : string;
-        c        : CC.t;
+        c        : CC.t option;
         sockaddr : Unix.sockaddr;
         serv     : 'a SS.server;
         exec     : 'a SS.server -> C.op -> [`OK of 'a | `Error of exn] Lwt.t;
       }
 
-  let make exec addr ~peer_addr ?election_period ?heartbeat_period id =
-    let c = CC.make ~id () in
-      CC.connect c "" peer_addr >>
-      match_lwt CC.get_config c with
-          `Error s -> raise_lwt (Failure s)
-        | `OK config ->
-            let state    = Oraft.Core.make
-                             ~id ~current_term:0L ~voted_for:None
-                             ~log:[] ~config () in
-            let sockaddr = C.sockaddr_of_string addr in
-            let conn_mgr = SS.make_conn_manager ~id sockaddr in
-            let serv     = SS.make exec ?election_period ?heartbeat_period
-                             state conn_mgr
-            in
-              return { id; addr; c; sockaddr; serv; exec; }
+  let make exec addr ?join ?election_period ?heartbeat_period id =
+    match join with
+        None ->
+          let config   = Simple_config ([id, addr], []) in
+          let state    = Oraft.Core.make
+                           ~id ~current_term:0L ~voted_for:None
+                           ~log:[] ~config () in
+          let sockaddr = C.sockaddr_of_string addr in
+          let conn_mgr = SS.make_conn_manager ~id sockaddr in
+          let serv     = SS.make exec ?election_period ?heartbeat_period
+                           state conn_mgr
+          in
+            return { id; addr; c = None; sockaddr; serv; exec; }
+      | Some peer_addr ->
+          let c = CC.make ~id () in
+            CC.connect c ~addr:peer_addr >>
+            match_lwt CC.get_config c with
+                `Error s -> raise_lwt (Failure s)
+              | `OK config ->
+                  let state    = Oraft.Core.make
+                                   ~id ~current_term:0L ~voted_for:None
+                                   ~log:[] ~config () in
+                  let sockaddr = C.sockaddr_of_string addr in
+                  let conn_mgr = SS.make_conn_manager ~id sockaddr in
+                  let serv     = SS.make exec ?election_period ?heartbeat_period
+                                   state conn_mgr
+                  in
+                    return { id; addr; c = Some c; sockaddr; serv; exec; }
 
   let send_msg = send_msg Oraft_proto.Server_msg.write
   let read_msg = read_msg Oraft_proto.Client_msg.read
@@ -307,17 +322,20 @@ struct
           accept_loop t
       in
         try_lwt
-          (* (1) add ourselves as failover *)
-          match_lwt CC.change_config t.c (Add_failover (t.id, t.addr)) with
-              `Cannot_change | `Unsafe_change _ | `Error _ ->
-                  Lwt_log.error_f ~section "Failed to add ourselves as failover"
-            | `OK ->
-                (* (2) promote to active node *)
-                match_lwt CC.change_config t.c (Promote t.id) with
+          match t.c with
+            | None -> accept_loop t
+            | Some c ->
+                (* (1) add ourselves as failover *)
+                match_lwt CC.change_config c (Add_failover (t.id, t.addr)) with
                     `Cannot_change | `Unsafe_change _ | `Error _ ->
-                        Lwt_log.error_f ~section
-                          "Failed to promote ourselves (id: %S)" t.id
-                  | `OK -> accept_loop t
+                        Lwt_log.error_f ~section "Failed to add ourselves as failover"
+                  | `OK ->
+                      (* (2) promote to active node *)
+                      match_lwt CC.change_config c (Promote t.id) with
+                          `Cannot_change | `Unsafe_change _ | `Error _ ->
+                              Lwt_log.error_f ~section
+                                "Failed to promote ourselves (id: %S)" t.id
+                        | `OK -> accept_loop t
         finally
           (* FIXME: t.c client shutdown *)
           Lwt_unix.close sock

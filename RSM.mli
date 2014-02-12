@@ -17,6 +17,8 @@ sig
 
   val make : id:string -> unit -> t
 
+  val connect : t -> addr:address -> unit Lwt.t
+
   val execute    : t -> C.op -> [ `Error of string | `OK of string ] Lwt.t
   val execute_ro : t -> C.op -> [ `Error of string | `OK of string ] Lwt.t
   val get_config : t -> [`Error of string | `OK of config ] Lwt.t
@@ -38,7 +40,7 @@ sig
 
   val make :
     ('a Core.server -> C.op -> [ `Error of exn | `OK of 'a ] Lwt.t) ->
-    address -> peer_addr:address ->
+    address -> ?join:address ->
     ?election_period:float ->
     ?heartbeat_period:float -> rep_id -> 'a t Lwt.t
 
