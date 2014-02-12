@@ -179,9 +179,13 @@ struct
   open Config_change
 
   type 'a t =
-      { addr : Unix.sockaddr;
-        serv : 'a SS.server;
-        exec : 'a SS.server -> C.op -> [`OK of 'a | `Error of exn] Lwt.t;
+      {
+        id       : rep_id;
+        addr     : string;
+        c        : CC.t;
+        sockaddr : Unix.sockaddr;
+        serv     : 'a SS.server;
+        exec     : 'a SS.server -> C.op -> [`OK of 'a | `Error of exn] Lwt.t;
       }
 
   let make exec addr ~peer_addr ?election_period ?heartbeat_period id =
@@ -193,11 +197,12 @@ struct
             let state    = Oraft.Core.make
                              ~id ~current_term:0L ~voted_for:None
                              ~log:[] ~config () in
-            let conn_mgr = SS.make_conn_manager ~id addr in
+            let sockaddr = C.sockaddr_of_string addr in
+            let conn_mgr = SS.make_conn_manager ~id sockaddr in
             let serv     = SS.make exec ?election_period ?heartbeat_period
                              state conn_mgr
             in
-              return { addr; serv; exec; }
+              return { id; addr; c; sockaddr; serv; exec; }
 
   let send_msg = send_msg Oraft_proto.Server_msg.write
   let read_msg = read_msg Oraft_proto.Client_msg.read
@@ -283,9 +288,11 @@ struct
         | { id; _ } -> send_msg och { id; response = Error "Bad request" }
 
   let run t =
-    let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr t.addr) Unix.SOCK_STREAM 0) in
+    let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr t.sockaddr)
+                           Unix.SOCK_STREAM 0)
+    in
       Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
-      Lwt_unix.bind sock t.addr;
+      Lwt_unix.bind sock t.sockaddr;
       Lwt_unix.listen sock 256;
 
       let rec accept_loop t =
@@ -299,5 +306,19 @@ struct
             end;
           accept_loop t
       in
-        accept_loop t
+        try_lwt
+          (* (1) add ourselves as failover *)
+          match_lwt CC.change_config t.c (Add_failover (t.id, t.addr)) with
+              `Cannot_change | `Unsafe_change _ | `Error _ ->
+                  Lwt_log.error_f ~section "Failed to add ourselves as failover"
+            | `OK ->
+                (* (2) promote to active node *)
+                match_lwt CC.change_config t.c (Promote t.id) with
+                    `Cannot_change | `Unsafe_change _ | `Error _ ->
+                        Lwt_log.error_f ~section
+                          "Failed to promote ourselves (id: %S)" t.id
+                  | `OK -> accept_loop t
+        finally
+          (* FIXME: t.c client shutdown *)
+          Lwt_unix.close sock
 end

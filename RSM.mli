@@ -38,9 +38,9 @@ sig
 
   val make :
     ('a Core.server -> C.op -> [ `Error of exn | `OK of 'a ] Lwt.t) ->
-    Unix.sockaddr -> peer_addr:address ->
+    address -> peer_addr:address ->
     ?election_period:float ->
     ?heartbeat_period:float -> rep_id -> 'a t Lwt.t
 
-  val run : string t -> 'a Lwt.t
+  val run : string t -> unit Lwt.t
 end
