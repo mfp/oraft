@@ -55,7 +55,7 @@ struct
 
   and conn = address * Lwt_io.input_channel * Lwt_io.output_channel
 
-  let make id =
+  let make ~id () =
     { id; dst = None; conns = M.empty; req_id = 0L; pending_reqs = H.create 13; }
 
   let gen_id t =
@@ -173,7 +173,7 @@ struct
       }
 
   let make exec addr peer_addr ?election_period ?heartbeat_period id =
-    let c = CC.make id in
+    let c = CC.make ~id () in
       CC.connect c "" peer_addr >>
       match_lwt CC.get_config c with
           `Error s -> raise_lwt (Failure s)
