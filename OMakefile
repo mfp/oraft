@@ -33,6 +33,12 @@ LIBS     = $(OCamlLibrary oraft, $(OBJECTS))
 
 PROGRAMS = $(OCamlProgram test_DES, oraft test_DES)
 
+%.sig: %.ml %.cmo
+    $(OCAMLFIND) $(OCAMLC) -package camlp4.macro,$(concat \,, $(OCAMLPACKS)) \
+        -syntax camlp4o \
+        $(mapprefix -I, $(OCAMLINCLUDES)) \
+        $(OCAMLFLAGS) $(OCAMLCFLAGS) -i $< > $@
+
 .DEFAULT: $(LIBS) $(PROGRAMS)
 
 # vim: set expandtab:
