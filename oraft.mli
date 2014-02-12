@@ -136,7 +136,7 @@ sig
       | `Already_changed
       | `Cannot_change
       | `Change_in_process
-      | `Redirect of rep_id option
+      | `Redirect of (rep_id * address) option
       | `Start_change of 'a state
       | `Unsafe_change of simple_config * passive_peers
       ]

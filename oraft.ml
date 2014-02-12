@@ -1054,13 +1054,20 @@ struct
       | `Already_changed
       | `Cannot_change
       | `Change_in_process
-      | `Redirect of rep_id option
+      | `Redirect of (rep_id * address) option
       | `Start_change of 'a state
       | `Unsafe_change of simple_config * passive_peers
       ]
 
     let config_change_aux s f =  match s.state with
-        Follower -> `Redirect s.leader_id
+        Follower ->
+          begin match
+            Option.map (fun id -> (id, CONFIG.address id s.config))
+              s.leader_id
+          with
+              Some (id, Some address) -> `Redirect (Some (id, address))
+            | _ -> `Redirect None
+          end
       | Candidate -> `Redirect None
       | Leader ->
           match CONFIG.current s.config with

@@ -49,8 +49,7 @@ sig
   type gen_result =
       [ `Error of exn
       | `Redirect of rep_id * address
-      | `Redirect_randomized of rep_id * address
-      | `Retry_later ]
+      | `Retry ]
 
   type 'a cmd_result   = [ gen_result | `OK of 'a ]
   type ro_op_result = [ gen_result | `OK ]
@@ -72,12 +71,13 @@ sig
     type result =
       [
       | `OK
-      | `Redirect of rep_id option
+      | `Redirect of rep_id * address
       | `Retry
       | `Cannot_change
       | `Unsafe_change of simple_config * passive_peers
       ]
 
+    val get             : _ server -> config
     val add_failover    : _ server -> rep_id -> address -> result Lwt.t
     val remove_failover : _ server -> rep_id -> result Lwt.t
     val decommission    : _ server -> rep_id -> result Lwt.t
@@ -86,6 +86,8 @@ sig
     val replace         : _ server -> replacee:rep_id -> failover:rep_id -> result Lwt.t
   end
 end
+
+let retry_delay = 0.05
 
 module Make_server(IO : LWTIO) =
 struct
@@ -166,8 +168,7 @@ struct
   type gen_result =
       [ `Error of exn
       | `Redirect of rep_id * address
-      | `Redirect_randomized of rep_id * address
-      | `Retry_later ]
+      | `Retry ]
 
   type 'a cmd_result   = [ gen_result | `OK of 'a ]
   type ro_op_result = [ gen_result | `OK ]
@@ -534,9 +535,10 @@ struct
                     (fun x -> if x = [||] then failwith "empty"; x) |>
                     (fun a -> a.(Random.int (Array.length a)))
                   in
-                    return (`Redirect_randomized (leader_id, address))
+                    return (`Redirect (leader_id, address))
                 with _ ->
-                  return `Retry_later
+                  Lwt_unix.sleep retry_delay >>
+                  return `Retry
         end
       | Candidate, _ | Follower, _ ->
           (* await leader, retry *)
@@ -573,13 +575,13 @@ struct
     type result =
       [
       | `OK
-      | `Redirect of rep_id option
+      | `Redirect of rep_id * address
       | `Retry
       | `Cannot_change
       | `Unsafe_change of simple_config * passive_peers
       ]
 
-    let retry_delay = 0.05
+    let get t = Core.config t.state
 
     let rec perform_change t perform mk_change : result Lwt.t =
       match t.config_change with
@@ -590,7 +592,9 @@ struct
         | No_change ->
             match perform t.state with
                 `Already_changed -> return `OK
-              | `Cannot_change | `Unsafe_change _ | `Redirect _ as x -> return x
+              | `Cannot_change | `Unsafe_change _ as x -> return x
+              | `Redirect (Some x) -> return (`Redirect x)
+              | `Redirect None -> return `Retry
               | `Change_in_process ->
                   Lwt_unix.sleep retry_delay >>
                   perform_change t perform mk_change
@@ -636,12 +640,17 @@ struct
   end
 end
 
-module type SERVER_CONF =
+module type OP =
 sig
   type op
 
   val string_of_op : op -> string
   val op_of_string : string -> op
+end
+
+module type SERVER_CONF =
+sig
+  include OP
   val sockaddr_of_string : string -> Unix.sockaddr
 end
 
@@ -690,7 +699,7 @@ struct
         conn_signal   : unit Lwt_condition.t;
       }
 
-  let make id addr =
+  let make ~id addr =
     let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr addr) Unix.SOCK_STREAM 0) in
       Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
       Lwt_unix.bind sock addr;
@@ -831,4 +840,9 @@ struct
 end
 
 module Simple_server(C : SERVER_CONF) =
-  Make_server(Simple_IO(C))
+struct
+  module IO = Simple_IO(C)
+  include Make_server(IO)
+
+  let make_conn_manager = IO.make
+end

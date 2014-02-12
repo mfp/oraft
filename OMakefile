@@ -22,6 +22,7 @@ OBJECTS[] =
     oraft
     oraft_lwt
     oraft_proto
+    RSM
 
 OCamlGeneratedFiles(oraft_proto)
 

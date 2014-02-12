@@ -36,8 +36,7 @@ sig
   type gen_result =
       [ `Error of exn
       | `Redirect of rep_id * address
-      | `Redirect_randomized of rep_id * address
-      | `Retry_later ]
+      | `Retry ]
 
   type 'a cmd_result   = [ gen_result | `OK of 'a ]
   type ro_op_result = [ gen_result | `OK ]
@@ -59,12 +58,13 @@ sig
     type result =
       [
       | `OK
-      | `Redirect of rep_id option
+      | `Redirect of rep_id * address
       | `Retry
       | `Cannot_change
       | `Unsafe_change of simple_config * passive_peers
       ]
 
+    val get             : _ server -> config
     val add_failover    : _ server -> rep_id -> address -> result Lwt.t
     val remove_failover : _ server -> rep_id -> result Lwt.t
     val decommission    : _ server -> rep_id -> result Lwt.t
@@ -78,11 +78,17 @@ module Make_server : functor(IO : LWTIO) ->
   SERVER_GENERIC with type op         = IO.op
                   and type connection = IO.connection
 
-module type SERVER_CONF =
+module type OP =
 sig
   type op
+
   val string_of_op : op -> string
   val op_of_string : string -> op
+end
+
+module type SERVER_CONF =
+sig
+  include OP
   val sockaddr_of_string : string -> Unix.sockaddr
 end
 
@@ -91,4 +97,8 @@ val open_connection :
   (Lwt_unix.file_descr * Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t
 
 module Simple_server : functor(C : SERVER_CONF) ->
-  SERVER_GENERIC with type op = C.op
+sig
+  include SERVER_GENERIC with type op = C.op
+
+  val make_conn_manager : id:string -> Unix.sockaddr -> conn_manager
+end
