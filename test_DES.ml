@@ -439,12 +439,12 @@ struct
         t.ticks_to_transition <- t.period;
         match t.state with
             `Down id ->
-              if t.verbose then printf "### Node %S UP\n" id;
+              if t.verbose then printf "### Node %S BACK\n" id;
               t.state <- `Up
           | `Up ->
               let node_ids = Array.of_list node_ids in
               let id       = node_ids.(RND.int t.rng (Array.length node_ids)) in
-                if t.verbose then printf "### Node %S DOWN\n" id;
+                if t.verbose then printf "### Node %S PARTITIONED\n" id;
                 t.state <- `Down id
       end
 
