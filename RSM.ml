@@ -333,6 +333,11 @@ struct
             end;
           accept_loop t
       in
+        ignore begin try_lwt
+          SS.run t.serv
+        with exn ->
+          Lwt_log.error_f ~section ~exn "Error in Oraft_lwt server run()"
+        end;
         try_lwt
           match t.c with
             | None -> accept_loop t
