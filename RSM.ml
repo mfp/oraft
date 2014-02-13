@@ -327,9 +327,16 @@ struct
           ignore
             begin try_lwt
               dispatch t fd
-            with _ ->
-              Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
-              Lwt_unix.close fd
+            with exn ->
+              begin match exn with
+                  End_of_file | Unix.Unix_error (Unix.ECONNRESET, _, _) ->
+                      return ()
+                | exn -> Lwt_log.error_f ~exn ~section "Error in dispatch"
+              end >>
+              let () = Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL in
+                Lwt_unix.close fd
+            finally
+              Lwt_log.info_f ~section "Client connection closed"
             end;
           accept_loop t
       in
