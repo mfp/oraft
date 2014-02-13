@@ -13,6 +13,7 @@ let section = Lwt_log.Section.make "oraft_lwt"
 
 module REPID = struct type t = rep_id let compare = String.compare end
 module RM = Map.Make(REPID)
+module RS = Set.Make(REPID)
 
 module type LWTIO_TYPES =
 sig
@@ -111,9 +112,12 @@ struct
         heartbeat_period         : float;
         mutable next_req_id      : Int64.t;
         mutable conns            : IO.connection RM.t;
+        mutable connecting       : RS.t;
         mutable state            : (req_id * IO.op) Core.state;
         mutable running          : bool;
-        mutable msg_threads      : th_res Lwt.t list;
+        msg_stream               : (rep_id * (req_id * IO.op) message) Lwt_stream.t;
+        push_msg                 : rep_id * (req_id * IO.op) message -> unit;
+        mutable get_msg          : th_res Lwt.t;
         mutable election_timeout : th_res Lwt.t;
         mutable heartbeat        : th_res Lwt.t;
         mutable abort            : th_res Lwt.t * th_res Lwt.u;
@@ -186,10 +190,27 @@ struct
         None -> fst (Lwt.wait ())
       | Some rep_id -> return (Snapshot_send_failed rep_id)
 
+  let get_msg t =
+    match_lwt Lwt_stream.get t.msg_stream with
+      | None -> fst (Lwt.wait ())
+      | Some (rep_id, msg) -> return (Message (rep_id, msg))
+
+  let get_cmd t =
+    match_lwt Lwt_stream.get t.cmd_stream with
+      | None -> fst (Lwt.wait ())
+      | Some (req_id, op) -> return (Client_command (req_id, op))
+
+  let get_ro_op t =
+    match_lwt Lwt_stream.get t.ro_op_stream with
+      | None -> fst (Lwt.wait ())
+      | Some x -> return (Readonly_op x)
+
   let make
         execute
         ?(election_period = 2.)
         ?(heartbeat_period = election_period /. 2.) state conn_manager =
+    let msg_stream, p     = Lwt_stream.create () in
+    let push_msg x        = p (Some x) in
     let cmd_stream, p     = Lwt_stream.create () in
     let push_cmd x        = p (Some x) in
     let ro_op_stream, p   = Lwt_stream.create () in
@@ -230,6 +251,8 @@ struct
         failed_snapshots;
         snapshot_failed;
         failed_snapshot_th;
+        msg_stream;
+        push_msg;
         cmd_stream;
         push_cmd;
         ro_op_stream;
@@ -238,16 +261,12 @@ struct
         push_apply;
         next_req_id   = 42L;
         conns         = RM.empty;
+        connecting    = RS.empty;
         running       = true;
-        msg_threads   = [];
         abort         = Lwt.task ();
-        get_cmd       = (match_lwt Lwt_stream.get cmd_stream with
-                           | None -> fst (Lwt.wait ())
-                           | Some (req_id, op) ->
-                               return (Client_command (req_id, op)));
-        get_ro_op     = (match_lwt Lwt_stream.get ro_op_stream with
-                           | None -> fst (Lwt.wait ())
-                           | Some x -> return (Readonly_op x));
+        get_msg       = fst (Lwt.wait ());
+        get_cmd       = fst (Lwt.wait ());
+        get_ro_op     = fst (Lwt.wait ());
         pending_ro_ops= Queue.create ();
         pending_cmds  = CMDM.empty;
         leader_signal = Lwt_condition.create ();
@@ -256,6 +275,9 @@ struct
     in
       t.sent_snapshots_th   <- get_sent_snapshots  t;
       t.failed_snapshot_th  <- get_failed_snapshot t;
+      t.get_msg             <- get_msg t;
+      t.get_cmd             <- get_cmd t;
+      t.get_ro_op           <- get_ro_op t;
 
       ignore begin
         try_lwt
@@ -295,13 +317,27 @@ struct
     let rec make_thread = function
         0 -> Lwt_unix.sleep 5. >> make_thread 5
       | n ->
-          match_lwt IO.connect t.conn_manager peer addr with
-            | None -> Lwt_unix.sleep 0.1 >> make_thread (n - 1)
-            | Some conn ->
-                t.conns <- RM.add peer conn t.conns;
-                match_lwt IO.receive conn with
-                    None -> Lwt_unix.sleep 0.1 >> make_thread 5
-                  | Some msg -> return (Message (peer, msg))
+          if RM.mem peer t.conns || RS.mem peer t.connecting ||
+             not (List.mem_assoc peer (Core.peers t.state)) then
+            return ()
+          else begin
+            t.connecting <- RS.add peer t.connecting;
+            match_lwt IO.connect t.conn_manager peer addr with
+              | None ->
+                  t.connecting <- RS.remove peer t.connecting;
+                  Lwt_unix.sleep 0.1 >> make_thread (n - 1)
+              | Some conn ->
+                  t.connecting <- RS.remove peer t.connecting;
+                  t.conns      <- RM.add peer conn t.conns;
+                  let rec loop_receive () =
+                    match_lwt IO.receive conn with
+                        None -> Lwt_unix.sleep 0.1 >> make_thread 5
+                      | Some msg ->
+                          t.push_msg (peer, msg);
+                          loop_receive ()
+                  in
+                    loop_receive ()
+          end
     in
       make_thread 5
 
@@ -443,73 +479,76 @@ struct
 
   let rec run t =
     if not t.running then return ()
-    else
-      let must_recon = Core.peers t.state |>
-                       List.filter (fun (peer, _) -> not (RM.mem peer t.conns)) in
-      let new_ths    = List.map (connect_and_get_msgs t) must_recon in
-        t.msg_threads <- new_ths @ t.msg_threads;
-
-        match_lwt
-          Lwt.choose
-            ([ t.election_timeout;
-               fst t.abort;
-               t.get_cmd;
-               t.get_ro_op;
-               t.heartbeat;
-               t.sent_snapshots_th;
-             ] @
-             t.msg_threads)
-        with
-          | Abort -> t.running <- false; return ()
-          | Readonly_op u -> begin
-              match Core.readonly_operation t.state with
-                  (s, None) -> Lwt.wakeup_later u Retry;
-                               return_unit
-                | (s, Some (id, actions)) ->
-                    Queue.push (id, u) t.pending_ro_ops;
-                    t.state <- s;
-                    exec_actions t actions >>
-                    run t
-            end
-          | Client_command (req_id, op) ->
-              let state, actions = Core.client_command (req_id, op) t.state in
-                t.state <- state;
-                exec_actions t actions >>
-                run t
-          | Message (rep_id, msg) ->
-              let state, actions = Core.receive_msg t.state rep_id msg in
-                t.state <- state;
-                exec_actions t actions >>
-                run t
-          | Election_timeout ->
-              let state, actions = Core.election_timeout t.state in
-                t.state <- state;
-                exec_actions t actions >>
-                run t
-          | Heartbeat_timeout ->
-              let state, actions = Core.heartbeat_timeout t.state in
-                t.state <- state;
-                exec_actions t actions >>
-                run t
-          | Snapshots_sent data ->
-              let state, actions =
-                List.fold_left
-                  (fun (s, actions) (peer, last_index) ->
-                     let s, actions' = Core.snapshot_sent peer ~last_index s in
-                       (s, actions' @ actions))
-                  (t.state, [])
-                  data
-              in
-                t.sent_snapshots_th <- get_sent_snapshots t;
-                t.state <- state;
-                exec_actions t actions >>
-                run t
-          | Snapshot_send_failed rep_id ->
-              let state, actions = Core.snapshot_send_failed rep_id t.state in
-                t.failed_snapshot_th <- get_failed_snapshot t;
-                t.state <- state;
-                exec_actions t actions >>
-                run t
+    else begin
+      (* Launch new connections as needed.
+       * connect_and_get_msgs will ignore peers for which a connection already
+       * exists or is being established. *)
+      ignore (List.map (connect_and_get_msgs t) (Core.peers t.state));
+      match_lwt
+        Lwt.choose
+          [ t.election_timeout;
+            fst t.abort;
+            t.get_msg;
+            t.get_cmd;
+            t.get_ro_op;
+            t.heartbeat;
+            t.sent_snapshots_th;
+          ]
+      with
+        | Abort -> t.running <- false; return ()
+        | Readonly_op u -> begin
+            t.get_ro_op <- get_ro_op t;
+            match Core.readonly_operation t.state with
+                (s, None) -> Lwt.wakeup_later u Retry;
+                             return_unit
+              | (s, Some (id, actions)) ->
+                  Queue.push (id, u) t.pending_ro_ops;
+                  t.state <- s;
+                  exec_actions t actions >>
+                  run t
+          end
+        | Client_command (req_id, op) ->
+            let state, actions = Core.client_command (req_id, op) t.state in
+              t.get_cmd <- get_cmd t;
+              t.state   <- state;
+              exec_actions t actions >>
+              run t
+        | Message (rep_id, msg) ->
+            let state, actions = Core.receive_msg t.state rep_id msg in
+              t.get_msg <- get_msg t;
+              t.state <- state;
+              exec_actions t actions >>
+              run t
+        | Election_timeout ->
+            let state, actions = Core.election_timeout t.state in
+              t.state <- state;
+              exec_actions t actions >>
+              run t
+        | Heartbeat_timeout ->
+            let state, actions = Core.heartbeat_timeout t.state in
+              t.state <- state;
+              exec_actions t actions >>
+              run t
+        | Snapshots_sent data ->
+            let state, actions =
+              List.fold_left
+                (fun (s, actions) (peer, last_index) ->
+                   let s, actions' = Core.snapshot_sent peer ~last_index s in
+                     (s, actions' @ actions))
+                (t.state, [])
+                data
+            in
+              t.sent_snapshots_th <- get_sent_snapshots t;
+              t.state <- state;
+              exec_actions t actions >>
+              run t
+        | Snapshot_send_failed rep_id ->
+            let state, actions = Core.snapshot_send_failed rep_id t.state in
+              t.failed_snapshot_th <- get_failed_snapshot t;
+              t.state <- state;
+              exec_actions t actions >>
+              run t
+    end
 
   let run t =
     try_lwt
