@@ -37,6 +37,9 @@ struct
     val status       : t -> [`Normal | `Joint]
     val target       : t -> (simple_config * passive_peers) option
 
+    (** Return whether we are the only active node in the latest config. *)
+    val is_alone     : t -> bool
+
     (** Returns all peers (including passive). *)
     val peers        : t -> (rep_id * address) list
 
@@ -123,11 +126,45 @@ struct
     let quorum_min get t = match t.latest with
         _, Simple_config (c, _), _, _ -> quorum_min_simple get c
       | _, Joint_config (c1, c2, _), _, _ ->
-          (* we require a quorum (len (c1) / 2 + 1) amongst the nodes that are
-           * not removed when going from c1 to c2, i.e.
-           * set(c1) - (set(c1) - set(c2)) *)
-          let only = set_diff c1 (set_diff c1 c2) in
-            min (quorum_min_simple get ~only c1) (quorum_min_simple get c2)
+          (* If new nodes are added, we require a quorum (len (c1) / 2 + 1)
+           * amongst the nodes that are not removed when going from c1 to c2,
+           * i.e.
+           * set(c1) - (set(c1) - set(c2))
+           *
+           * This is required to handle cases like:
+           *
+           *  n0 n1 n2   ->  n1 n2 n3
+           *  transitional config: Joint_config ([n0 n1 n2], [n1 n2 n3])
+           *
+           *  We need a consensus involving n1 + n2.
+           *  n0 + n1 would not do, since the moment we transition to
+           *  [n1 n2 n3] if n1 were to fail [n2 n3] would still have a quorum
+           *  and could lose the committed config entry that completed the
+           *  transition (as well as other committed operations).
+           *
+           *  As a special case, transitions like (i.e., only 1 active node
+           *  in prior config):
+           *
+           *    n0 -> n1
+           *
+           *  require the following quora:     n0    n1
+           *
+           *
+           * OTOH, if we're merely removing nodes, we just want a "normal"
+           * consensus in both the previous and next configurations:
+           *
+           *   n0 n1 -> n1
+           *   Joint_config ([n0 n1], [n1])  required quora  n0+n1    n1
+           *
+           *   n0 -> n1
+           *   Joint_config ([n0], [n1])     required quora  n0       n1
+           * *)
+          if List.length c1 > 1 &&
+             List.exists (fun (id, _) -> not (List.mem_assoc id c1)) c2 then
+            let only = set_diff c1 (set_diff c1 c2) in
+              min (quorum_min_simple get ~only c1) (quorum_min_simple get c2)
+          else
+              min (quorum_min_simple get c1) (quorum_min_simple get c2)
 
     let join index ?passive:p c2 t = match t.latest with
         | (idx, Simple_config (c1, passive), _, _) when index > idx ->
@@ -185,6 +222,9 @@ struct
 
     let peers { id; latest = (_, _, _, all); _ } =
       M.remove id all |> M.bindings
+
+    let is_alone { id; latest = (_, _, active, _); _ } =
+      M.mem id active && (M.remove id active |> M.is_empty)
 
     let address id { latest = (_, _, _, all); } =
       M.Exceptionless.find id all
@@ -852,6 +892,24 @@ let election_timeout s = match s.state with
     (* passive nodes do not trigger elections *)
   | _ when not (CONFIG.mem_active s.id s.config) -> (s, [])
 
+  (* if we're the active only node in the cluster, win the elections right
+   * away *)
+  | Follower | Candidate when CONFIG.is_alone s.config ->
+      let s = { s with current_term = Int64.succ s.current_term;
+                       state        = Leader;
+                       votes        = RS.singleton s.id;
+                       leader_id    = Some s.id;
+                       voted_for    = Some s.id;
+                       pongs        = RM.empty;
+                       ping_index   = 1L;
+                       acked_ro_op  = 0L;
+                       snapshot_transfers = RS.empty;
+              }
+      in (s, [Become_leader])
+
+  | Leader when CONFIG.is_alone s.config ->
+      (s, [Reset_election_timeout])
+
     (* we have the leader step down if it does not get any append_result
      * within an election timeout *)
   | Leader
@@ -909,6 +967,10 @@ let heartbeat_timeout s = match s.state with
 
 let client_command x s = match s.state with
     Follower | Candidate -> (s, [Redirect (s.leader_id, x)])
+  | Leader when CONFIG.is_alone s.config ->
+      let log = LOG.append ~term:s.current_term (Op x) s.log in
+      let s   = update_commit_index { s with log; } in
+        try_commit s
   | Leader ->
       let log        = LOG.append ~term:s.current_term (Op x) s.log in
       let s, actions =
@@ -1138,7 +1200,8 @@ struct
            let len    = List.length c in
            let quorum = len / 2 + 1 in
              match safe_assoc replacee c, safe_assoc failover p with
-                 Some _, Some _ when len - 1 < quorum -> `Unsafe_change (c, p)
+                 Some _, Some _ when len > 1 && len - 1 < quorum ->
+                   `Unsafe_change (c, p)
                | Some _, Some addr2 ->
                    `Perform_change
                      ((failover, addr2) :: List.remove_assoc replacee c,
