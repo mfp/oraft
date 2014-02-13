@@ -651,7 +651,7 @@ end
 module type SERVER_CONF =
 sig
   include OP
-  val sockaddr_of_string : string -> Unix.sockaddr
+  val node_sockaddr : address -> Unix.sockaddr
 end
 
 (* taken from lwt_io.ml *)
@@ -749,12 +749,12 @@ struct
             await_conn ()
       | None -> (* we must connect ourselves *)
           try_lwt
-            lwt fd, ich, och = open_connection (C.sockaddr_of_string addr) in
-            (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
-            (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-            Lwt_io.write och (t.id ^ "\n") >>
-            Lwt_io.flush och >>
-              return (Some (ich, och))
+            lwt fd, ich, och = open_connection (C.node_sockaddr addr) in
+              (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+              (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
+              Lwt_io.write och (t.id ^ "\n") >>
+              Lwt_io.flush och >>
+                return (Some (ich, och))
           with _ -> return_none
 
   open Oraft_proto

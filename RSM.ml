@@ -34,7 +34,13 @@ type config_change =
   | Promote of rep_id
   | Replace of rep_id * rep_id
 
-module Make_client(C : Oraft_lwt.SERVER_CONF) =
+module type CONF =
+sig
+  include Oraft_lwt.SERVER_CONF
+  val app_sockaddr : address -> Unix.sockaddr
+end
+
+module Make_client(C : CONF) =
 struct
   module M = Map.Make(String)
 
@@ -78,7 +84,9 @@ struct
 
   let connect t peer_id address =
     let do_connect () =
-      lwt fd, ich, och = Oraft_lwt.open_connection (C.sockaddr_of_string address) in
+      lwt fd, ich, och = Oraft_lwt.open_connection
+                           (C.app_sockaddr address)
+      in
         (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
         (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
         try_lwt
@@ -165,7 +173,7 @@ struct
   let connect t ~addr = connect t "" addr
 end
 
-module Make_server(C : Oraft_lwt.SERVER_CONF) =
+module Make_server(C : CONF) =
 struct
   module SS   = Oraft_lwt.Simple_server(C)
   module SSC  = SS.Config
@@ -182,42 +190,46 @@ struct
 
   type 'a t =
       {
-        id       : rep_id;
-        addr     : string;
-        c        : CC.t option;
-        sockaddr : Unix.sockaddr;
-        serv     : 'a SS.server;
-        exec     : 'a SS.server -> C.op -> [`OK of 'a | `Error of exn] Lwt.t;
+        id            : rep_id;
+        addr          : string;
+        c             : CC.t option;
+        node_sockaddr : Unix.sockaddr;
+        app_sockaddr  : Unix.sockaddr;
+        serv          : 'a SS.server;
+        exec          : 'a SS.server -> C.op -> [`OK of 'a | `Error of exn] Lwt.t;
       }
 
   let make exec addr ?join ?election_period ?heartbeat_period id =
     match join with
         None ->
-          let config   = Simple_config ([id, addr], []) in
-          let state    = Oraft.Core.make
-                           ~id ~current_term:0L ~voted_for:None
-                           ~log:[] ~config () in
-          let sockaddr = C.sockaddr_of_string addr in
-          let conn_mgr = SS.make_conn_manager ~id sockaddr in
-          let serv     = SS.make exec ?election_period ?heartbeat_period
-                           state conn_mgr
+          let config        = Simple_config ([id, addr], []) in
+          let state         = Oraft.Core.make
+                                ~id ~current_term:0L ~voted_for:None
+                                ~log:[] ~config () in
+          let node_sockaddr = C.node_sockaddr addr in
+          let app_sockaddr  = C.app_sockaddr addr in
+          let conn_mgr      = SS.make_conn_manager ~id node_sockaddr in
+          let serv          = SS.make exec ?election_period ?heartbeat_period
+                                state conn_mgr
           in
-            return { id; addr; c = None; sockaddr; serv; exec; }
+            return { id; addr; c = None; node_sockaddr; app_sockaddr; serv; exec; }
       | Some peer_addr ->
           let c = CC.make ~id () in
             CC.connect c ~addr:peer_addr >>
             match_lwt CC.get_config c with
                 `Error s -> raise_lwt (Failure s)
               | `OK config ->
-                  let state    = Oraft.Core.make
-                                   ~id ~current_term:0L ~voted_for:None
-                                   ~log:[] ~config () in
-                  let sockaddr = C.sockaddr_of_string addr in
-                  let conn_mgr = SS.make_conn_manager ~id sockaddr in
-                  let serv     = SS.make exec ?election_period ?heartbeat_period
-                                   state conn_mgr
+                  let state         = Oraft.Core.make
+                                        ~id ~current_term:0L ~voted_for:None
+                                        ~log:[] ~config () in
+                  let node_sockaddr = C.node_sockaddr addr in
+                  let app_sockaddr  = C.app_sockaddr addr in
+                  let conn_mgr      = SS.make_conn_manager ~id node_sockaddr in
+                  let serv          = SS.make exec ?election_period
+                                        ?heartbeat_period state conn_mgr
                   in
-                    return { id; addr; c = Some c; sockaddr; serv; exec; }
+                    return { id; addr; c = Some c;
+                             node_sockaddr; app_sockaddr; serv; exec; }
 
   let send_msg = send_msg Oraft_proto.Server_msg.write
   let read_msg = read_msg Oraft_proto.Client_msg.read
@@ -303,11 +315,11 @@ struct
         | { id; _ } -> send_msg och { id; response = Error "Bad request" }
 
   let run t =
-    let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr t.sockaddr)
+    let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr t.app_sockaddr)
                            Unix.SOCK_STREAM 0)
     in
       Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
-      Lwt_unix.bind sock t.sockaddr;
+      Lwt_unix.bind sock t.app_sockaddr;
       Lwt_unix.listen sock 256;
 
       let rec accept_loop t =

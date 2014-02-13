@@ -88,8 +88,9 @@ end
 
 module type SERVER_CONF =
 sig
+  open Oraft.Types
   include OP
-  val sockaddr_of_string : string -> Unix.sockaddr
+  val node_sockaddr : address -> Unix.sockaddr
 end
 
 val open_connection :

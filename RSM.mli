@@ -8,7 +8,13 @@ type config_change =
   | Promote of rep_id
   | Replace of rep_id * rep_id
 
-module Make_client : functor (C : Oraft_lwt.SERVER_CONF) ->
+module type CONF =
+sig
+  include Oraft_lwt.SERVER_CONF
+  val app_sockaddr : address -> Unix.sockaddr
+end
+
+module Make_client : functor (C : CONF) ->
 sig
   exception Not_connected
   exception Bad_response
@@ -32,7 +38,7 @@ sig
     Lwt.t
 end
 
-module Make_server : functor (C : Oraft_lwt.SERVER_CONF) ->
+module Make_server : functor (C : CONF) ->
 sig
   type 'a t
 
