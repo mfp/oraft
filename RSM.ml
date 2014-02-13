@@ -5,7 +5,8 @@ open Oraft.Types
 
 let section = Lwt_log.Section.make "RSM"
 
-module Map = BatMap
+module Map     = BatMap
+module Hashtbl = BatHashtbl
 
 let send_msg write och msg =
   let s = Extprot.Conv.serialize write msg in
@@ -96,6 +97,16 @@ struct
                 let conn = (address, ich, och) in
                   t.conns <- M.add id conn t.conns;
                   t.dst <- Some conn;
+                  ignore begin
+                    let rec loop_recv () =
+                      lwt { id; response } = read_msg ich in
+                        match H.Exceptionless.find t.pending_reqs id with
+                            None -> loop_recv ()
+                          | Some u ->
+                              Lwt.wakeup_later u response;
+                              loop_recv ()
+                    in loop_recv ()
+                  end;
                   return ()
             | _ -> failwith "conn refused"
         with _ ->
