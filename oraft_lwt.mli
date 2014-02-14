@@ -41,9 +41,11 @@ sig
   type 'a cmd_result   = [ gen_result | `OK of 'a ]
   type ro_op_result = [ gen_result | `OK ]
 
+  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
+  type 'a apply     = 'a server -> op -> [`OK of 'a | `Error of exn] execution
+
   val make :
-    ('a server -> op -> [`OK of 'a | `Error of exn] Lwt.t) ->
-    ?election_period:float -> ?heartbeat_period:float ->
+    'a apply -> ?election_period:float -> ?heartbeat_period:float ->
     (req_id * op) Oraft.Core.state -> conn_manager -> 'a server
 
   val config  : _ server -> config

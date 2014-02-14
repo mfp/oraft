@@ -1,10 +1,12 @@
 open Printf
 open Lwt
 
-module String = BatString
+module String  = BatString
+module Hashtbl = BatHashtbl
 
 type op =
     Get of string
+  | Wait of string
   | Set of string * string
 
 module CONF =
@@ -14,6 +16,7 @@ struct
 
   let string_of_op = function
       Get v -> "?" ^ v
+    | Wait v -> "<" ^ v
     | Set (k, v) -> sprintf "!%s=%s" k v
 
   let op_of_string s =
@@ -21,6 +24,7 @@ struct
     else
       match s.[0] with
           '?' -> Get (String.slice ~first:1 s)
+        | '<' -> Wait (String.slice ~first:1 s)
         | '!' -> let k, v = String.slice ~first:1 s |> String.split ~by:"=" in
                    Set (k, v)
         | _ -> failwith "bad op"
@@ -42,22 +46,37 @@ module SERVER = RSM.Make_server(CONF)
 module CLIENT = RSM.Make_client(CONF)
 
 let run_server ~addr ?join ~id () =
-  let h = Hashtbl.create 13 in
+  let h    = Hashtbl.create 13 in
+  let cond = Lwt_condition.create () in
 
   let exec _ op = match op with
-      Get s -> return (try `OK (Hashtbl.find h s) with Not_found -> `OK "")
+      Get s -> `Sync (return (try `OK (Hashtbl.find h s) with Not_found -> `OK ""))
+    | Wait k ->
+        `Async begin
+          let rec attempt () =
+            match Hashtbl.Exceptionless.find h k with
+                Some v -> return (`OK v)
+              | None ->
+                  Lwt_condition.wait cond >>
+                  attempt ()
+          in
+            attempt ()
+        end
     | Set (k, v) ->
-        if v = "" then Hashtbl.remove h k
-        else Hashtbl.add h k v;
-        return (`OK "")
+        if v = "" then
+          Hashtbl.remove h k
+        else begin
+          Hashtbl.add h k v;
+          Lwt_condition.broadcast cond ();
+        end;
+        `Sync (return (`OK ""))
   in
 
   lwt server = SERVER.make exec addr ?join id in
     SERVER.run server
 
-
 let client_op ~addr op =
-  let c = CLIENT.make ~id:"foo" () in
+  let c = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
     CLIENT.connect c ~addr >>
     match_lwt CLIENT.execute c op with
         `OK s -> printf "+OK %s\n" s;
@@ -99,5 +118,5 @@ let () =
           | Some k, Some v ->
               Lwt_unix.run (client_op ~addr (Set (k, v)))
           | Some k, None ->
-              Lwt_unix.run (client_op ~addr (Get k))
+              Lwt_unix.run (client_op ~addr (Wait k))
 

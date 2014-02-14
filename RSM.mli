@@ -44,9 +44,11 @@ sig
 
   module Core : Oraft_lwt.SERVER_GENERIC with type op = C.op
 
+  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
+  type 'a apply     = 'a Core.server -> C.op -> [`OK of 'a | `Error of exn] execution
+
   val make :
-    ('a Core.server -> C.op -> [ `Error of exn | `OK of 'a ] Lwt.t) ->
-    address -> ?join:address ->
+    'a apply -> address -> ?join:address ->
     ?election_period:float ->
     ?heartbeat_period:float -> rep_id -> 'a t Lwt.t
 

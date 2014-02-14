@@ -55,9 +55,11 @@ sig
   type 'a cmd_result   = [ gen_result | `OK of 'a ]
   type ro_op_result = [ gen_result | `OK ]
 
+  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
+  type 'a apply     = 'a server -> op -> [`OK of 'a | `Error of exn] execution
+
   val make :
-    ('a server -> op -> [`OK of 'a | `Error of exn] Lwt.t) ->
-    ?election_period:float -> ?heartbeat_period:float ->
+    'a apply -> ?election_period:float -> ?heartbeat_period:float ->
     (req_id * op) Oraft.Core.state -> conn_manager -> 'a server
 
   val config  : _ server -> config
@@ -105,10 +107,13 @@ struct
   type connection   = IO.connection
   type conn_manager = IO.conn_manager
 
-  type 'a server =
+  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
+  type 'a apply     = 'a server -> op -> [`OK of 'a | `Error of exn] execution
+
+  and 'a server =
       {
-        execute      : 'a server -> IO.op -> [`OK of 'a | `Error of exn] Lwt.t;
-        conn_manager : IO.conn_manager;
+        execute                  : 'a apply;
+        conn_manager             : IO.conn_manager;
         election_period          : float;
         heartbeat_period         : float;
         mutable next_req_id      : Int64.t;
@@ -289,18 +294,29 @@ struct
             match_lwt Lwt_stream.get t.apply_stream with
                 None -> return ()
               | Some (req_id, op) ->
-                  lwt resp = try_lwt t.execute t op
-                             with exn -> return (`Error exn)
+                  let return_result resp =
+                    try_lwt
+                      let (_, u), pending = CMDM.extract req_id t.pending_cmds in
+                        t.pending_cmds <- pending;
+                        Lwt.wakeup_later u (Executed resp);
+                        return ()
+                    with _ -> return ()
                   in
-                    begin
-                      try_lwt
-                        let (_, u), pending = CMDM.extract req_id t.pending_cmds in
-                          t.pending_cmds <- pending;
-                          Lwt.wakeup_later u (Executed resp);
-                          return ()
-                      with _ -> return ()
-                    end >>
-                    apply_loop ()
+                    match
+                      try (t.execute t op :> [`Sync of _ | `Async of _ | `Error of _])
+                      with exn -> `Error exn
+                    with
+                        `Sync resp ->
+                          (try_lwt resp with exn -> return (`Error exn)) >>=
+                          return_result >>
+                          apply_loop ()
+                      | `Async resp ->
+                          ignore begin
+                            (try_lwt resp with exn -> return (`Error exn)) >>=
+                             return_result
+                          end;
+                          apply_loop ()
+                      | `Error _ as x -> return_result x >> apply_loop ()
           in
             apply_loop ()
         with exn ->

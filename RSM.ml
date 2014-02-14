@@ -199,6 +199,9 @@ struct
   open Response
   open Config_change
 
+  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
+  type 'a apply     = 'a Core.server -> C.op -> [`OK of 'a | `Error of exn] execution
+
   type 'a t =
       {
         id            : rep_id;
@@ -207,7 +210,7 @@ struct
         node_sockaddr : Unix.sockaddr;
         app_sockaddr  : Unix.sockaddr;
         serv          : 'a SS.server;
-        exec          : 'a SS.server -> C.op -> [`OK of 'a | `Error of exn] Lwt.t;
+        exec          : 'a SS.apply;
       }
 
   let raise_if_error = function
@@ -311,10 +314,20 @@ struct
               let response = map_op_result x in
                 send_msg och { id; response; }
           | `OK ->
-              lwt response = t.exec t.serv (C.op_of_string op) >|=
-                             map_op_result
-              in
-                send_msg och { id; response }
+              match t.exec t.serv (C.op_of_string op) with
+                | `Sync resp ->
+                    lwt resp = resp in
+                      send_msg och { id; response = map_op_result resp }
+                | `Async resp ->
+                    ignore begin try_lwt
+                      lwt resp = try_lwt resp
+                                 with exn -> return (`Error exn)
+                      in
+                        send_msg och { id; response = map_op_result resp }
+                    with _ ->
+                      return ()
+                    end;
+                    return ()
       end
     | { id; op = Execute op; } ->
         lwt response = SS.execute t.serv (C.op_of_string op) >|= map_op_result in
