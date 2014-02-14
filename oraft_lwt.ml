@@ -334,7 +334,10 @@ struct
                   t.conns      <- RM.add peer conn t.conns;
                   let rec loop_receive () =
                     match_lwt IO.receive conn with
-                        None -> Lwt_unix.sleep 0.1 >> make_thread 5
+                        None ->
+                          lwt () = Lwt_unix.sleep 0.1 in
+                            t.conns <- RM.remove peer t.conns;
+                            make_thread 5
                       | Some msg ->
                           t.push_msg (peer, msg);
                           loop_receive ()
