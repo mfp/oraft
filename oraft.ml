@@ -428,8 +428,10 @@ struct
 
   and actual_append_result =
       Append_success of index (* last log entry included in msg we respond to *)
-    | Append_failure of index (* index of log entry preceding those in
-                                 message we respond to *)
+    | Append_failure of index
+      (* Index of log entry preceding those in message we respond to or
+       * the index following the last entry we do have.
+       * *)
 
   and ping = { term : term; n : Int64.t; }
 
@@ -746,10 +748,11 @@ let receive_msg s peer = function
             LOG.get_term prev_log_index s.log, CONFIG.address peer s.config
           with
               None, Some addr ->
-                (* we don't have the entry at prev_log_index; we use the last
-                 * entry we do have as the prev_log_index in the failure msg,
-                 * thus allowing to rewind next_index in the leader quickly *)
-                let prev_log_index = LOG.last_index s.log |> snd in
+                (* we don't have the entry at prev_log_index; we use the
+                 * successor of the last entry we do have as the
+                 * prev_log_index in the failure msg, thus allowing to rewind
+                 * next_index in the leader quickly *)
+                let prev_log_index = LOG.last_index s.log |> snd |> Int64.succ in
                   (s, Send (peer, addr, append_fail ~prev_log_index s) :: actions)
             | Some term', Some addr when prev_log_term <> term' ->
                 (s, Send (peer, addr, append_fail ~prev_log_index s) :: actions)
