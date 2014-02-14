@@ -1193,7 +1193,7 @@ struct
              else match safe_assoc id p with
                  None -> `Cannot_change
                | Some addr ->
-                   `Perform_change (List.remove_assoc id c, (id, addr) :: p))
+                   `Perform_change ((id, addr) :: c, List.remove_assoc id p))
 
     let replace ~replacee ~failover s =
       config_change_aux s
