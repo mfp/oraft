@@ -28,13 +28,14 @@ struct
   let sockaddr s =
     try
       let host, port = String.split ~by:":" s in
-        printf "host %S   port %s\n" host port;
         Unix.ADDR_INET (Unix.inet_addr_of_string host, int_of_string port)
     with Not_found ->
       Unix.ADDR_UNIX s
 
   let node_sockaddr s = String.split ~by:"," s |> fst |> sockaddr
-  let app_sockaddr  s = String.split ~by:"," s |> snd |> sockaddr
+  let app_sockaddr  s =
+    printf "Connecting to %s\n%!" s;
+    String.split ~by:"," s |> snd |> sockaddr
 end
 
 module SERVER = RSM.Make_server(CONF)
