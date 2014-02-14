@@ -790,14 +790,21 @@ let run
                 ~on_apply ~take_snapshot ~install_snapshot
                 des in
   let dt    = Unix.gettimeofday () -. t0 in
-  let ncmds = DES.live_nodes des |>
+  (* We filter out nodes with 0 entries, i.e. those that were being introduced
+   * into the cluster at the end of the simulation. *)
+  let nodes = DES.live_nodes des |>
+              List.filter
+                (fun node ->
+                   let _, q, _ = DES.app_state node in
+                     FQueue.length q <> 0) in
+  let ncmds = nodes |>
               List.map
                 (fun node ->
                    let _, q, _ = DES.app_state node in
                      printf "%S: len %d\n" (DES.node_id node) (FQueue.length q);
                      FQueue.length q) |>
               List.fold_left min max_int in
-  let logs  = DES.live_nodes des |>
+  let logs  = nodes |>
               List.map
                 (fun node ->
                    let _, q, _ = DES.app_state node in
