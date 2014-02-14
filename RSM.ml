@@ -342,6 +342,7 @@ struct
     let och = Lwt_io.of_fd Lwt_io.output fd in
       match_lwt read_msg ich with
         | { id; op = Connect client_id; _ } ->
+            Lwt_log.info_f ~section "Incoming client connection from %S" client_id >>
             send_msg och { id; response = OK "" } >>
             request_loop t client_id ich och
         | { id; _ } -> send_msg och { id; response = Error "Bad request" }

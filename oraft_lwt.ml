@@ -731,6 +731,8 @@ struct
 
   module M = Map.Make(String)
 
+  let section = Lwt_log.Section.make "oraft_lwt.io"
+
   type conn_manager =
       {
         id            : string;
@@ -767,7 +769,7 @@ struct
             lwt id  = Lwt_io.read_line ich in
               t.conns <- M.add id { id; mgr = t; ich; och; closed = false; } t.conns;
               Lwt_condition.broadcast t.conn_signal ();
-              return ()
+              Lwt_log.info_f ~section "Incoming connection from peer %S" id
           with _ ->
             Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
             Lwt_unix.close fd
@@ -799,6 +801,7 @@ struct
             await_conn ()
       | None -> (* we must connect ourselves *)
           try_lwt
+            Lwt_log.info_f ~section "Connecting to %S" addr >>
             lwt fd, ich, och = open_connection (C.node_sockaddr addr) in
               (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
               (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
