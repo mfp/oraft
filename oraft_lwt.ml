@@ -206,6 +206,9 @@ struct
       | None -> fst (Lwt.wait ())
       | Some x -> return (Readonly_op x)
 
+  let sleep_randomized period =
+    Lwt_unix.sleep (period *. 0.75 +. Random.float (period *. 0.5))
+
   let make
         execute
         ?(election_period = 2.)
@@ -218,7 +221,7 @@ struct
     let push_ro_op x      = p (Some x) in
     let election_timeout  = match Core.status state with
                               | Follower | Candidate ->
-                                  Lwt_unix.sleep election_period >>
+                                  sleep_randomized election_period >>
                                   return Election_timeout
                               | Leader -> fst (Lwt.wait ()) in
     let heartbeat         = match Core.status state with
@@ -401,7 +404,7 @@ struct
 
   let rec exec_action t : _ action -> unit Lwt.t = function
     | Reset_election_timeout ->
-        t.election_timeout <- (Lwt_unix.sleep t.election_period >>
+        t.election_timeout <- (sleep_randomized t.election_period >>
                                return Election_timeout);
         return ()
     | Reset_heartbeat ->
