@@ -1,8 +1,6 @@
 open Printf
 open Lwt
 
-open Oraft_util
-
 module Map    = BatMap
 module List   = BatList
 module Option = BatOption
@@ -890,7 +888,7 @@ let receive_msg s peer = function
 
 let election_timeout s = match s.state with
     (* passive nodes do not trigger elections *)
-  | _ when not (CONFIG.mem_active s.id s.config) -> (s, [])
+  | _ when not (CONFIG.mem_active s.id s.config) -> (s, [Reset_election_timeout])
 
   (* if we're the active only node in the cluster, win the elections right
    * away *)
@@ -943,7 +941,10 @@ let election_timeout s = match s.state with
         (s, (Become_candidate :: sends))
 
 let heartbeat_timeout s = match s.state with
-    Follower | Candidate -> (s, [])
+    Follower | Candidate -> (s, [Reset_heartbeat])
+  | Leader when CONFIG.is_alone s.config ->
+      let s, actions = update_commit_index s |> try_commit in
+        (s, Reset_heartbeat :: actions)
   | Leader ->
       let s, sends =
         CONFIG.peers s.config |>
@@ -1069,7 +1070,7 @@ struct
 
   let make ~id ~current_term ~voted_for ~log ~config () =
     let log    = LOG.of_list ~prev_log_index:0L ~prev_log_term:current_term log in
-    let config = CONFIG.make ~node_id:id ~index:1L config in
+    let config = CONFIG.make ~node_id:id ~index:0L config in
       {
         current_term; voted_for; log; id; config;
         state        = Follower;
