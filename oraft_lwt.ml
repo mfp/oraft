@@ -852,7 +852,10 @@ struct
             }
 
   let send (_, och) msg =
-    let payload = EC.serialize Raft_message.write (wrap_msg msg) in
+    let wrapped = wrap_msg msg in
+    let payload = EC.serialize Raft_message.write wrapped in
+      Lwt_log.debug_f ~section
+        "Sending\n%s" (Extprot.Pretty_print.pp pp_raft_message wrapped) >>
       Lwt_io.atomic
         (fun och ->
            Lwt_io.LE.write_int och (String.length payload) >>
@@ -866,7 +869,11 @@ struct
            lwt len = Lwt_io.LE.read_int ich in
            let s   = String.create len in
            lwt ()  = Lwt_io.read_into_exactly ich s 0 len in
-             return (Some (EC.deserialize Raft_message.read s |> unwrap_msg)))
+           let msg = EC.deserialize Raft_message.read s in
+             Lwt_log.debug_f ~section
+               "Received\n%s"
+               (Extprot.Pretty_print.pp pp_raft_message msg) >>
+             return (Some (unwrap_msg msg)))
         ich
     with _ ->
       Lwt_io.abort ich >>
