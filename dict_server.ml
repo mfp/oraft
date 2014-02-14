@@ -76,13 +76,15 @@ let run_server ~addr ?join ~id () =
     SERVER.run server
 
 let client_op ~addr op =
-  let c = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
+  let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
+  let exec = match op with
+               | Get _ | Wait _ -> CLIENT.execute_ro
+               | Set _ -> CLIENT.execute
+  in
     CLIENT.connect c ~addr >>
-    match_lwt CLIENT.execute c op with
-        `OK s -> printf "+OK %s\n" s;
-                 return ()
-      | `Error s -> printf "-ERR %s\n" s;
-                    return ()
+    match_lwt exec c op with
+        `OK s -> printf "+OK %s\n" s; return ()
+      | `Error s -> printf "-ERR %s\n" s; return ()
 
 let mode         = ref `Help
 let cluster_addr = ref None
