@@ -809,11 +809,15 @@ struct
           try_lwt
             Lwt_log.info_f ~section "Connecting to %S" addr >>
             lwt fd, ich, och = open_connection (C.node_sockaddr addr) in
-              (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
-              (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-              Lwt_io.write och (t.id ^ "\n") >>
-              Lwt_io.flush och >>
-              return (Some { id = dst_id; mgr = t; ich; och; closed = false })
+              try_lwt
+                (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+                (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
+                Lwt_io.write och (t.id ^ "\n") >>
+                Lwt_io.flush och >>
+                return (Some { id = dst_id; mgr = t; ich; och; closed = false })
+              with exn ->
+                Lwt_unix.close fd >>
+                raise_lwt exn
           with _ -> return_none
 
   open Oraft_proto
