@@ -46,6 +46,7 @@ sig
     ?election_period:float -> ?heartbeat_period:float ->
     (req_id * op) Oraft.Core.state -> conn_manager -> 'a server
 
+  val config  : _ server -> config
   val run     : _ server -> unit Lwt.t
   val abort   : _ server -> unit Lwt.t
   val execute : 'a server -> op -> 'a cmd_result Lwt.t

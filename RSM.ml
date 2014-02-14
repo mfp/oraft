@@ -210,6 +210,16 @@ struct
         exec          : 'a SS.server -> C.op -> [`OK of 'a | `Error of exn] Lwt.t;
       }
 
+  let raise_if_error = function
+      `OK x -> return x
+    | `Error s -> raise_lwt (Failure s)
+
+  let check_config_err = function
+    | `OK -> return ()
+    | `Error s -> raise_lwt (Failure s)
+    | `Cannot_change -> raise_lwt (Failure "Cannot perform config change")
+    | `Unsafe_change _ -> raise_lwt (Failure "Unsafe config change")
+
   let make exec addr ?join ?election_period ?heartbeat_period id =
     match join with
         None ->
@@ -226,21 +236,23 @@ struct
             return { id; addr; c = None; node_sockaddr; app_sockaddr; serv; exec; }
       | Some peer_addr ->
           let c = CC.make ~id () in
+            Lwt_log.info_f ~section "Connecting to %S" peer_addr >>
             CC.connect c ~addr:peer_addr >>
-            match_lwt CC.get_config c with
-                `Error s -> raise_lwt (Failure s)
-              | `OK config ->
-                  let state         = Oraft.Core.make
-                                        ~id ~current_term:0L ~voted_for:None
-                                        ~log:[] ~config () in
-                  let node_sockaddr = C.node_sockaddr addr in
-                  let app_sockaddr  = C.app_sockaddr addr in
-                  let conn_mgr      = SS.make_conn_manager ~id node_sockaddr in
-                  let serv          = SS.make exec ?election_period
-                                        ?heartbeat_period state conn_mgr
-                  in
-                    return { id; addr; c = Some c;
-                             node_sockaddr; app_sockaddr; serv; exec; }
+            lwt config        = CC.get_config c >>= raise_if_error in
+            lwt ()            = Lwt_log.info_f ~section
+                                  "Got initial configuration %s"
+                                  (Oraft_util.string_of_config config) in
+            let state         = Oraft.Core.make
+                                  ~id ~current_term:0L ~voted_for:None
+                                  ~log:[] ~config () in
+            let node_sockaddr = C.node_sockaddr addr in
+            let app_sockaddr  = C.app_sockaddr addr in
+            let conn_mgr      = SS.make_conn_manager ~id node_sockaddr in
+            let serv          = SS.make exec ?election_period
+                                  ?heartbeat_period state conn_mgr
+            in
+              return { id; addr; c = Some c;
+                       node_sockaddr; app_sockaddr; serv; exec; }
 
   let send_msg = send_msg Oraft_proto.Server_msg.write
   let read_msg = read_msg Oraft_proto.Client_msg.read
@@ -282,7 +294,16 @@ struct
         let config = SS.Config.get t.serv in
           send_msg och { id; response = Config config }
     | { id; op = Change_config x } ->
+        Lwt_log.info_f ~section
+          "Config change requested: %s"
+          (Extprot.Pretty_print.pp pp_config_change x) >>
         lwt response = perform_change t x in
+          Lwt_log.info_f ~section
+            "Config change result: %s"
+            (Extprot.Pretty_print.pp pp_response response) >>
+          Lwt_log.info_f ~section
+            "New config: %s"
+            (Oraft_util.string_of_config (SS.config t.serv)) >>
           send_msg och { id; response }
     | { id; op = Execute_RO op; } -> begin
         match_lwt SS.readonly_operation t.serv with
@@ -360,17 +381,14 @@ struct
           match t.c with
             | None -> accept_loop t
             | Some c ->
-                (* (1) add ourselves as failover *)
-                match_lwt CC.change_config c (Add_failover (t.id, t.addr)) with
-                    `Cannot_change | `Unsafe_change _ | `Error _ ->
-                        Lwt_log.error_f ~section "Failed to add ourselves as failover"
-                  | `OK ->
-                      (* (2) promote to active node *)
-                      match_lwt CC.change_config c (Promote t.id) with
-                          `Cannot_change | `Unsafe_change _ | `Error _ ->
-                              Lwt_log.error_f ~section
-                                "Failed to promote ourselves (id: %S)" t.id
-                        | `OK -> accept_loop t
+                Lwt_log.info_f ~section "Adding failover id:%S addr:%S" t.id t.addr >>
+                CC.change_config c (Add_failover (t.id, t.addr)) >>= check_config_err >>
+                Lwt_log.info_f ~section "Promoting failover id:%S" t.id >>
+                CC.change_config c (Promote t.id) >>= check_config_err >>
+                lwt config = CC.get_config c >>= raise_if_error in
+                  Lwt_log.info_f ~section "New config: %s"
+                    (Oraft_util.string_of_config config) >>
+                accept_loop t
         finally
           (* FIXME: t.c client shutdown *)
           Lwt_unix.close sock

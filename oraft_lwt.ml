@@ -60,6 +60,7 @@ sig
     ?election_period:float -> ?heartbeat_period:float ->
     (req_id * op) Oraft.Core.state -> conn_manager -> 'a server
 
+  val config  : _ server -> config
   val run     : _ server -> unit Lwt.t
   val abort   : _ server -> unit Lwt.t
   val execute : 'a server -> op -> 'a cmd_result Lwt.t
@@ -303,6 +304,8 @@ struct
           Lwt_log.error_f ~exn ~section "Error in Oraft_lwt apply loop."
       end;
       t
+
+  let config t = Core.config t.state
 
   let abort t =
     if not t.running then
