@@ -323,9 +323,8 @@ struct
   let unschedule_heartbeat t node =
     node.next_heartbeat <- None
 
-  let send_cmd t node_id cmd =
-    ignore (Event_queue.schedule t.ev_queue
-              200L node_id (Command cmd))
+  let send_cmd t ?(dt=200L) node_id cmd =
+    ignore (Event_queue.schedule t.ev_queue dt node_id (Command cmd))
 
   let must_account time node = function
       Election_timeout -> begin match node.next_election with
@@ -457,8 +456,8 @@ struct
         ?(verbose = false) ?string_of_cmd ~msg_loss_rate
         ~on_apply ~take_snapshot ~install_snapshot ?(steps = max_int) t =
 
-    let send_cmd ?(dst = random_node_id t) cmd =
-      send_cmd t dst cmd in
+    let send_cmd ?(dst = random_node_id t) ?dt cmd =
+      send_cmd ?dt t dst cmd in
 
     let fail_sim  = FAILURE_SIMULATOR.make
                       ~verbose ~msg_loss_rate ~period:1000 t.rng in
@@ -587,8 +586,15 @@ struct
             send_cmd ~dst:leader cmd
         | Redirect (None, cmd) ->
             if verbose then printf " Redirect\n";
-            (* send to a random server *)
-            send_cmd cmd
+            (* Send to a random server. *)
+            (* We use a large redirection delay to speed up the simulation:
+             * otherwise, most of the time is spent simulating redirections,
+             * since there's no time to elect a new leader before the next
+             * attempt. This makes sense in practice too, because when you
+             * know there's no leader, you don't want to retry until you're
+             * confident there's one --- and it's assumed the election period
+             * is picked suitably to the network performance. *)
+            send_cmd ~dt:CLOCK.(t.election_period / 2L) cmd
         | Reset_election_timeout ->
             if verbose then printf " Reset_election_timeout\n";
             unschedule_election t node;
@@ -684,22 +690,19 @@ struct
   let to_list (_, l) = List.rev l
 end
 
-let run ?(seed = 2) ?(verbose=false) () =
+let run
+      ?(seed = 2)
+      ~num_nodes ?(num_cmds = 100_000)
+      ~election_period ~heartbeat_period ~rtt ~msg_loss_rate
+      ?(verbose=false) () =
   let module S = Set.Make(String) in
 
   let completed = ref S.empty in
-  let num_nodes = 3 in
-  let num_cmds  = 100_000 in
   let init_cmd  = 1 in
   let last_sent = ref init_cmd in
   let ev_queue  = DES.Event_queue.create () in
 
-  let election_period  = 800L in
-  let heartbeat_period = 200L in
-  let rtt              = 50L in
-  let msg_loss_rate    = 0.01 in
-  let batch_size       = 20 in
-
+  let batch_size   = 20 in
   let retry_period = CLOCK.(4L * election_period) in
 
   let applied = BatBitSet.create (2 * num_cmds) (* work around BatBitSet bug *) in
@@ -717,7 +720,7 @@ let run ?(seed = 2) ?(verbose=false) () =
 
     let f _  =
       if not (BatBitSet.mem applied cmd) then
-        schedule 100L (DES.random_node_id des) cmd in
+        schedule election_period (DES.random_node_id des) cmd in
 
     let _    = DES.Event_queue.schedule ev_queue
                  CLOCK.(dt + retry_period)
@@ -828,9 +831,27 @@ let run ?(seed = 2) ?(verbose=false) () =
         exit 1;
       end
 
+let params =
+  [|
+    800L,   200L, 50L, 0.01;
+    4000L,  200L, 50L, 0.20;
+    8000L,  200L, 50L, 0.50;
+    40000L, 200L, 50L, 0.60;
+    (* 40000L, 200L, 50L, 0.70; *)
+  |]
+
+let random rng a = a.(RND.int rng (Array.length a))
+
 let () =
   for i = 1 to 100 do
-    print_endline "";
-    printf "Running with seed %d\n%!" i;
-    run ~seed:i ~verbose:false ()
+    let rng       = RND.make [| i |] in
+    let num_nodes = 1 + RND.int rng 5 in
+    let election_period, heartbeat_period, rtt, msg_loss_rate = random rng params in
+      print_endline (String.make 78 '=');
+      printf "seed:%d num_nodes:%d election:%Ld heartbeat:%Ld rtt:%Ld loss:%.4f\n%!"
+        i num_nodes election_period heartbeat_period rtt msg_loss_rate;
+      run ~seed:i ~verbose:false
+        ~num_nodes ~election_period ~heartbeat_period ~rtt ~msg_loss_rate
+        ();
+      print_endline "";
   done
