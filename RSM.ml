@@ -346,6 +346,49 @@ struct
             request_loop t client_id ich och
         | { id; _ } -> send_msg och { id; response = Error "Bad request" }
 
+  let is_in_config t config =
+    let all = match config with
+      | Simple_config (a, p) -> a @ p
+      | Joint_config (a1, a2, p) -> a1 @ a2 @ p
+    in
+      List.mem_assoc t.id all
+
+  let is_active t config =
+    let active = match config with
+      | Simple_config (a, _) -> a
+      | Joint_config (a1, a2, _) -> a1 @ a2
+    in
+      List.mem_assoc t.id active
+
+  let add_as_failover_if_needed t c config =
+    if is_in_config t config then
+      return ()
+    else begin
+      Lwt_log.info_f ~section "Adding failover id:%S addr:%S" t.id t.addr >>
+      CC.change_config c (Add_failover (t.id, t.addr)) >>= check_config_err
+    end
+
+  let promote_if_needed t c config =
+    if is_active t config then
+      return ()
+    else begin
+      Lwt_log.info_f ~section "Promoting failover id:%S" t.id >>
+      CC.change_config c (Promote t.id) >>= check_config_err
+    end
+
+  let join_cluster t c =
+    (* We only try to add as failover/promote if actually needed.
+     * Otherwise, we could get blocked in situations were the node is
+     * rejoining the cluster (and thus already active in its configuration)
+     * and the remaining nodes do not have the quorum to perform a
+     * configuration change (even if it'd eventually be a NOP). *)
+    lwt config = CC.get_config c >>= raise_if_error in
+      add_as_failover_if_needed t c config >>
+      promote_if_needed t c config >>
+      lwt config = CC.get_config c >>= raise_if_error in
+        Lwt_log.info_f ~section "Final config: %s"
+          (Oraft_util.string_of_config config)
+
   let run t =
     let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr t.app_sockaddr)
                            Unix.SOCK_STREAM 0)
@@ -380,15 +423,7 @@ struct
         try_lwt
           match t.c with
             | None -> accept_loop t
-            | Some c ->
-                Lwt_log.info_f ~section "Adding failover id:%S addr:%S" t.id t.addr >>
-                CC.change_config c (Add_failover (t.id, t.addr)) >>= check_config_err >>
-                Lwt_log.info_f ~section "Promoting failover id:%S" t.id >>
-                CC.change_config c (Promote t.id) >>= check_config_err >>
-                lwt config = CC.get_config c >>= raise_if_error in
-                  Lwt_log.info_f ~section "New config: %s"
-                    (Oraft_util.string_of_config config) >>
-                accept_loop t
+            | Some c -> join_cluster t c >> accept_loop t
         finally
           (* FIXME: t.c client shutdown *)
           Lwt_unix.close sock
