@@ -1089,6 +1089,8 @@ struct
         snapshot_transfers = RS.empty;
       }
 
+  let is_single_node_cluster t = CONFIG.is_alone t.config
+
   let leader_id (s : _ state) = s.leader_id
 
   let id s     = s.id

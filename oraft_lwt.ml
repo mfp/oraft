@@ -623,13 +623,16 @@ struct
               | Redirect _ -> execute t cmd)
 
   let rec readonly_operation t =
-    exec_aux t
-      (fun t ->
-         let th, u = Lwt.task () in
-           t.push_ro_op u;
-           match_lwt th with
-               OK -> return `OK
-             | Retry -> readonly_operation t)
+    if Core.is_single_node_cluster t.state then
+      return `OK
+    else
+      exec_aux t
+        (fun t ->
+           let th, u = Lwt.task () in
+             t.push_ro_op u;
+             match_lwt th with
+                 OK -> return `OK
+               | Retry -> readonly_operation t)
 
   let compact_log t index =
     t.state <- Core.compact_log index t.state

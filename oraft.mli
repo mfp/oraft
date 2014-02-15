@@ -92,6 +92,8 @@ sig
     log:(index * 'a entry * term) list ->
     config:config -> unit -> 'a state
 
+  val is_single_node_cluster : 'a state -> bool
+
   val leader_id : 'a state -> rep_id option
   val id        : 'a state -> rep_id
   val status    : 'a state -> status
