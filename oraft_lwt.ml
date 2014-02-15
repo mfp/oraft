@@ -751,7 +751,8 @@ struct
 
   type op = C.op
 
-  module M = Map.Make(String)
+  module M  = Map.Make(String)
+  module MB = Extprot.Msg_buffer
 
   let section = Lwt_log.Section.make "oraft_lwt.io"
 
@@ -770,6 +771,8 @@ struct
       ich            : Lwt_io.input_channel;
       och            : Lwt_io.output_channel;
       mutable closed : bool;
+      mutable in_buf : string;
+      out_buf        : MB.t;
     }
 
 
@@ -789,7 +792,11 @@ struct
             let ich = Lwt_io.of_fd Lwt_io.input fd in
             let och = Lwt_io.of_fd Lwt_io.output fd in
             lwt id  = Lwt_io.read_line ich in
-              t.conns <- M.add id { id; mgr = t; ich; och; closed = false; } t.conns;
+            let c   = { id; mgr = t; ich; och; closed = false;
+                        in_buf = ""; out_buf = MB.create ();
+                      }
+            in
+              t.conns <- M.add id c t.conns;
               Lwt_condition.broadcast t.conn_signal ();
               Lwt_log.info_f ~section "Incoming connection from peer %S" id
           with _ ->
@@ -830,7 +837,8 @@ struct
                 (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
                 Lwt_io.write och (t.id ^ "\n") >>
                 Lwt_io.flush och >>
-                return (Some { id = dst_id; mgr = t; ich; och; closed = false })
+                return (Some { id = dst_id; mgr = t; ich; och; closed = false;
+                               in_buf = ""; out_buf = MB.create (); })
               with exn ->
                 Lwt_unix.close fd >>
                 raise_lwt exn
@@ -900,14 +908,16 @@ struct
     if c.closed then return ()
     else begin
       let wrapped = wrap_msg msg in
-      let payload = EC.serialize Raft_message.write wrapped in
         Lwt_log.debug_f ~section
           "Sending\n%s" (Extprot.Pretty_print.pp pp_raft_message wrapped) >>
         try_lwt
           Lwt_io.atomic
             (fun och ->
-               Lwt_io.LE.write_int och (String.length payload) >>
-               Lwt_io.write och payload)
+               MB.clear c.out_buf;
+               Raft_message.write c.out_buf wrapped;
+               Lwt_io.LE.write_int och (MB.length c.out_buf) >>
+               Lwt_io.write_from_exactly
+                 och (MB.unsafe_contents c.out_buf) 0 (MB.length c.out_buf))
             c.och
         with exn ->
           lwt () = Lwt_log.info_f ~section ~exn
@@ -917,24 +927,26 @@ struct
     end
 
   let receive c =
-    try_lwt
-      Lwt_io.atomic
-        (fun ich ->
-           lwt len = Lwt_io.LE.read_int ich in
-           let s   = String.create len in
-           lwt ()  = Lwt_io.read_into_exactly ich s 0 len in
-           let msg = EC.deserialize Raft_message.read s in
-             Lwt_log.debug_f ~section
-               "Received\n%s"
-               (Extprot.Pretty_print.pp pp_raft_message msg) >>
-             return (Some (unwrap_msg msg)))
-        c.ich
-    with exn ->
-      lwt () = Lwt_log.info_f ~section ~exn
-                 "Error on receive from %S, closing connection" c.id
-      in
-        abort c >>
-        return None
+    if c.closed then
+      return None
+    else
+      try_lwt
+        Lwt_io.atomic
+          (fun ich ->
+             lwt len = Lwt_io.LE.read_int ich in
+               if String.length c.in_buf < len then c.in_buf <- String.create len;
+               lwt ()  = Lwt_io.read_into_exactly ich c.in_buf 0 len in
+               let msg = EC.deserialize Raft_message.read c.in_buf in
+                 Lwt_log.debug_f ~section
+                   "Received\n%s" (Extprot.Pretty_print.pp pp_raft_message msg) >>
+                 return (Some (unwrap_msg msg)))
+          c.ich
+      with exn ->
+        lwt () = Lwt_log.info_f ~section ~exn
+                   "Error on receive from %S, closing connection" c.id
+        in
+          abort c >>
+          return None
 
   type snapshot_transfer = unit
 

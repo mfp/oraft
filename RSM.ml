@@ -8,23 +8,34 @@ let section = Lwt_log.Section.make "RSM"
 module Map     = BatMap
 module Hashtbl = BatHashtbl
 
+module MB = Extprot.Msg_buffer
+
+let out_bufs = Lwt_pool.create 16384 (fun () -> return (MB.create ()))
+let in_bufs  = Lwt_pool.create 16384 (fun () -> return (ref ""))
+
 let send_msg write och msg =
-  let s = Extprot.Conv.serialize write msg in
-    Lwt_io.atomic
-      (fun och ->
-         Lwt_io.LE.write_int och (String.length s) >>
-         Lwt_io.write och s >>
-         Lwt_io.flush och)
-      och
+  Lwt_pool.use out_bufs
+    (fun buf ->
+       Lwt_io.atomic
+         (fun och ->
+            MB.clear buf;
+            write buf msg;
+            Lwt_io.LE.write_int och (MB.length buf) >>
+            Lwt_io.write_from_exactly
+              och (MB.unsafe_contents buf) 0  (MB.length buf) >>
+            Lwt_io.flush och)
+         och)
 
 let read_msg read ich =
-  Lwt_io.atomic
-    (fun ich ->
-       lwt len = Lwt_io.LE.read_int ich in
-       let s   = String.create len in
-         Lwt_io.read_into_exactly ich s 0 len >>
-         return (Extprot.Conv.deserialize read s))
-    ich
+  Lwt_pool.use in_bufs
+    (fun buf ->
+      Lwt_io.atomic
+        (fun ich ->
+           lwt len = Lwt_io.LE.read_int ich in
+             if String.length !buf < len then buf := String.create len;
+             Lwt_io.read_into_exactly ich !buf 0 len >>
+             return (Extprot.Conv.deserialize read !buf))
+        ich)
 
 type config_change =
     Oraft_proto.Config_change.config_change =
