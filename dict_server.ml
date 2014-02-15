@@ -86,10 +86,37 @@ let client_op ~addr op =
         `OK s -> printf "+OK %s\n" s; return ()
       | `Error s -> printf "-ERR %s\n" s; return ()
 
+let ro_benchmark ?(iterations = 10_000) ~addr () =
+  let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
+    CLIENT.connect c ~addr >>
+    CLIENT.execute c (Set ("bm", "0")) >>
+    let t0 = Unix.gettimeofday () in
+      for_lwt i = 1 to iterations do
+        lwt _ = CLIENT.execute_ro c (Get "bm") in
+          return_unit
+      done >>
+      let dt = Unix.gettimeofday () -. t0 in
+        printf "%.0f RO ops/s\n" (float iterations /. dt);
+        return ()
+
+let wr_benchmark ?(iterations = 10_000) ~addr () =
+  let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
+    CLIENT.connect c ~addr >>
+    let t0 = Unix.gettimeofday () in
+      for_lwt i = 1 to iterations do
+        lwt _ = CLIENT.execute c (Set ("bm", "")) in
+          return_unit
+      done >>
+      let dt = Unix.gettimeofday () -. t0 in
+        printf "%.0f WR ops/s\n" (float iterations /. dt);
+        return ()
+
 let mode         = ref `Help
 let cluster_addr = ref None
 let k            = ref None
 let v            = ref None
+let ro_bm_iters  = ref 0
+let wr_bm_iters  = ref 0
 
 let specs =
   Arg.align
@@ -99,9 +126,11 @@ let specs =
       "-join", Arg.String (fun p -> cluster_addr := Some p),
         "ADDR Join cluster at given address";
       "-client", Arg.String (fun addr -> mode := `Client addr), "ADDR Client mode";
-      "-key", Arg.String (fun s -> k := Some s), "STRING Get/set specified key";
+      "-key", Arg.String (fun s -> k := Some s), "STRING Wait for key/set it";
       "-value", Arg.String (fun s -> v := Some s),
         "STRING Set key given in -key to STRING";
+      "-ro_bm", Arg.Set_int ro_bm_iters, "N Run RO benchmark (N iterations)";
+      "-wr_bm", Arg.Set_int wr_bm_iters, "N Run WR benchmark (N iterations)";
     ]
 
 let usage () =
@@ -115,6 +144,14 @@ let () =
     | `Master addr ->
         Lwt_unix.run (run_server ~addr ?join:!cluster_addr ~id:addr ())
     | `Client addr ->
+        printf "Launching client %d\n" (Unix.getpid ());
+        if !ro_bm_iters > 0 then
+          Lwt_unix.run (ro_benchmark ~iterations:!ro_bm_iters ~addr ());
+        if !wr_bm_iters > 0 then
+          Lwt_unix.run (wr_benchmark ~iterations:!wr_bm_iters ~addr ());
+
+        if !ro_bm_iters > 0 || !wr_bm_iters > 0 then exit 0;
+
         match !k, !v with
             None, None | None, _ -> usage ()
           | Some k, Some v ->
