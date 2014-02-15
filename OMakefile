@@ -36,7 +36,7 @@ LIBS     = $(OCamlLibrary oraft, $(OBJECTS))
 section
     OCAML_LIBS = oraft
     PROGRAMS = $(OCamlProgram test_DES, oraft test_DES) \
-               $(OCamlProgram dict_server, dict_server)
+               $(OCamlProgram dict, dict)
     .DEFAULT: $(PROGRAMS)
 
 %.sig: %.ml %.cmo

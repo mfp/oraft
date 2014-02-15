@@ -19,6 +19,6 @@ OMake*.omc
 *.annot
 *.sig
 perf.data*
-/dict_server
+/dict
 /oraft_proto.ml
 /test_DES
