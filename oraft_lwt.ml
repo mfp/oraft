@@ -920,7 +920,8 @@ struct
                Raft_message.write c.out_buf wrapped;
                Lwt_io.LE.write_int och (MB.length c.out_buf) >>
                Lwt_io.write_from_exactly
-                 och (MB.unsafe_contents c.out_buf) 0 (MB.length c.out_buf))
+                 och (MB.unsafe_contents c.out_buf) 0 (MB.length c.out_buf) >>
+               Lwt_io.flush och)
             c.och
         with exn ->
           lwt () = Lwt_log.info_f ~section ~exn
