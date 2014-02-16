@@ -10,32 +10,40 @@ module Hashtbl = BatHashtbl
 
 module MB = Extprot.Msg_buffer
 
-let out_bufs = Lwt_pool.create 16384 (fun () -> return (MB.create ()))
-let in_bufs  = Lwt_pool.create 16384 (fun () -> return (ref ""))
+type 'a conn =
+    {
+      addr    : 'a;
+      ich     : Lwt_io.input_channel;
+      och     : Lwt_io.output_channel;
+      in_buf  : string ref;
+      out_buf : MB.t;
+    }
 
-let send_msg write och msg =
-  Lwt_pool.use out_bufs
-    (fun buf ->
-       Lwt_io.atomic
-         (fun och ->
-            MB.clear buf;
-            write buf msg;
-            Lwt_io.LE.write_int och (MB.length buf) >>
-            Lwt_io.write_from_exactly
-              och (MB.unsafe_contents buf) 0  (MB.length buf) >>
-            Lwt_io.flush och)
-         och)
+let send_msg write conn msg =
+  (* Since the buffers are private to the conn AND Lwt_io.atomic prevents
+   * concurrent IO operations, it's safe to reuse the buffer for a given
+   * channel across send_msg calls.  *)
+  Lwt_io.atomic
+    (fun och ->
+       let buf = conn.out_buf in
+         MB.clear buf;
+         write buf msg;
+         Lwt_io.LE.write_int och (MB.length buf) >>
+         Lwt_io.write_from_exactly
+           och (MB.unsafe_contents buf) 0  (MB.length buf) >>
+         Lwt_io.flush och)
+    conn.och
 
-let read_msg read ich =
-  Lwt_pool.use in_bufs
-    (fun buf ->
-      Lwt_io.atomic
-        (fun ich ->
-           lwt len = Lwt_io.LE.read_int ich in
-             if String.length !buf < len then buf := String.create len;
-             Lwt_io.read_into_exactly ich !buf 0 len >>
-             return (Extprot.Conv.deserialize read !buf))
-        ich)
+let read_msg read conn =
+  (* same as send_msg applies here regarding the buffers *)
+  Lwt_io.atomic
+    (fun ich ->
+       lwt len = Lwt_io.LE.read_int ich in
+       let buf = conn.in_buf in
+         if String.length !buf < len then buf := String.create len;
+         Lwt_io.read_into_exactly ich !buf 0 len >>
+         return (Extprot.Conv.deserialize read !buf))
+    conn.ich
 
 type config_change =
     Oraft_proto.Config_change.config_change =
@@ -74,15 +82,13 @@ struct
   type t =
       {
         id             : string;
-        mutable dst    : conn option;
-        mutable conns  : conn M.t;
+        mutable dst    : address conn option;
+        mutable conns  : address conn M.t;
         mutable req_id : Int64.t;
         pending_reqs   : response Lwt.u H.t;
       }
 
   and address = string
-
-  and conn = address * Lwt_io.input_channel * Lwt_io.output_channel
 
   let make ~id () =
     { id; dst = None; conns = M.empty; req_id = 0L; pending_reqs = H.create 13; }
@@ -91,57 +97,70 @@ struct
     t.req_id <- Int64.succ t.req_id;
     t.req_id
 
-  let send_msg = send_msg Oraft_proto.Client_msg.write
-  let read_msg = read_msg Oraft_proto.Server_msg.read
+  let send_msg conn msg = send_msg Oraft_proto.Client_msg.write conn msg
+  let read_msg conn     = read_msg Oraft_proto.Server_msg.read conn
 
-  let connect t peer_id address =
+  let connect t peer_id addr =
     let do_connect () =
-      lwt fd, ich, och = Oraft_lwt.open_connection
-                           (C.app_sockaddr address)
-      in
+      lwt fd, ich, och = Oraft_lwt.open_connection (C.app_sockaddr addr) in
+      let out_buf      = MB.create () in
+      let in_buf       = ref "" in
+      let conn         = { addr; ich; och; in_buf; out_buf } in
         (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
         (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
         try_lwt
-          send_msg och { id = 0L; op = (Connect t.id) } >>
-          match_lwt read_msg ich with
+          send_msg conn { id = 0L; op = (Connect t.id) } >>
+          match_lwt read_msg conn with
             | { response = OK id; _ } ->
-                let conn = (address, ich, och) in
-                  t.conns <- M.add id conn t.conns;
-                  t.dst <- Some conn;
-                  ignore begin
-                    let rec loop_recv () =
-                      lwt { id; response } = read_msg ich in
-                        match H.Exceptionless.find t.pending_reqs id with
-                            None -> loop_recv ()
-                          | Some u ->
-                              Lwt.wakeup_later u response;
-                              loop_recv ()
-                    in loop_recv ()
-                  end;
-                  return ()
+                t.conns <- M.add id conn t.conns;
+                t.dst <- Some conn;
+                ignore begin
+                  let rec loop_recv () =
+                    lwt msg = read_msg conn in
+                      Lwt_log.debug_f ~section
+                        "Received from server\n%s"
+                        (Extprot.Pretty_print.pp Oraft_proto.Server_msg.pp msg) >>
+                      match H.Exceptionless.find t.pending_reqs msg.id with
+                          None -> loop_recv ()
+                        | Some u ->
+                            Lwt.wakeup_later u msg.response;
+                            loop_recv ()
+                  in
+                    try_lwt
+                      loop_recv ()
+                    finally
+                      t.conns <- M.remove peer_id t.conns;
+                      Lwt_io.abort och
+                end;
+                return ()
             | _ -> failwith "conn refused"
         with _ ->
           t.conns <- M.remove peer_id t.conns;
           Lwt_io.abort och
     in
       match M.Exceptionless.find peer_id t.conns with
-          Some ((addr, _, _) as conn) when addr = address ->
+          Some conn when conn.addr = addr ->
             t.dst <- Some conn;
             return ()
-        | Some (addr, _, och) (* when addr <> address *) ->
-            Lwt_io.abort och >> do_connect ()
+        | Some conn (* when addr <> address *) ->
+            t.conns <- M.remove peer_id t.conns;
+            Lwt_io.abort conn.och >> do_connect ()
         | None -> do_connect ()
 
   let send_and_await_response t op f =
     match t.dst with
         None -> raise_lwt Not_connected
-      | Some (dst, _, och) ->
+      | Some c ->
           let th, u = Lwt.task () in
           let id    = gen_id t in
+          let msg   = { id; op; } in
             H.add t.pending_reqs id u;
-            send_msg och { id; op; } >>
+            Lwt_log.debug_f ~section
+              "Sending to server\n%s"
+              (Extprot.Pretty_print.pp Oraft_proto.Client_msg.pp msg) >>
+            send_msg c msg >>
             lwt x = th in
-              f dst x
+              f c.addr x
 
   let rec do_execute t op =
     send_and_await_response t op
@@ -268,8 +287,8 @@ struct
               return { id; addr; c = Some c;
                        node_sockaddr; app_sockaddr; serv; exec; }
 
-  let send_msg = send_msg Oraft_proto.Server_msg.write
-  let read_msg = read_msg Oraft_proto.Client_msg.read
+  let send_msg conn msg = send_msg Oraft_proto.Server_msg.write conn msg
+  let read_msg conn     = read_msg Oraft_proto.Client_msg.read conn
 
   let map_op_result = function
     | `Redirect (peer_id, addr) -> Redirect (peer_id, addr)
@@ -301,12 +320,12 @@ struct
           (Extprot.Pretty_print.pp pp_config_change op) >>
         return (Error (Printexc.to_string exn))
 
-  let process_message t client_id och = function
+  let process_message t client_id conn = function
       { id; op = Connect _ } ->
-        send_msg och { id; response = Error "Unexpected request" }
+        send_msg conn { id; response = Error "Unexpected request" }
     | { id; op = Get_config } ->
         let config = SS.Config.get t.serv in
-          send_msg och { id; response = Config config }
+          send_msg conn { id; response = Config config }
     | { id; op = Change_config x } ->
         Lwt_log.info_f ~section
           "Config change requested: %s"
@@ -318,23 +337,23 @@ struct
           Lwt_log.info_f ~section
             "New config: %s"
             (Oraft_util.string_of_config (SS.config t.serv)) >>
-          send_msg och { id; response }
+          send_msg conn { id; response }
     | { id; op = Execute_RO op; } -> begin
         match_lwt SS.readonly_operation t.serv with
           | `Redirect _ | `Retry | `Error _ as x ->
               let response = map_op_result x in
-                send_msg och { id; response; }
+                send_msg conn { id; response; }
           | `OK ->
               match t.exec t.serv (C.op_of_string op) with
                 | `Sync resp ->
                     lwt resp = resp in
-                      send_msg och { id; response = map_op_result resp }
+                      send_msg conn { id; response = map_op_result resp }
                 | `Async resp ->
                     ignore begin try_lwt
                       lwt resp = try_lwt resp
                                  with exn -> return (`Error exn)
                       in
-                        send_msg och { id; response = map_op_result resp }
+                        send_msg conn { id; response = map_op_result resp }
                     with _ ->
                       return ()
                     end;
@@ -342,34 +361,35 @@ struct
       end
     | { id; op = Execute op; } ->
         lwt response = SS.execute t.serv (C.op_of_string op) >|= map_op_result in
-          send_msg och { id; response }
+          send_msg conn { id; response }
 
-  let rec request_loop t client_id ich och =
-    lwt msg = read_msg ich in
+  let rec request_loop t client_id conn =
+    lwt msg = read_msg conn in
       ignore begin
         try_lwt
-          process_message t client_id och msg
+          process_message t client_id conn msg
         with exn ->
           Lwt_log.debug_f ~section ~exn
             "Error while processing message\n%s"
             (Extprot.Pretty_print.pp Oraft_proto.Client_msg.pp msg) >>
-          send_msg och { id = msg.id; response = Error (Printexc.to_string exn) }
+          send_msg conn { id = msg.id; response = Error (Printexc.to_string exn) }
       end;
-      request_loop t client_id ich och
+      request_loop t client_id conn
 
-  let dispatch t fd =
+  let dispatch t fd addr =
     (* the following are not supported for ADDR_UNIX sockets, so catch *)
     (* possible exceptions  *)
     (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
     (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-    let ich = Lwt_io.of_fd Lwt_io.input fd in
-    let och = Lwt_io.of_fd Lwt_io.output fd in
-      match_lwt read_msg ich with
+    let ich  = Lwt_io.of_fd Lwt_io.input fd in
+    let och  = Lwt_io.of_fd Lwt_io.output fd in
+    let conn = { addr; ich; och; in_buf = ref ""; out_buf = MB.create () } in
+      match_lwt read_msg conn with
         | { id; op = Connect client_id; _ } ->
             Lwt_log.info_f ~section "Incoming client connection from %S" client_id >>
-            send_msg och { id; response = OK "" } >>
-            request_loop t client_id ich och
-        | { id; _ } -> send_msg och { id; response = Error "Bad request" }
+            send_msg conn { id; response = OK "" } >>
+            request_loop t client_id conn
+        | { id; _ } -> send_msg conn { id; response = Error "Bad request" }
 
   let is_in_config t config =
     let all = match config with
@@ -426,7 +446,7 @@ struct
         lwt (fd, addr) = Lwt_unix.accept sock in
           ignore
             begin try_lwt
-              dispatch t fd
+              dispatch t fd addr
             with exn ->
               begin match exn with
                   End_of_file
