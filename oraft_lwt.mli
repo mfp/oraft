@@ -17,6 +17,8 @@ sig
   val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
 
+  val is_saturated : connection -> bool
+
   type snapshot_transfer
 
   val prepare_snapshot :

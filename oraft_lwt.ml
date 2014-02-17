@@ -31,6 +31,8 @@ sig
   val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
 
+  val is_saturated : connection -> bool
+
   type snapshot_transfer
 
   val prepare_snapshot :
@@ -471,7 +473,9 @@ struct
         (* TODO: limit the number of msgs in outboung queue.
          * Drop after the nth? *)
         ignore begin try_lwt
-          IO.send (RM.find rep_id t.conns) msg
+          let c = RM.find rep_id t.conns in
+            if IO.is_saturated c then return_unit
+            else IO.send c msg
         with _ ->
           (* cannot send -- partition *)
           return ()
@@ -782,6 +786,7 @@ struct
       mutable closed : bool;
       mutable in_buf : string;
       out_buf        : MB.t;
+      mutable noutgoing : int;
     }
 
 
@@ -803,6 +808,7 @@ struct
             lwt id  = Lwt_io.read_line ich in
             let c   = { id; mgr = t; ich; och; closed = false;
                         in_buf = ""; out_buf = MB.create ();
+                        noutgoing = 0;
                       }
             in
               t.conns <- M.add id c t.conns;
@@ -847,11 +853,14 @@ struct
                 Lwt_io.write och (t.id ^ "\n") >>
                 Lwt_io.flush och >>
                 return (Some { id = dst_id; mgr = t; ich; och; closed = false;
-                               in_buf = ""; out_buf = MB.create (); })
+                               in_buf = ""; out_buf = MB.create ();
+                               noutgoing = 0; })
               with exn ->
                 Lwt_unix.close fd >>
                 raise_lwt exn
           with _ -> return_none
+
+  let is_saturated conn = conn.noutgoing > 10
 
   open Oraft_proto
   open Raft_message
@@ -920,6 +929,7 @@ struct
         Lwt_log.debug_f ~section
           "Sending\n%s" (Extprot.Pretty_print.pp pp_raft_message wrapped) >>
         try_lwt
+          c.noutgoing <- c.noutgoing + 1;
           Lwt_io.atomic
             (fun och ->
                MB.clear c.out_buf;
@@ -934,6 +944,9 @@ struct
                      "Error on send to %s, closing connection" c.id
           in
             abort c
+        finally
+          c.noutgoing <- c.noutgoing - 1;
+          return_unit
     end
 
   let receive c =
