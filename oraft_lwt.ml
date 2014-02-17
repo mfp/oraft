@@ -216,7 +216,7 @@ struct
 
   let make
         execute
-        ?(election_period = 2.)
+        ?(election_period = 0.5)
         ?(heartbeat_period = election_period /. 2.) state conn_manager =
     let msg_stream, p     = Lwt_stream.create () in
     let push_msg x        = p (Some x) in
