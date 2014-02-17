@@ -664,7 +664,8 @@ let receive_msg s peer = function
                 (s, [Become_follower None; Send (peer, addr, vote_result s false)])
               else
                 let s = { s with voted_for = Some candidate_id } in
-                  (s, [Become_follower None; Send (peer, addr, vote_result s true)])
+                  (s, [Become_follower (Some candidate_id);
+                       Send (peer, addr, vote_result s true)])
         end
 
   | Request_vote { term; candidate_id; last_log_index; last_log_term; } -> begin
