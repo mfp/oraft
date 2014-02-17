@@ -428,21 +428,27 @@ struct
                         return Heartbeat_timeout);
         return ()
     | Become_candidate
-    | Become_follower None ->
+    | Become_follower None as ev ->
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         t.heartbeat <- fst (Lwt.wait ());
+        Lwt_log.info_f ~section "Becoming %s"
+          (match ev with
+             | Become_candidate -> "candidate"
+             | _ -> "follower (unknown leader)") >>
         exec_action t Reset_election_timeout
-    | Become_follower (Some _) ->
+    | Become_follower (Some id) ->
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         Lwt_condition.broadcast t.leader_signal ();
         t.heartbeat <- fst (Lwt.wait ());
+        Lwt_log.info_f ~section "Becoming follower leader:%S" id >>
         exec_action t Reset_election_timeout
     | Become_leader ->
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         Lwt_condition.broadcast t.leader_signal ();
+        Lwt_log.info_f ~section "Becoming leader" >>
         exec_action t Reset_election_timeout >>
         exec_action t Reset_heartbeat
     | Changed_config ->
