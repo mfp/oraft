@@ -980,22 +980,31 @@ let client_command x s = match s.state with
       let log        = LOG.append ~term:s.current_term (Op x) s.log in
       let s, actions =
         CONFIG.peers s.config |>
+        (* We update next_index to be past the last entry we send to each
+         * peer. This way, we don't send entries repeatedly to a peer when we
+         * get several commands before the peer has ACKed them. *)
         List.fold_left
-          (fun (s, actions) (peer, addr) ->
-             let idx =
-               try RM.find peer s.next_index
-               with Not_found -> LOG.last_index s.log |> snd
-             in
+          (fun (s, next_index, actions) (peer, addr) ->
+             let next       = LOG.last_index s.log |> snd |> Int64.succ in
+             let idx        = try RM.find peer s.next_index with Not_found -> next in
+             let next_index = RM.add peer next s.next_index in
                match send_entries_or_snapshot s peer idx with
                    Snapshot ->
                      (* must send snapshot if cannot send log *)
                      let transfers = RS.add peer s.snapshot_transfers in
                      let s         = { s with snapshot_transfers = transfers } in
                      let config    = CONFIG.last_commit s.config in
-                       (s, Send_snapshot (peer, addr, idx, config) :: actions)
-                 | Snapshot_in_progress -> (s, actions)
-                 | Send_entries msg -> (s, Send (peer, addr, msg) :: actions))
-          ({ s with log }, []) in
+                     let actions   = Send_snapshot (peer, addr, idx, config) ::
+                                     actions
+                     in (s, next_index, actions)
+                 | Snapshot_in_progress -> (s, next_index, actions)
+                 | Send_entries msg ->
+                     (* we don't update s with the new next_index directly
+                      * here so as to avoid making 1 copy per peer --- we'll
+                      * update at once after the fold *)
+                     (s, next_index, Send (peer, addr, msg) :: actions))
+          ({ s with log }, s.next_index, []) |>
+          (fun (s, next_index, actions) -> ({ s with next_index }, actions)) in
       let actions = match actions with
                       | [] -> []
                       | l -> Reset_heartbeat :: actions
