@@ -17,7 +17,7 @@ struct
   let string_of_op = function
       Get v -> "?" ^ v
     | Wait v -> "<" ^ v
-    | Set (k, v) -> sprintf "!%s=%s" k v
+    | Set (k, v) -> "!" ^ k ^ "=" ^ v
 
   let op_of_string s =
     if s = "" then failwith "bad op"
