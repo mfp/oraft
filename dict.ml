@@ -138,6 +138,7 @@ let usage () =
   exit 1
 
 let () =
+  ignore (Sys.set_signal Sys.sigpipe Sys.Signal_ignore);
   Arg.parse specs ignore "Usage:";
   match !mode with
       `Help -> usage ()
