@@ -219,7 +219,7 @@ struct
   let make
         execute
         ?(election_period = 0.5)
-        ?(heartbeat_period = election_period /. 2.) state conn_manager =
+        ?(heartbeat_period = election_period /. 4.) state conn_manager =
     let msg_stream, p     = Lwt_stream.create () in
     let push_msg x        = p (Some x) in
     let cmd_stream, p     = Lwt_stream.create () in
@@ -427,6 +427,10 @@ struct
         return ()
     | Reset_heartbeat ->
         t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period >>
+                        return Heartbeat_timeout);
+        return ()
+    | Reset_heartbeat_fast ->
+        t.heartbeat <- (Lwt_unix.sleep 0.001 >>
                         return Heartbeat_timeout);
         return ()
     | Become_candidate

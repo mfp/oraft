@@ -99,7 +99,7 @@ let ro_benchmark ?(iterations = 10_000) ~addr () =
         printf "%.0f RO ops/s\n" (float iterations /. dt);
         return ()
 
-let wr_benchmark ?(iterations = 10_000) ~addr () =
+let wr_benchmark_seq ?(iterations = 10_000) ~addr () =
   let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
     CLIENT.connect c ~addr >>
     let t0 = Unix.gettimeofday () in
@@ -107,6 +107,47 @@ let wr_benchmark ?(iterations = 10_000) ~addr () =
         lwt _ = CLIENT.execute c (Set ("bm", "")) in
           return_unit
       done >>
+      let dt = Unix.gettimeofday () -. t0 in
+        printf "%.0f WR ops/s\n" (float iterations /. dt);
+        return ()
+
+let max_concurrency = 2048
+
+let wr_benchmark_par ?(iterations = 10_000) ~addr () =
+  let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
+    CLIENT.connect c ~addr >>
+    let t0        = Unix.gettimeofday () in
+    let in_flight = ref 0 in
+    let to_send   = ref iterations in
+    let to_exec   = ref iterations in
+    let one_done  = Lwt_condition.create () in
+    let finished  = Lwt_condition.create () in
+
+    let rec write () =
+      while_lwt !in_flight < max_concurrency do
+        if !to_send >= 0 then begin
+          ignore begin
+            try_lwt
+              incr in_flight;
+              CLIENT.execute c (Set ("bm", ""))
+            finally
+              decr in_flight;
+              decr to_exec;
+              Lwt_condition.broadcast one_done ();
+              if !to_exec <= 0 then Lwt_condition.broadcast finished ();
+              return ()
+          end;
+          decr to_send;
+          return ()
+        end else begin
+          Lwt_condition.wait finished >>
+          raise_lwt Exit
+        end
+      done >>
+      Lwt_condition.wait one_done >>
+      write ()
+    in
+      (try_lwt write () with Exit -> return ()) >>
       let dt = Unix.gettimeofday () -. t0 in
         printf "%.0f WR ops/s\n" (float iterations /. dt);
         return ()
@@ -149,7 +190,7 @@ let () =
         if !ro_bm_iters > 0 then
           Lwt_unix.run (ro_benchmark ~iterations:!ro_bm_iters ~addr ());
         if !wr_bm_iters > 0 then
-          Lwt_unix.run (wr_benchmark ~iterations:!wr_bm_iters ~addr ());
+          Lwt_unix.run (wr_benchmark_par ~iterations:!wr_bm_iters ~addr ());
 
         if !ro_bm_iters > 0 || !wr_bm_iters > 0 then exit 0;
 

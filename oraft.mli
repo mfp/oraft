@@ -76,6 +76,7 @@ sig
     | Redirect of rep_id option * 'a
     | Reset_election_timeout
     | Reset_heartbeat
+    | Reset_heartbeat_fast
     | Send of rep_id * address * 'a message
     | Send_snapshot of rep_id * address * index * config
     | Stop

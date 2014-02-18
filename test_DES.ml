@@ -599,7 +599,8 @@ struct
             if verbose then printf " Reset_election_timeout\n";
             unschedule_election t node;
             schedule_election t node
-        | Reset_heartbeat ->
+        | Reset_heartbeat | Reset_heartbeat_fast
+            (* FIXME: shorter period for "fast" heartbeat *)->
             if verbose then printf " Reset_heartbeat\n";
             unschedule_heartbeat t node;
             schedule_heartbeat t node

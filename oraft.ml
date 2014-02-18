@@ -445,6 +445,7 @@ struct
     | Redirect of rep_id option * 'a
     | Reset_election_timeout
     | Reset_heartbeat
+    | Reset_heartbeat_fast
     | Send of rep_id * address * 'a message
     | Send_snapshot of rep_id * address * index * config
     | Stop
@@ -978,6 +979,7 @@ let client_command x s = match s.state with
         try_commit s
   | Leader ->
       let log        = LOG.append ~term:s.current_term (Op x) s.log in
+        (*
       let s, actions =
         CONFIG.peers s.config |>
         (* We update next_index to be past the last entry we send to each
@@ -1010,6 +1012,8 @@ let client_command x s = match s.state with
                       | l -> Reset_heartbeat :: actions
       in
         (s, actions)
+         *)
+        ({ s with log }, [Reset_heartbeat_fast])
 
 let install_snapshot ~last_term ~last_index ~config s = match s.state with
     Leader | Candidate -> (s, false)
