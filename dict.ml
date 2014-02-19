@@ -86,7 +86,7 @@ let client_op ~addr op =
         `OK s -> printf "+OK %s\n" s; return ()
       | `Error s -> printf "-ERR %s\n" s; return ()
 
-let ro_benchmark ?(iterations = 10_000) ~addr () =
+let ro_benchmark_seq ?(iterations = 10_000) ~addr () =
   let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
     CLIENT.connect c ~addr >>
     CLIENT.execute c (Set ("bm", "0")) >>
@@ -113,44 +113,55 @@ let wr_benchmark_seq ?(iterations = 10_000) ~addr () =
 
 let max_concurrency = 2048
 
+let par_run f c iterations =
+  let t0        = Unix.gettimeofday () in
+  let in_flight = ref 0 in
+  let to_send   = ref iterations in
+  let to_exec   = ref iterations in
+  let one_done  = Lwt_condition.create () in
+  let finished  = Lwt_condition.create () in
+
+  let rec loop () =
+    while_lwt !in_flight < max_concurrency do
+      if !to_send >= 0 then begin
+        ignore begin
+          try_lwt
+            incr in_flight;
+            f c
+          finally
+            decr in_flight;
+            decr to_exec;
+            Lwt_condition.broadcast one_done ();
+            if !to_exec <= 0 then Lwt_condition.broadcast finished ();
+            return ()
+        end;
+        decr to_send;
+        return ()
+      end else begin
+        Lwt_condition.wait finished >>
+        raise_lwt Exit
+      end
+    done >>
+    Lwt_condition.wait one_done >>
+    loop ()
+  in
+    (try_lwt loop () with Exit -> return ()) >>
+    return (Unix.gettimeofday () -. t0)
+
+let ro_benchmark_par ?(iterations = 10_000) ~addr () =
+  let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
+    CLIENT.connect c ~addr >>
+    CLIENT.execute c (Set ("bm", "0")) >>
+    lwt dt = par_run (fun c -> CLIENT.execute_ro c (Get "bm")) c iterations in
+      printf "%.0f RO ops/s\n" (float iterations /. dt);
+      return ()
+
 let wr_benchmark_par ?(iterations = 10_000) ~addr () =
   let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
     CLIENT.connect c ~addr >>
-    let t0        = Unix.gettimeofday () in
-    let in_flight = ref 0 in
-    let to_send   = ref iterations in
-    let to_exec   = ref iterations in
-    let one_done  = Lwt_condition.create () in
-    let finished  = Lwt_condition.create () in
-
-    let rec write () =
-      while_lwt !in_flight < max_concurrency do
-        if !to_send >= 0 then begin
-          ignore begin
-            try_lwt
-              incr in_flight;
-              CLIENT.execute c (Set ("bm", ""))
-            finally
-              decr in_flight;
-              decr to_exec;
-              Lwt_condition.broadcast one_done ();
-              if !to_exec <= 0 then Lwt_condition.broadcast finished ();
-              return ()
-          end;
-          decr to_send;
-          return ()
-        end else begin
-          Lwt_condition.wait finished >>
-          raise_lwt Exit
-        end
-      done >>
-      Lwt_condition.wait one_done >>
-      write ()
-    in
-      (try_lwt write () with Exit -> return ()) >>
-      let dt = Unix.gettimeofday () -. t0 in
-        printf "%.0f WR ops/s\n" (float iterations /. dt);
-        return ()
+    lwt dt = par_run (fun c -> CLIENT.execute c (Set ("bm", ""))) c iterations in
+      printf "%.0f WR ops/s\n" (float iterations /. dt);
+      return ()
 
 let mode         = ref `Help
 let cluster_addr = ref None
@@ -189,7 +200,7 @@ let () =
     | `Client addr ->
         printf "Launching client %d\n" (Unix.getpid ());
         if !ro_bm_iters > 0 then
-          Lwt_unix.run (ro_benchmark ~iterations:!ro_bm_iters ~addr ());
+          Lwt_unix.run (ro_benchmark_par ~iterations:!ro_bm_iters ~addr ());
         if !wr_bm_iters > 0 then
           Lwt_unix.run (wr_benchmark_par ~iterations:!wr_bm_iters ~addr ());
 
