@@ -180,6 +180,7 @@ let usage () =
 
 let () =
   ignore (Sys.set_signal Sys.sigpipe Sys.Signal_ignore);
+  ignore (Sys.set_signal Sys.sighup (Sys.Signal_handle (fun _ -> Gc.compact ())));
   Arg.parse specs ignore "Usage:";
   match !mode with
       `Help -> usage ()
