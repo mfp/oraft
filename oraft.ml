@@ -35,8 +35,11 @@ struct
     val status       : t -> [`Normal | `Joint]
     val target       : t -> (simple_config * passive_peers) option
 
-    (** Return whether we are the only active node in the latest config. *)
+    (** Return whether we are the only node in the latest config. *)
     val is_alone     : t -> bool
+
+    (** Return whether we are the only active node in the latest config. *)
+    val is_only_active : t -> bool
 
     (** Returns all peers (including passive). *)
     val peers        : t -> (rep_id * address) list
@@ -221,7 +224,10 @@ struct
     let peers { id; latest = (_, _, _, all); _ } =
       M.remove id all |> M.bindings
 
-    let is_alone { id; latest = (_, _, active, _); _ } =
+    let is_alone { id; latest = (_, _, _, all); _ } =
+      M.mem id all && (M.remove id all |> M.is_empty)
+
+    let is_only_active { id; latest = (_, _, active, _); _ } =
       M.mem id active && (M.remove id active |> M.is_empty)
 
     let address id { latest = (_, _, _, all); } =
@@ -895,9 +901,8 @@ let election_timeout s = match s.state with
     (* passive nodes do not trigger elections *)
   | _ when not (CONFIG.mem_active s.id s.config) -> (s, [Reset_election_timeout])
 
-  (* if we're the active only node in the cluster, win the elections right
-   * away *)
-  | Follower | Candidate when CONFIG.is_alone s.config ->
+  (* if we're the only active node in the cluster, we win the elections *)
+  | Follower | Candidate when CONFIG.is_only_active s.config ->
       let s = { s with current_term = Int64.succ s.current_term;
                        state        = Leader;
                        votes        = RS.singleton s.id;
@@ -910,7 +915,7 @@ let election_timeout s = match s.state with
               }
       in (s, [Become_leader])
 
-  | Leader when CONFIG.is_alone s.config ->
+  | Leader when CONFIG.is_only_active s.config ->
       (s, [Reset_election_timeout])
 
     (* we have the leader step down if it does not get any append_result
