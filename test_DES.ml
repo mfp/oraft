@@ -50,6 +50,7 @@ sig
     num_nodes:int ->
     election_period:CLOCK.t ->
     heartbeat_period:CLOCK.t ->
+    fast_heartbeat_period:CLOCK.t ->
     rtt:CLOCK.t ->
     (unit -> 'app_state) -> ('op, 'app_state, 'snapshot) t
 
@@ -162,11 +163,13 @@ struct
         id                     : rep_id;
         addr                   : address;
         mutable state          : 'op C.state;
-        mutable next_heartbeat : CLOCK.t option;
+        mutable next_heartbeat : (CLOCK.t * heartbeat) option;
         mutable next_election  : CLOCK.t option;
         mutable app_state      : 'app_state;
         mutable stopped        : bool;
       }
+
+  and heartbeat = Fast | Normal
 
   type ('op, 'app_state, 'snapshot) t =
       {
@@ -175,6 +178,7 @@ struct
         nodes            : ('op, 'app_state) node NODES.t;
         election_period  : CLOCK.t;
         heartbeat_period : CLOCK.t;
+        fast_heartbeat_period : CLOCK.t;
         rtt              : CLOCK.t;
         make_node        : unit -> ('op, 'app_state) node;
       }
@@ -210,7 +214,7 @@ struct
         ?(rng = RND.make_self_init ())
         ?(ev_queue = Event_queue.create ())
         ~num_nodes
-        ~election_period ~heartbeat_period ~rtt
+        ~election_period ~heartbeat_period ~fast_heartbeat_period ~rtt
         mk_app_state =
     let active   = List.init num_nodes
                      (fun n -> let s = sprintf "n%03d" n in (s, s)) in
@@ -237,7 +241,8 @@ struct
         mk_node mk_app_state config (id, addr)
 
     and t =
-      { rng; ev_queue; election_period; heartbeat_period; rtt;
+      { rng; ev_queue; election_period;
+        heartbeat_period; fast_heartbeat_period; rtt;
         nodes; make_node;
       }
     in
@@ -311,11 +316,15 @@ struct
     let t1 = Event_queue.schedule t.ev_queue dt node.id Election_timeout in
       node.next_election <- Some t1
 
-  let schedule_heartbeat t node =
-    let t1 = Event_queue.schedule
-               t.ev_queue t.heartbeat_period node.id Heartbeat_timeout
-    in
-      node.next_heartbeat <- Some t1
+  let schedule_heartbeat t node kind =
+    match node.next_heartbeat with
+        Some (_, Fast) -> (* next heartbeat cannot be unscheduled *) ()
+      | _ ->
+          let dt = match kind with
+                     | Fast -> t.fast_heartbeat_period
+                     | Normal -> t.heartbeat_period in
+          let t1 = Event_queue.schedule t.ev_queue dt node.id Heartbeat_timeout in
+            node.next_heartbeat <- Some (t1, kind)
 
   let unschedule_election t node =
     node.next_election <- None
@@ -332,7 +341,7 @@ struct
         | _ -> false
       end
     | Heartbeat_timeout -> begin match node.next_heartbeat with
-          Some t when t = time -> true
+          Some (t, _) when t = time -> true
         | _ -> false
       end
     | Func _ -> false
@@ -485,7 +494,12 @@ struct
           end
         | Heartbeat_timeout -> begin
             match node.next_heartbeat with
-              | Some t when t = time -> C.heartbeat_timeout node.state
+              | Some (time', _) when time' = time ->
+                  (* If the current hearbeat is a Fast one, we have to get rid
+                   * of it, lest schedule_heartbeat not allow to schedule a
+                   * new one. *)
+                  unschedule_heartbeat t node;
+                  C.heartbeat_timeout node.state
               | _ -> (node.state, [])
           end
         | Command c -> C.client_command c node.state
@@ -544,7 +558,8 @@ struct
             if verbose then printf " Become_leader\n";
             unschedule_election t node;
             schedule_election t node;
-            schedule_heartbeat t node
+            unschedule_heartbeat t node;
+            schedule_heartbeat t node Normal
         | Changed_config ->
             if verbose then
               printf " Changed config to %s (committed %s)\n"
@@ -599,11 +614,12 @@ struct
             if verbose then printf " Reset_election_timeout\n";
             unschedule_election t node;
             schedule_election t node
-        | Reset_heartbeat | Reset_heartbeat_fast
-            (* FIXME: shorter period for "fast" heartbeat *)->
+        | Reset_heartbeat ->
             if verbose then printf " Reset_heartbeat\n";
-            unschedule_heartbeat t node;
-            schedule_heartbeat t node
+            schedule_heartbeat t node Normal
+        | Reset_heartbeat_fast ->
+            if verbose then printf " Reset_heartbeat_fast\n";
+            schedule_heartbeat t node Fast
         | Send (rep_id, addr, msg) ->
             let dropped = FAILURE_SIMULATOR.is_msg_lost fail_sim
                             ~src:node.id ~dst:rep_id
@@ -711,7 +727,8 @@ let run
   let rng     = Random.State.make [| seed |] in
 
   let des     = DES.make ~ev_queue ~rng ~num_nodes
-                  ~election_period ~heartbeat_period ~rtt
+                  ~election_period
+                  ~heartbeat_period ~fast_heartbeat_period:2L ~rtt
                   (fun () -> (0L, FQueue.empty, 0L)) in
 
   let rec schedule dt node cmd =

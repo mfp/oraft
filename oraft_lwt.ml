@@ -127,7 +127,7 @@ struct
         push_msg                 : rep_id * (req_id * IO.op) message -> unit;
         mutable get_msg          : th_res Lwt.t;
         mutable election_timeout : th_res Lwt.t;
-        mutable heartbeat        : th_res Lwt.t;
+        mutable heartbeat        : th_res Lwt.t * heartbeat;
         mutable abort            : th_res Lwt.t * th_res Lwt.u;
         mutable get_cmd          : th_res Lwt.t;
         mutable get_ro_op        : th_res Lwt.t;
@@ -149,6 +149,8 @@ struct
         apply_stream             : (req_id * IO.op) Lwt_stream.t;
         push_apply               : (req_id * IO.op) -> unit;
       }
+
+  and heartbeat = Fast | Normal
 
   and config_change =
     | No_change
@@ -232,10 +234,13 @@ struct
                                   return Election_timeout
                               | Leader -> fst (Lwt.wait ()) in
     let heartbeat         = match Core.status state with
-                              | Follower | Candidate -> fst (Lwt.wait ())
+                              | Follower | Candidate ->
+                                  (fst (Lwt.wait ()), Normal)
                               | Leader ->
-                                  Lwt_unix.sleep heartbeat_period >>
-                                  return Heartbeat_timeout in
+                                  let th =
+                                    Lwt_unix.sleep heartbeat_period >>
+                                    return Heartbeat_timeout
+                                  in (th, Normal) in
     let sent_snapshots, p = Lwt_stream.create () in
     let snapshot_sent x   = p (Some x) in
     let sent_snapshots_th = fst (Lwt.wait ()) in
@@ -426,18 +431,30 @@ struct
                                return Election_timeout);
         return ()
     | Reset_heartbeat ->
-        t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period >>
-                        return Heartbeat_timeout);
-        return ()
+          begin match t.heartbeat with
+              _, Fast -> return_unit
+            | _ ->
+                let th = (Lwt_unix.sleep t.heartbeat_period >>
+                          return Heartbeat_timeout)
+                in
+                  t.heartbeat <- (th, Normal);
+                  return_unit
+          end
     | Reset_heartbeat_fast ->
-        t.heartbeat <- (Lwt_unix.sleep 0.001 >>
-                        return Heartbeat_timeout);
-        return ()
+        begin match t.heartbeat with
+            _, Fast -> return_unit
+          | _ ->
+              let th = (Lwt_unix.sleep 0.001 >>
+                        return Heartbeat_timeout)
+              in
+                t.heartbeat <- (th, Fast);
+                return_unit
+        end
     | Become_candidate
     | Become_follower None as ev ->
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
-        t.heartbeat <- fst (Lwt.wait ());
+        t.heartbeat <- (fst (Lwt.wait ()), Normal);
         Lwt_log.info_f ~section "Becoming %s"
           (match ev with
              | Become_candidate -> "candidate"
@@ -447,7 +464,7 @@ struct
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         Lwt_condition.broadcast t.leader_signal ();
-        t.heartbeat <- fst (Lwt.wait ());
+        t.heartbeat <- (fst (Lwt.wait ()), Normal);
         Lwt_log.info_f ~section "Becoming follower leader:%S" id >>
         exec_action t Reset_election_timeout
     | Become_leader ->
@@ -530,7 +547,7 @@ struct
             t.get_msg;
             t.get_cmd;
             t.get_ro_op;
-            t.heartbeat;
+            fst t.heartbeat;
             t.sent_snapshots_th;
           ]
       with
@@ -564,6 +581,7 @@ struct
               exec_actions t actions >>
               run t
         | Heartbeat_timeout ->
+            t.heartbeat <- (fst (Lwt.wait ()), Normal);
             let state, actions = Core.heartbeat_timeout t.state in
               t.state <- state;
               exec_actions t actions >>
