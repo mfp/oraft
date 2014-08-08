@@ -269,7 +269,8 @@ struct
             return { id; addr; c = None; node_sockaddr; app_sockaddr; serv; exec; }
       | Some peer_addr ->
           let c = CC.make ~id () in
-            Lwt_log.info_f ~section "Connecting to %S" peer_addr >>
+            Lwt_log.info_f ~section "Connecting to %S"
+              (peer_addr |> C.string_of_address) >>
             CC.connect c ~addr:peer_addr >>
             lwt config        = CC.get_config c >>= raise_if_error in
             lwt ()            = Lwt_log.info_f ~section
@@ -441,6 +442,10 @@ struct
       Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
       Lwt_unix.bind sock t.app_sockaddr;
       Lwt_unix.listen sock 256;
+      Lwt_log.ign_info_f ~section "Running app server at %s"
+        (match t.app_sockaddr with
+         | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
+         | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s);
 
       let rec accept_loop t =
         lwt (fd, addr) = Lwt_unix.accept sock in

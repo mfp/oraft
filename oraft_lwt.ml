@@ -729,6 +729,7 @@ module type SERVER_CONF =
 sig
   include OP
   val node_sockaddr : address -> Unix.sockaddr
+  val string_of_address : address -> string
 end
 
 (* taken from lwt_io.ml *)
@@ -795,6 +796,11 @@ struct
       Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
       Lwt_unix.bind sock addr;
       Lwt_unix.listen sock 256;
+      Lwt_log.ign_info_f ~section "Running node server at %s"
+        (match addr with
+         | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
+         | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s);
+
 
       let rec accept_loop t =
         lwt (fd, addr) = Lwt_unix.accept sock in
