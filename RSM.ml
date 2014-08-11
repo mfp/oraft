@@ -269,12 +269,13 @@ struct
             return { id; addr; c = None; node_sockaddr; app_sockaddr; serv; exec; }
       | Some peer_addr ->
           let c = CC.make ~id () in
-            Lwt_log.info_f ~section "Connecting to %S" peer_addr >>
+            Lwt_log.info_f ~section "Connecting to %S"
+              (peer_addr |> C.string_of_address) >>
             CC.connect c ~addr:peer_addr >>
             lwt config        = CC.get_config c >>= raise_if_error in
             lwt ()            = Lwt_log.info_f ~section
                                   "Got initial configuration %s"
-                                  (Oraft_util.string_of_config config) in
+                                  (Oraft_util.string_of_config C.string_of_address config) in
             let state         = Oraft.Core.make
                                   ~id ~current_term:0L ~voted_for:None
                                   ~log:[] ~config () in
@@ -336,7 +337,7 @@ struct
             (Extprot.Pretty_print.pp pp_response response) >>
           Lwt_log.info_f ~section
             "New config: %s"
-            (Oraft_util.string_of_config (SS.config t.serv)) >>
+            (Oraft_util.string_of_config C.string_of_address (SS.config t.serv)) >>
           send_msg conn { id; response }
     | { id; op = Execute_RO op; } -> begin
         match_lwt SS.readonly_operation t.serv with
@@ -432,7 +433,7 @@ struct
       promote_if_needed t c config >>
       lwt config = CC.get_config c >>= raise_if_error in
         Lwt_log.info_f ~section "Final config: %s"
-          (Oraft_util.string_of_config config)
+          (Oraft_util.string_of_config C.string_of_address config)
 
   let run t =
     let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr t.app_sockaddr)
@@ -441,6 +442,10 @@ struct
       Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
       Lwt_unix.bind sock t.app_sockaddr;
       Lwt_unix.listen sock 256;
+      Lwt_log.ign_info_f ~section "Running app server at %s"
+        (match t.app_sockaddr with
+         | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
+         | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s);
 
       let rec accept_loop t =
         lwt (fd, addr) = Lwt_unix.accept sock in

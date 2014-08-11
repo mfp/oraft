@@ -96,6 +96,7 @@ sig
   open Oraft.Types
   include OP
   val node_sockaddr : address -> Unix.sockaddr
+  val string_of_address : address -> string
 end
 
 val open_connection :
