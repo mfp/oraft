@@ -40,6 +40,8 @@ struct
   let app_sockaddr  s =
     printf "Connecting to %s\n%!" s;
     String.split ~by:"," s |> snd |> sockaddr
+
+  let string_of_address s = s
 end
 
 module SERVER = RSM.Make_server(CONF)
