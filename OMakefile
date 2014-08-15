@@ -4,8 +4,10 @@ NATIVE_ENABLED = true
 
 OCAMLFINDFLAGS = -syntax camlp4o -ppopt -lwt-debug
 
-OCAMLFLAGS = -g -w +a-4-6-9-27..29-30-32..99 -warn-error +a-4-6-9-18-27-28-29..99
+OCAMLFLAGS = -g -w +a-4-6-9-27..29-30-32..99 -warn-error +a-4-6-9-18-27-28-29..99 -bin-annot
 OCAMLOPTFLAGS = -inline 1000
+
+VERSION = 0.1
 
 OCAMLPACKS[] =
    batteries
@@ -46,5 +48,20 @@ section
         $(OCAMLFLAGS) $(OCAMLCFLAGS) -i $< > $@
 
 .DEFAULT: $(LIBS)
+
+META: META.in
+        sed s/VERSION/$(VERSION)/g $< > $@
+
+.PHONY: clean install uninstall
+
+install: $(LIBS) META
+	ocamlfind remove oraft
+	ocamlfind install oraft META $(ls *.cmi *.cmxa *.cma *.a *.mli)
+
+uninstall:
+	ocamlfind remove oraft
+
+clean:
+	rm -f $(filter-proper-targets $(ls R, .))
 
 # vim: set expandtab:
