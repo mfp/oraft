@@ -15,6 +15,7 @@ OCAMLPACKS[] =
    lwt.syntax
    lwt.syntax.log
    extprot
+   tls.lwt
 
 if $(not $(OCAMLFIND_EXISTS))
    eprintln(This project requires ocamlfind, but is was not found.)

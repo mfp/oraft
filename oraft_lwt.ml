@@ -26,7 +26,7 @@ module type LWTIO =
 sig
   include LWTIO_TYPES
 
-  val connect : conn_manager -> rep_id -> address -> connection option Lwt.t
+  val connect : ?tls:Tls.Config.client -> conn_manager -> rep_id -> address -> connection option Lwt.t
   val send    : connection -> (req_id * op) message -> unit Lwt.t
   val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
@@ -733,8 +733,11 @@ sig
 end
 
 (* taken from lwt_io.ml *)
-let open_connection ?buffer_size sockaddr =
-  let fd = Lwt_unix.socket (Unix.domain_of_sockaddr sockaddr) Unix.SOCK_STREAM 0 in
+let open_connection ?fd ?buffer_size sockaddr =
+  let fd = match fd with
+    | None -> Lwt_unix.socket (Unix.domain_of_sockaddr sockaddr) Unix.SOCK_STREAM 0
+    | Some fd -> fd
+  in
   let close = lazy begin
     try_lwt
       Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
@@ -748,13 +751,25 @@ let open_connection ?buffer_size sockaddr =
   try_lwt
     lwt () = Lwt_unix.connect fd sockaddr in
     (try Lwt_unix.set_close_on_exec fd with Invalid_argument _ -> ());
-    return (fd,
-            Lwt_io.make ?buffer_size
+    return (Lwt_io.make ?buffer_size
               ~close:(fun _ -> Lazy.force close)
               ~mode:Lwt_io.input (Lwt_bytes.read fd),
             Lwt_io.make ?buffer_size
               ~close:(fun _ -> Lazy.force close)
               ~mode:Lwt_io.output (Lwt_bytes.write fd))
+  with exn ->
+    lwt () = Lwt_unix.close fd in
+    raise_lwt exn
+
+let open_tls_connection ?fd ?buffer_size ~tls sockaddr =
+  let fd = match fd with
+    | None -> Lwt_unix.socket (Unix.domain_of_sockaddr sockaddr) Unix.SOCK_STREAM 0
+    | Some fd -> fd
+  in
+  try_lwt
+    lwt () = Lwt_unix.connect fd sockaddr in
+    (try Lwt_unix.set_close_on_exec fd with Invalid_argument _ -> ());
+    Tls_lwt.(Unix.client_of_fd ~host:"" tls fd >|= of_t)
   with exn ->
     lwt () = Lwt_unix.close fd in
     raise_lwt exn
@@ -791,54 +806,57 @@ struct
     }
 
 
-  let make ~id addr =
+  let make ?tls ~id addr =
     let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr addr) Unix.SOCK_STREAM 0) in
       Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
       Lwt_unix.bind sock addr;
       Lwt_unix.listen sock 256;
-      Lwt_log.ign_info_f ~section "Running node server at %s"
-        (match addr with
-         | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
-         | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s);
-
 
       let rec accept_loop t =
         lwt (fd, addr) = Lwt_unix.accept sock in
-          ignore begin try_lwt
+        ignore begin try_lwt
             (* the following are not supported for ADDR_UNIX sockets, so catch
              * possible exceptions *)
             (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
             (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-            let ich = Lwt_io.of_fd Lwt_io.input fd in
-            let och = Lwt_io.of_fd Lwt_io.output fd in
+            lwt ich, och = match tls with
+              | None ->
+                Lwt_io.(of_fd input fd, of_fd output fd) |> Lwt.return
+              | Some server_config ->
+                Tls_lwt.(Unix.server_of_fd server_config fd >|= of_t)
+            in
             lwt id  = Lwt_io.read_line ich in
             let c   = { id; mgr = t; ich; och; closed = false;
                         in_buf = ""; out_buf = MB.create ();
                         noutgoing = 0;
                       }
             in
-              t.conns <- M.add id c t.conns;
-              Lwt_condition.broadcast t.conn_signal ();
-              Lwt_log.info_f ~section "Incoming connection from peer %S" id
+            t.conns <- M.add id c t.conns;
+            Lwt_condition.broadcast t.conn_signal ();
+            Lwt_log.info_f ~section "Incoming connection from peer %S" id
           with _ ->
             Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
             Lwt_unix.close fd
-          end;
-          accept_loop t in
-
+        end;
+        accept_loop t
+      in
       let conn_signal = Lwt_condition.create () in
       let t           = { id; sock; conn_signal; conns = M.empty; } in
-        ignore begin
-          try_lwt
-            accept_loop t
-          with
-            | Exit -> return ()
+      ignore begin
+        try_lwt
+          Lwt_log.info_f ~section "Running node server at %s"
+            (match addr with
+             | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
+             | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s) >>
+          accept_loop t
+        with
+        | Exit -> return ()
             | exn -> Lwt_log.error_f ~exn ~section
                        "Error in connection manager accept loop"
         end;
         t
 
-  let connect t dst_id addr =
+  let connect ?tls t dst_id addr =
     match M.Exceptionless.find dst_id t.conns with
         Some _ as x -> return x
       | None when dst_id < t.id -> (* wait for other end to connect *)
@@ -851,8 +869,13 @@ struct
             await_conn ()
       | None -> (* we must connect ourselves *)
           try_lwt
-            Lwt_log.info_f ~section "Connecting to %S" addr >>
-            lwt fd, ich, och = open_connection (C.node_sockaddr addr) in
+            Lwt_log.info_f ~section "Connecting to %S" (C.string_of_address addr) >>
+            let saddr = C.node_sockaddr addr in
+            let fd = Lwt_unix.socket (Unix.domain_of_sockaddr saddr) Unix.SOCK_STREAM 0 in
+            lwt ich, och = match tls with
+              | None -> open_connection ~fd saddr
+              | Some tls -> open_tls_connection ~fd ~tls saddr
+            in
               try_lwt
                 (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
                 (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
