@@ -3,6 +3,7 @@ open Lwt
 
 module String  = BatString
 module Hashtbl = BatHashtbl
+module Option  = BatOption
 
 type op =
     Get of string
@@ -47,6 +48,13 @@ end
 module SERVER = RSM.Make_server(CONF)
 module CLIENT = RSM.Make_client(CONF)
 
+let make_tls_wrapper tls =
+  Option.map
+    (fun (client_config, server_config) ->
+       Oraft_lwt_tls.make_conn_wrapper
+         ~client_config ~server_config ())
+    tls
+
 let run_server ?tls ~addr ?join ~id () =
   let h    = Hashtbl.create 13 in
   let cond = Lwt_condition.create () in
@@ -74,11 +82,13 @@ let run_server ?tls ~addr ?join ~id () =
         `Sync (return (`OK ""))
   in
 
-  lwt server = SERVER.make ?tls exec addr ?join id in
+  lwt server = SERVER.make ?conn_wrapper:(make_tls_wrapper tls) exec addr ?join id in
     SERVER.run server
 
 let client_op ?tls ~addr op =
-  let c    = CLIENT.make ?tls ~id:(string_of_int (Unix.getpid ())) () in
+  let c    = CLIENT.make
+               ?conn_wrapper:(make_tls_wrapper tls)
+               ~id:(string_of_int (Unix.getpid ())) () in
   let exec = match op with
                | Get _ | Wait _ -> CLIENT.execute_ro
                | Set _ -> CLIENT.execute
@@ -89,7 +99,10 @@ let client_op ?tls ~addr op =
       | `Error s -> printf "-ERR %s\n" s; return ()
 
 let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
-  let c    = CLIENT.make ?tls ~id:(string_of_int (Unix.getpid ())) () in
+  let c    = CLIENT.make
+               ?conn_wrapper:(make_tls_wrapper tls)
+               ~id:(string_of_int (Unix.getpid ())) ()
+  in
     CLIENT.connect c ~addr >>
     CLIENT.execute c (Set ("bm", "0")) >>
     let t0 = Unix.gettimeofday () in
@@ -102,7 +115,10 @@ let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
         return ()
 
 let wr_benchmark ?tls ?(iterations = 10_000) ~addr () =
-  let c    = CLIENT.make ?tls ~id:(string_of_int (Unix.getpid ())) () in
+  let c    = CLIENT.make
+               ?conn_wrapper:(make_tls_wrapper tls)
+               ~id:(string_of_int (Unix.getpid ())) ()
+  in
     CLIENT.connect c ~addr >>
     let t0 = Unix.gettimeofday () in
       for_lwt i = 1 to iterations do
@@ -151,30 +167,26 @@ let tls_create dirname =
   let x509_pk = x509_pk dirname in
   lwt certificate =
     X509_lwt.private_of_pems ~cert:x509_cert ~priv_key:x509_pk in
-  return Tls.Config.(Some (server ~certificate ()),
-                     Some (client ()))
+  return (Some Tls.Config.(client_exn (), server_exn ~certificate ()))
 
 let () =
   ignore (Sys.set_signal Sys.sigpipe Sys.Signal_ignore);
   Arg.parse specs ignore "Usage:";
   let tls = match !tls with
-    | None -> Lwt.return (None, None)
+    | None -> Lwt.return None
     | Some dirname -> tls_create dirname in
   match !mode with
   | `Help -> usage ()
   | `Master addr ->
     Lwt_main.run (tls >>= fun tls ->
-                  let tls = fst tls in
                   run_server ?tls ~addr ?join:!cluster_addr ~id:addr ())
   | `Client addr ->
     printf "Launching client %d\n" (Unix.getpid ());
     if !ro_bm_iters > 0 then
       Lwt_main.run (tls >>= fun tls ->
-                    let tls = snd tls in
                     ro_benchmark ?tls ~iterations:!ro_bm_iters ~addr ());
     if !wr_bm_iters > 0 then
       Lwt_main.run (tls >>= fun tls ->
-                    let tls = snd tls in
                     wr_benchmark ?tls ~iterations:!wr_bm_iters ~addr ());
 
     if !ro_bm_iters > 0 || !wr_bm_iters > 0 then exit 0;
@@ -183,10 +195,8 @@ let () =
     | None, None | None, _ -> usage ()
     | Some k, Some v ->
       Lwt_main.run (tls >>= fun tls ->
-                    let tls = snd tls in
                     client_op ?tls ~addr (Set (k, v)))
     | Some k, None ->
       Lwt_main.run (tls >>= fun tls ->
-                    let tls = snd tls in
                     client_op ?tls ~addr (Wait k))
 

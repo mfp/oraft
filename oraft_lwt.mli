@@ -12,9 +12,7 @@ sig
 
   include LWTIO_TYPES
 
-  val connect :
-    ?tls:Tls.Config.client ->
-    conn_manager -> rep_id -> address -> connection option Lwt.t
+  val connect : conn_manager -> rep_id -> address -> connection option Lwt.t
   val send    : connection -> (req_id * op) message -> unit Lwt.t
   val receive : connection -> (req_id * op) message option Lwt.t
   val abort   : connection -> unit Lwt.t
@@ -101,22 +99,21 @@ sig
   val string_of_address : address -> string
 end
 
-val open_connection :
-  ?fd : Lwt_unix.file_descr ->
-  ?buffer_size : int -> Unix.sockaddr ->
-  (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t
+type conn_wrapper =
+    {
+      wrap_incoming_conn :
+        Lwt_unix.file_descr -> (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t;
+      wrap_outgoing_conn :
+        Lwt_unix.file_descr ->
+        (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t;
+    }
 
-val open_tls_connection :
-  ?fd : Lwt_unix.file_descr ->
-  ?buffer_size : int ->
-  tls:Tls.Config.client -> Unix.sockaddr ->
-  (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t
+val trivial_conn_wrapper : ?buffer_size:int -> unit -> conn_wrapper
 
 module Simple_server : functor(C : SERVER_CONF) ->
 sig
   include SERVER_GENERIC with type op = C.op
 
   val make_conn_manager :
-    ?tls:Tls.Config.server ->
-    id:string -> Unix.sockaddr -> conn_manager
+    ?conn_wrapper:conn_wrapper -> id:string -> Unix.sockaddr -> conn_manager
 end

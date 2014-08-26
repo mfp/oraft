@@ -86,13 +86,15 @@ struct
         mutable conns  : address conn M.t;
         mutable req_id : Int64.t;
         pending_reqs   : response Lwt.u H.t;
-        tls            : Tls.Config.client option;
+        conn_wrapper   : Oraft_lwt.conn_wrapper;
       }
 
   and address = string
 
-  let make ?tls ~id () =
-    { id; dst = None; conns = M.empty; req_id = 0L; pending_reqs = H.create 13; tls; }
+  let make ?(conn_wrapper = Oraft_lwt.trivial_conn_wrapper ()) ~id () =
+    { id; dst = None; conns = M.empty; req_id = 0L;
+      pending_reqs = H.create 13; conn_wrapper;
+    }
 
   let gen_id t =
     t.req_id <- Int64.succ t.req_id;
@@ -105,10 +107,8 @@ struct
     let do_connect () =
       let saddr = C.app_sockaddr addr in
       let fd = Lwt_unix.socket (Unix.domain_of_sockaddr saddr) Unix.SOCK_STREAM 0 in
-      lwt ich, och = match t.tls with
-        | None -> Oraft_lwt.open_connection ~fd saddr
-        | Some tls -> Oraft_lwt.open_tls_connection ~fd ~tls saddr
-      in
+      lwt () = Lwt_unix.connect fd saddr in
+      lwt ich, och     = t.conn_wrapper.wrap_outgoing_conn fd in
       let out_buf      = MB.create () in
       let in_buf       = ref "" in
       let conn         = { addr; ich; och; in_buf; out_buf } in
@@ -247,7 +247,7 @@ struct
         app_sockaddr  : Unix.sockaddr;
         serv          : 'a SS.server;
         exec          : 'a SS.apply;
-        tls           : Tls.Config.server option;
+        conn_wrapper  : Oraft_lwt.conn_wrapper;
       }
 
   let raise_if_error = function
@@ -260,7 +260,9 @@ struct
     | `Cannot_change -> raise_lwt (Failure "Cannot perform config change")
     | `Unsafe_change _ -> raise_lwt (Failure "Unsafe config change")
 
-  let make exec addr ?tls ?client_tls ?join ?election_period ?heartbeat_period id =
+  let make exec addr
+        ?(conn_wrapper = Oraft_lwt.trivial_conn_wrapper ())
+        ?join ?election_period ?heartbeat_period id =
     match join with
     | None ->
       let config        = Simple_config ([id, addr], []) in
@@ -274,9 +276,9 @@ struct
           state conn_mgr
       in
       return { id; addr; c = None; node_sockaddr;
-               app_sockaddr; serv; exec; tls; }
+               app_sockaddr; serv; exec; conn_wrapper; }
     | Some peer_addr ->
-      let c = CC.make ?tls:client_tls ~id () in
+      let c = CC.make ~conn_wrapper ~id () in
       Lwt_log.info_f ~section "Connecting to %S" (peer_addr |> C.string_of_address) >>
       CC.connect c ~addr:peer_addr >>
       lwt config        = CC.get_config c >>= raise_if_error in
@@ -292,7 +294,7 @@ struct
           ?heartbeat_period state conn_mgr
       in
       return { id; addr; c = Some c;
-               node_sockaddr; app_sockaddr; serv; exec; tls; }
+               node_sockaddr; app_sockaddr; serv; exec; conn_wrapper }
 
   let send_msg conn msg = send_msg Oraft_proto.Server_msg.write conn msg
   let read_msg conn     = read_msg Oraft_proto.Client_msg.read conn
@@ -443,12 +445,7 @@ struct
         (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
         (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
         try_lwt
-          lwt ich, och = match t.tls with
-            | None ->
-              Lwt_io.(of_fd input fd, of_fd output fd) |> Lwt.return
-            | Some server_config ->
-              Tls_lwt.(Unix.server_of_fd server_config fd >|= of_t)
-          in
+          lwt ich, och = t.conn_wrapper.wrap_incoming_conn fd in
           let conn = { addr; ich; och; in_buf = ref ""; out_buf = MB.create () } in
           (match_lwt read_msg conn with
           | { id; op = Connect client_id; _ } ->
