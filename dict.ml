@@ -52,7 +52,7 @@ module CLIENT = RSM.Make_client(CONF)
 let make_tls_wrapper tls =
   Option.map
     (fun (client_config, server_config) ->
-       Oraft_lwt_tls.make_conn_wrapper
+       Oraft_lwt_tls.make_server_wrapper
          ~client_config ~server_config ())
     tls
 

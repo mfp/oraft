@@ -86,14 +86,21 @@ struct
         mutable conns  : address conn M.t;
         mutable req_id : Int64.t;
         pending_reqs   : response Lwt.u H.t;
-        conn_wrapper   : Oraft_lwt.conn_wrapper;
+        conn_wrapper   : [`Outgoing] Oraft_lwt.conn_wrapper;
       }
 
   and address = string
 
-  let make ?(conn_wrapper = Oraft_lwt.trivial_conn_wrapper ()) ~id () =
+  let trivial_wrapper () =
+    (Oraft_lwt.trivial_conn_wrapper () :> [`Outgoing] Oraft_lwt.conn_wrapper)
+
+  let make ?conn_wrapper ~id () =
     { id; dst = None; conns = M.empty; req_id = 0L;
-      pending_reqs = H.create 13; conn_wrapper;
+      pending_reqs = H.create 13;
+      conn_wrapper = Option.map_default
+                       (fun w -> (w :> [`Outgoing] Oraft_lwt.conn_wrapper))
+                       (trivial_wrapper ())
+                       conn_wrapper;
     }
 
   let gen_id t =
@@ -108,7 +115,7 @@ struct
       let saddr = C.app_sockaddr addr in
       let fd = Lwt_unix.socket (Unix.domain_of_sockaddr saddr) Unix.SOCK_STREAM 0 in
       lwt () = Lwt_unix.connect fd saddr in
-      lwt ich, och     = t.conn_wrapper.wrap_outgoing_conn fd in
+      lwt ich, och     = Oraft_lwt.wrap_outgoing_conn t.conn_wrapper fd in
       let out_buf      = MB.create () in
       let in_buf       = ref "" in
       let conn         = { addr; ich; och; in_buf; out_buf } in
@@ -247,7 +254,7 @@ struct
         app_sockaddr  : Unix.sockaddr;
         serv          : 'a SS.server;
         exec          : 'a SS.apply;
-        conn_wrapper  : Oraft_lwt.conn_wrapper;
+        conn_wrapper  : [`Incoming | `Outgoing] Oraft_lwt.conn_wrapper;
       }
 
   let raise_if_error = function
@@ -435,7 +442,7 @@ struct
     (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
     (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
     try_lwt
-      lwt ich, och = t.conn_wrapper.wrap_incoming_conn fd in
+      lwt ich, och = Oraft_lwt.wrap_incoming_conn t.conn_wrapper fd in
       let conn     = { addr; ich; och; in_buf = ref ""; out_buf = MB.create () } in
         begin try_lwt
           match_lwt read_msg conn with

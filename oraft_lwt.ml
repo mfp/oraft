@@ -732,7 +732,7 @@ sig
   val string_of_address : address -> string
 end
 
-type conn_wrapper =
+type 'a conn_wrapper =
     {
       wrap_incoming_conn :
         Lwt_unix.file_descr -> (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t;
@@ -740,6 +740,18 @@ type conn_wrapper =
         Lwt_unix.file_descr ->
         (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t;
     }
+
+type simple_wrapper =
+  Lwt_unix.file_descr -> (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t
+
+let make_client_conn_wrapper f =
+  { wrap_incoming_conn =
+      (fun fd -> try_lwt failwith "Incoming conn wrapper invoked in client");
+    wrap_outgoing_conn = f;
+  }
+
+let make_server_conn_wrapper ~incoming ~outgoing =
+  { wrap_incoming_conn = incoming; wrap_outgoing_conn = outgoing }
 
 let trivial_wrap_outgoing_conn ?buffer_size fd =
   let close =
@@ -776,6 +788,9 @@ let trivial_conn_wrapper ?buffer_size () =
     wrap_outgoing_conn = trivial_wrap_outgoing_conn ?buffer_size;
   }
 
+let wrap_outgoing_conn w fd = w.wrap_outgoing_conn fd
+let wrap_incoming_conn w fd = w.wrap_incoming_conn fd
+
 module Simple_IO(C : SERVER_CONF) =
 struct
   module EC = Extprot.Conv
@@ -793,7 +808,7 @@ struct
         sock          : Lwt_unix.file_descr;
         mutable conns : connection M.t;
         conn_signal   : unit Lwt_condition.t;
-        conn_wrapper  : conn_wrapper;
+        conn_wrapper  : [`Incoming | `Outgoing] conn_wrapper;
       }
 
   and connection =

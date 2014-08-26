@@ -21,7 +21,8 @@ sig
 
   type t
 
-  val make : ?conn_wrapper:Oraft_lwt.conn_wrapper -> id:string -> unit -> t
+  val make :
+    ?conn_wrapper:[> `Outgoing] Oraft_lwt.conn_wrapper -> id:string -> unit -> t
 
   val connect : t -> addr:address -> unit Lwt.t
 
@@ -49,7 +50,7 @@ sig
 
   val make :
     'a apply -> address ->
-    ?conn_wrapper:Oraft_lwt.conn_wrapper ->
+    ?conn_wrapper:[`Outgoing | `Incoming] Oraft_lwt.conn_wrapper ->
     ?join:address ->
     ?election_period:float ->
     ?heartbeat_period:float -> rep_id -> 'a t Lwt.t
