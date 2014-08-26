@@ -452,8 +452,6 @@ struct
     with
       | End_of_file
       | Unix.Unix_error (Unix.ECONNRESET, _, _) -> return_unit
-      | Tls_lwt.Tls_failure _ as exn ->
-          Lwt_log.info ~section ~exn "TLS error in incoming connection, aborting"
       | exn ->
           Lwt_log.error_f ~section ~exn "Error in dispatch"
     finally
