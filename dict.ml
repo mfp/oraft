@@ -96,7 +96,7 @@ let client_op ?tls ~addr op =
   in
     CLIENT.connect c ~addr >>
     match_lwt exec c op with
-        `OK s -> printf "+OK %s\n" s; return ()
+      | `OK s -> printf "+OK %s\n" s; return ()
       | `Error s -> printf "-ERR %s\n" s; return ()
 
 let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
@@ -144,13 +144,13 @@ let specs =
       "-tls", Arg.String (fun dirname -> tls := Some dirname),
       "dirname Directory containing PEM files";
       "-master", Arg.String (fun n -> mode := `Master n),
-        "ADDR Launch master at given address";
+      "ADDR Launch master at given address";
       "-join", Arg.String (fun p -> cluster_addr := Some p),
-        "ADDR Join cluster at given address";
+      "ADDR Join cluster at given address";
       "-client", Arg.String (fun addr -> mode := `Client addr), "ADDR Client mode";
       "-key", Arg.String (fun s -> k := Some s), "STRING Wait for key/set it";
       "-value", Arg.String (fun s -> v := Some s),
-        "STRING Set key given in -key to STRING";
+      "STRING Set key given in -key to STRING";
       "-ro_bm", Arg.Set_int ro_bm_iters, "N Run RO benchmark (N iterations)";
       "-wr_bm", Arg.Set_int wr_bm_iters, "N Run WR benchmark (N iterations)";
     ]
@@ -160,12 +160,12 @@ let usage () =
   exit 1
 
 let x509_cert dirname = dirname ^ "/server.crt"
-let x509_pk dirname = dirname ^ "/server.key"
+let x509_pk dirname   = dirname ^ "/server.key"
 
 let tls_create dirname =
-  lwt () = Tls_lwt.rng_init () in
-  let x509_cert = x509_cert dirname in
-  let x509_pk = x509_pk dirname in
+  lwt ()          = Tls_lwt.rng_init () in
+  let x509_cert   = x509_cert dirname in
+  let x509_pk     = x509_pk dirname in
   lwt certificate =
     X509_lwt.private_of_pems ~cert:x509_cert ~priv_key:x509_pk in
     return (Some Tls.Config.(client_exn (), server_exn ~certificate ()))

@@ -822,11 +822,11 @@ struct
               (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
               (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
               lwt ich, och = conn_wrapper.wrap_incoming_conn fd in
-              lwt id  = Lwt_io.read_line ich in
-              let c   = { id; mgr = t; ich; och; closed = false;
-                          in_buf = ""; out_buf = MB.create ();
-                          noutgoing = 0;
-                        }
+              lwt id       = Lwt_io.read_line ich in
+              let c        = { id; mgr = t; ich; och; closed = false;
+                               in_buf = ""; out_buf = MB.create ();
+                               noutgoing = 0;
+                             }
               in
                 t.conns <- M.add id c t.conns;
                 Lwt_condition.broadcast t.conn_signal ();
@@ -867,9 +867,10 @@ struct
       | None -> (* we must connect ourselves *)
           try_lwt
             Lwt_log.info_f ~section "Connecting to %S" (C.string_of_address addr) >>
-            let saddr = C.node_sockaddr addr in
-            let fd = Lwt_unix.socket (Unix.domain_of_sockaddr saddr) Unix.SOCK_STREAM 0 in
-            lwt () = Lwt_unix.connect fd saddr in
+            let saddr    = C.node_sockaddr addr in
+            let fd       = Lwt_unix.socket (Unix.domain_of_sockaddr saddr)
+                             Unix.SOCK_STREAM 0 in
+            lwt ()       = Lwt_unix.connect fd saddr in
             lwt ich, och = t.conn_wrapper.wrap_outgoing_conn fd in
               try_lwt
                 (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());

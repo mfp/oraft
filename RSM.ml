@@ -436,7 +436,7 @@ struct
     (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
     try_lwt
       lwt ich, och = t.conn_wrapper.wrap_incoming_conn fd in
-      let conn = { addr; ich; och; in_buf = ref ""; out_buf = MB.create () } in
+      let conn     = { addr; ich; och; in_buf = ref ""; out_buf = MB.create () } in
         begin try_lwt
           match_lwt read_msg conn with
             | { id; op = Connect client_id; _ } ->
