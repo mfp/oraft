@@ -168,7 +168,7 @@ let tls_create dirname =
   let x509_pk     = x509_pk dirname in
   lwt certificate =
     X509_lwt.private_of_pems ~cert:x509_cert ~priv_key:x509_pk in
-    return (Some Tls.Config.(client_exn (), server_exn ~certificate ()))
+    return (Some Tls.Config.(client (), server ~certificate ()))
 
 let () =
   ignore (Sys.set_signal Sys.sigpipe Sys.Signal_ignore);
