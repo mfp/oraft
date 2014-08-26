@@ -429,6 +429,36 @@ struct
         Lwt_log.info_f ~section "Final config: %s"
           (Oraft_util.string_of_config C.string_of_address config)
 
+  let handle_conn t fd addr =
+    (* the following are not supported for ADDR_UNIX sockets, so catch *)
+    (* possible exceptions  *)
+    (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+    (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
+    try_lwt
+      lwt ich, och = t.conn_wrapper.wrap_incoming_conn fd in
+      let conn = { addr; ich; och; in_buf = ref ""; out_buf = MB.create () } in
+        begin try_lwt
+          match_lwt read_msg conn with
+            | { id; op = Connect client_id; _ } ->
+                Lwt_log.info_f ~section
+                  "Incoming client connection from %S" client_id >>
+                send_msg conn { id; response = OK "" } >>
+                request_loop t client_id conn
+            | { id; _ } ->
+                send_msg conn { id; response = Error "Bad request" }
+        finally
+          try_lwt Lwt_io.close ich with _ -> return_unit
+        end
+    with
+      | End_of_file
+      | Unix.Unix_error (Unix.ECONNRESET, _, _) -> return_unit
+      | Tls_lwt.Tls_failure _ as exn ->
+          Lwt_log.info ~section ~exn "TLS error in incoming connection, aborting"
+      | exn ->
+          Lwt_log.error_f ~section ~exn "Error in dispatch"
+    finally
+      try_lwt Lwt_unix.close fd with _ -> return_unit
+
   let run t =
     let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr t.app_sockaddr)
                            Unix.SOCK_STREAM 0)
@@ -439,33 +469,9 @@ struct
 
       let rec accept_loop t =
         lwt (fd_addrs,_) = Lwt_unix.accept_n sock 50 in
-        let handle_conn fd addr =
-          (* the following are not supported for ADDR_UNIX sockets, so catch *)
-          (* possible exceptions  *)
-          (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
-          (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-          try_lwt
-            lwt ich, och = t.conn_wrapper.wrap_incoming_conn fd in
-            let conn = { addr; ich; och; in_buf = ref ""; out_buf = MB.create () } in
-              (match_lwt read_msg conn with
-                | { id; op = Connect client_id; _ } ->
-                    Lwt_log.info_f ~section "Incoming client connection from %S" client_id >>
-                    send_msg conn { id; response = OK "" } >>
-                    request_loop t client_id conn
-                | { id; _ } ->
-                    send_msg conn { id; response = Error "Bad request" })
-              >> try_lwt Lwt_io.close ich with _ -> return_unit
-          with
-            | End_of_file
-            | Unix.Unix_error (Unix.ECONNRESET, _, _) -> return_unit
-            | Tls_lwt.Tls_failure _ as exn ->
-                Lwt_log.info ~section ~exn "TLS error in incoming connection, aborting"
-            | exn ->
-                Lwt_log.error_f ~section ~exn "Error in dispatch"
-          finally
-            try_lwt Lwt_unix.close fd with _ -> return_unit
-        in
-          List.iter (fun (fd, addr) -> Lwt.async (fun () -> handle_conn fd addr)) fd_addrs;
+          List.iter
+            (fun (fd, addr) -> Lwt.async (fun () -> handle_conn t fd addr))
+            fd_addrs;
           accept_loop t
       in
         ignore begin try_lwt
