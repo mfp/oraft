@@ -26,8 +26,9 @@ struct
       match s.[0] with
           '?' -> Get (String.slice ~first:1 s)
         | '<' -> Wait (String.slice ~first:1 s)
-        | '!' -> let k, v = String.slice ~first:1 s |> String.split ~by:"=" in
-                   Set (k, v)
+        | '!' ->
+            let k, v = String.slice ~first:1 s |> String.split ~by:"=" in
+              Set (k, v)
         | _ -> failwith "bad op"
 
   let sockaddr s =
@@ -167,36 +168,37 @@ let tls_create dirname =
   let x509_pk = x509_pk dirname in
   lwt certificate =
     X509_lwt.private_of_pems ~cert:x509_cert ~priv_key:x509_pk in
-  return (Some Tls.Config.(client_exn (), server_exn ~certificate ()))
+    return (Some Tls.Config.(client_exn (), server_exn ~certificate ()))
 
 let () =
   ignore (Sys.set_signal Sys.sigpipe Sys.Signal_ignore);
   Arg.parse specs ignore "Usage:";
   let tls = match !tls with
     | None -> Lwt.return None
-    | Some dirname -> tls_create dirname in
-  match !mode with
-  | `Help -> usage ()
-  | `Master addr ->
-    Lwt_main.run (tls >>= fun tls ->
-                  run_server ?tls ~addr ?join:!cluster_addr ~id:addr ())
-  | `Client addr ->
-    printf "Launching client %d\n" (Unix.getpid ());
-    if !ro_bm_iters > 0 then
-      Lwt_main.run (tls >>= fun tls ->
-                    ro_benchmark ?tls ~iterations:!ro_bm_iters ~addr ());
-    if !wr_bm_iters > 0 then
-      Lwt_main.run (tls >>= fun tls ->
-                    wr_benchmark ?tls ~iterations:!wr_bm_iters ~addr ());
+    | Some dirname -> tls_create dirname
+  in
+    match !mode with
+      | `Help -> usage ()
+      | `Master addr ->
+          Lwt_main.run (tls >>= fun tls ->
+                        run_server ?tls ~addr ?join:!cluster_addr ~id:addr ())
+      | `Client addr ->
+          printf "Launching client %d\n" (Unix.getpid ());
+          if !ro_bm_iters > 0 then
+            Lwt_main.run (tls >>= fun tls ->
+                          ro_benchmark ?tls ~iterations:!ro_bm_iters ~addr ());
+          if !wr_bm_iters > 0 then
+            Lwt_main.run (tls >>= fun tls ->
+                          wr_benchmark ?tls ~iterations:!wr_bm_iters ~addr ());
 
-    if !ro_bm_iters > 0 || !wr_bm_iters > 0 then exit 0;
+          if !ro_bm_iters > 0 || !wr_bm_iters > 0 then exit 0;
 
-    match !k, !v with
-    | None, None | None, _ -> usage ()
-    | Some k, Some v ->
-      Lwt_main.run (tls >>= fun tls ->
-                    client_op ?tls ~addr (Set (k, v)))
-    | Some k, None ->
-      Lwt_main.run (tls >>= fun tls ->
-                    client_op ?tls ~addr (Wait k))
+          match !k, !v with
+            | None, None | None, _ -> usage ()
+            | Some k, Some v ->
+                Lwt_main.run (tls >>= fun tls ->
+                              client_op ?tls ~addr (Set (k, v)))
+            | Some k, None ->
+                Lwt_main.run (tls >>= fun tls ->
+                              client_op ?tls ~addr (Wait k))
 

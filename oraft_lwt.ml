@@ -816,38 +816,38 @@ struct
 
       let rec accept_loop t =
         lwt (fd, addr) = Lwt_unix.accept sock in
-        ignore begin try_lwt
-            (* the following are not supported for ADDR_UNIX sockets, so catch
-             * possible exceptions *)
-            (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
-            (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-            lwt ich, och = conn_wrapper.wrap_incoming_conn fd in
-            lwt id  = Lwt_io.read_line ich in
-            let c   = { id; mgr = t; ich; och; closed = false;
-                        in_buf = ""; out_buf = MB.create ();
-                        noutgoing = 0;
-                      }
-            in
-            t.conns <- M.add id c t.conns;
-            Lwt_condition.broadcast t.conn_signal ();
-            Lwt_log.info_f ~section "Incoming connection from peer %S" id
-          with _ ->
-            Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
-            Lwt_unix.close fd
-        end;
-        accept_loop t
+          ignore begin try_lwt
+              (* the following are not supported for ADDR_UNIX sockets, so catch
+               * possible exceptions *)
+              (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+              (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
+              lwt ich, och = conn_wrapper.wrap_incoming_conn fd in
+              lwt id  = Lwt_io.read_line ich in
+              let c   = { id; mgr = t; ich; och; closed = false;
+                          in_buf = ""; out_buf = MB.create ();
+                          noutgoing = 0;
+                        }
+              in
+                t.conns <- M.add id c t.conns;
+                Lwt_condition.broadcast t.conn_signal ();
+                Lwt_log.info_f ~section "Incoming connection from peer %S" id
+            with _ ->
+              Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
+              Lwt_unix.close fd
+          end;
+          accept_loop t
       in
       let conn_signal = Lwt_condition.create () in
       let t           = { id; sock; conn_signal; conns = M.empty; conn_wrapper; } in
-      ignore begin
-        try_lwt
-          Lwt_log.info_f ~section "Running node server at %s"
-            (match addr with
-             | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
-             | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s) >>
-          accept_loop t
-        with
-        | Exit -> return ()
+        ignore begin
+          try_lwt
+            Lwt_log.info_f ~section "Running node server at %s"
+              (match addr with
+                | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
+                | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s) >>
+            accept_loop t
+          with
+            | Exit -> return ()
             | exn -> Lwt_log.error_f ~exn ~section
                        "Error in connection manager accept loop"
         end;

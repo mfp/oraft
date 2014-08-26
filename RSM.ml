@@ -261,40 +261,40 @@ struct
     | `Unsafe_change _ -> raise_lwt (Failure "Unsafe config change")
 
   let make exec addr
-        ?(conn_wrapper = Oraft_lwt.trivial_conn_wrapper ())
-        ?join ?election_period ?heartbeat_period id =
+          ?(conn_wrapper = Oraft_lwt.trivial_conn_wrapper ())
+          ?join ?election_period ?heartbeat_period id =
     match join with
-    | None ->
-      let config        = Simple_config ([id, addr], []) in
-      let state         = Oraft.Core.make
-          ~id ~current_term:0L ~voted_for:None
-          ~log:[] ~config () in
-      let node_sockaddr = C.node_sockaddr addr in
-      let app_sockaddr  = C.app_sockaddr addr in
-      let conn_mgr      = SS.make_conn_manager ~id node_sockaddr in
-      let serv          = SS.make exec ?election_period ?heartbeat_period
-          state conn_mgr
-      in
-      return { id; addr; c = None; node_sockaddr;
-               app_sockaddr; serv; exec; conn_wrapper; }
-    | Some peer_addr ->
-      let c = CC.make ~conn_wrapper ~id () in
-      Lwt_log.info_f ~section "Connecting to %S" (peer_addr |> C.string_of_address) >>
-      CC.connect c ~addr:peer_addr >>
-      lwt config        = CC.get_config c >>= raise_if_error in
-      lwt ()            = Lwt_log.info_f ~section "Got initial configuration %s"
-          (Oraft_util.string_of_config C.string_of_address config) in
-      let state         = Oraft.Core.make
-          ~id ~current_term:0L ~voted_for:None
-          ~log:[] ~config () in
-      let node_sockaddr = C.node_sockaddr addr in
-      let app_sockaddr  = C.app_sockaddr addr in
-      let conn_mgr      = SS.make_conn_manager ~id node_sockaddr in
-      let serv          = SS.make exec ?election_period
-          ?heartbeat_period state conn_mgr
-      in
-      return { id; addr; c = Some c;
-               node_sockaddr; app_sockaddr; serv; exec; conn_wrapper }
+      | None ->
+          let config        = Simple_config ([id, addr], []) in
+          let state         = Oraft.Core.make
+                                ~id ~current_term:0L ~voted_for:None
+                                ~log:[] ~config () in
+          let node_sockaddr = C.node_sockaddr addr in
+          let app_sockaddr  = C.app_sockaddr addr in
+          let conn_mgr      = SS.make_conn_manager ~id node_sockaddr in
+          let serv          = SS.make exec ?election_period ?heartbeat_period
+                                state conn_mgr
+          in
+            return { id; addr; c = None; node_sockaddr;
+                     app_sockaddr; serv; exec; conn_wrapper; }
+      | Some peer_addr ->
+          let c = CC.make ~conn_wrapper ~id () in
+            Lwt_log.info_f ~section "Connecting to %S" (peer_addr |> C.string_of_address) >>
+            CC.connect c ~addr:peer_addr >>
+            lwt config        = CC.get_config c >>= raise_if_error in
+            lwt ()            = Lwt_log.info_f ~section "Got initial configuration %s"
+                                  (Oraft_util.string_of_config C.string_of_address config) in
+            let state         = Oraft.Core.make
+                                  ~id ~current_term:0L ~voted_for:None
+                                  ~log:[] ~config () in
+            let node_sockaddr = C.node_sockaddr addr in
+            let app_sockaddr  = C.app_sockaddr addr in
+            let conn_mgr      = SS.make_conn_manager ~id node_sockaddr in
+            let serv          = SS.make exec ?election_period
+                                  ?heartbeat_period state conn_mgr
+            in
+              return { id; addr; c = Some c;
+                       node_sockaddr; app_sockaddr; serv; exec; conn_wrapper }
 
   let send_msg conn msg = send_msg Oraft_proto.Server_msg.write conn msg
   let read_msg conn     = read_msg Oraft_proto.Client_msg.read conn
@@ -433,57 +433,57 @@ struct
     let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr t.app_sockaddr)
                            Unix.SOCK_STREAM 0)
     in
-    Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
-    Lwt_unix.bind sock t.app_sockaddr;
-    Lwt_unix.listen sock 256;
+      Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
+      Lwt_unix.bind sock t.app_sockaddr;
+      Lwt_unix.listen sock 256;
 
-    let rec accept_loop t =
-      lwt (fd_addrs,_) = Lwt_unix.accept_n sock 50 in
-      let handle_conn fd addr =
-        (* the following are not supported for ADDR_UNIX sockets, so catch *)
-        (* possible exceptions  *)
-        (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
-        (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-        try_lwt
-          lwt ich, och = t.conn_wrapper.wrap_incoming_conn fd in
-          let conn = { addr; ich; och; in_buf = ref ""; out_buf = MB.create () } in
-          (match_lwt read_msg conn with
-          | { id; op = Connect client_id; _ } ->
-            Lwt_log.info_f ~section "Incoming client connection from %S" client_id >>
-            send_msg conn { id; response = OK "" } >>
-            request_loop t client_id conn
-          | { id; _ } ->
-            send_msg conn { id; response = Error "Bad request" })
-          >> try_lwt Lwt_io.close ich with _ -> return_unit
-        with
-        | End_of_file
-        | Unix.Unix_error (Unix.ECONNRESET, _, _) -> return_unit
-        | Tls_lwt.Tls_failure _ as exn ->
-          Lwt_log.info ~section ~exn "TLS error in incoming connection, aborting"
-        | exn ->
-          Lwt_log.error_f ~section ~exn "Error in dispatch"
-        finally
-        try_lwt Lwt_unix.close fd with _ -> return_unit
+      let rec accept_loop t =
+        lwt (fd_addrs,_) = Lwt_unix.accept_n sock 50 in
+        let handle_conn fd addr =
+          (* the following are not supported for ADDR_UNIX sockets, so catch *)
+          (* possible exceptions  *)
+          (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+          (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
+          try_lwt
+            lwt ich, och = t.conn_wrapper.wrap_incoming_conn fd in
+            let conn = { addr; ich; och; in_buf = ref ""; out_buf = MB.create () } in
+              (match_lwt read_msg conn with
+                | { id; op = Connect client_id; _ } ->
+                    Lwt_log.info_f ~section "Incoming client connection from %S" client_id >>
+                    send_msg conn { id; response = OK "" } >>
+                    request_loop t client_id conn
+                | { id; _ } ->
+                    send_msg conn { id; response = Error "Bad request" })
+              >> try_lwt Lwt_io.close ich with _ -> return_unit
+          with
+            | End_of_file
+            | Unix.Unix_error (Unix.ECONNRESET, _, _) -> return_unit
+            | Tls_lwt.Tls_failure _ as exn ->
+                Lwt_log.info ~section ~exn "TLS error in incoming connection, aborting"
+            | exn ->
+                Lwt_log.error_f ~section ~exn "Error in dispatch"
+          finally
+            try_lwt Lwt_unix.close fd with _ -> return_unit
+        in
+          List.iter (fun (fd, addr) -> Lwt.async (fun () -> handle_conn fd addr)) fd_addrs;
+          accept_loop t
       in
-      List.iter (fun (fd, addr) -> Lwt.async (fun () -> handle_conn fd addr)) fd_addrs;
-      accept_loop t
-    in
-    ignore begin try_lwt
-        Lwt_log.info_f ~section "Running app server at %s"
-          (match t.app_sockaddr with
-           | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
-           | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s) >>
-        SS.run t.serv
-      with exn ->
-        Lwt_log.error_f ~section ~exn "Error in Oraft_lwt server run()"
-    end;
-    try_lwt
-      match t.c with
-      | None -> accept_loop t
-      | Some c -> join_cluster t c >> accept_loop t
-    with exn ->
-      Lwt_log.fatal ~section ~exn "Exn raised"
-    finally
-    (* FIXME: t.c client shutdown *)
-    try_lwt Lwt_unix.close sock with _ -> return_unit
+        ignore begin try_lwt
+            Lwt_log.info_f ~section "Running app server at %s"
+              (match t.app_sockaddr with
+                | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
+                | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s) >>
+            SS.run t.serv
+          with exn ->
+            Lwt_log.error_f ~section ~exn "Error in Oraft_lwt server run()"
+        end;
+        try_lwt
+          match t.c with
+            | None -> accept_loop t
+            | Some c -> join_cluster t c >> accept_loop t
+        with exn ->
+          Lwt_log.fatal ~section ~exn "Exn raised"
+        finally
+          (* FIXME: t.c client shutdown *)
+          try_lwt Lwt_unix.close sock with _ -> return_unit
 end
