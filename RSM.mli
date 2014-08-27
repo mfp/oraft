@@ -21,7 +21,8 @@ sig
 
   type t
 
-  val make : id:string -> unit -> t
+  val make :
+    ?conn_wrapper:[> `Outgoing] Oraft_lwt.conn_wrapper -> id:string -> unit -> t
 
   val connect : t -> addr:address -> unit Lwt.t
 
@@ -48,7 +49,9 @@ sig
   type 'a apply     = 'a Core.server -> C.op -> [`OK of 'a | `Error of exn] execution
 
   val make :
-    'a apply -> address -> ?join:address ->
+    'a apply -> address ->
+    ?conn_wrapper:[`Outgoing | `Incoming] Oraft_lwt.conn_wrapper ->
+    ?join:address ->
     ?election_period:float ->
     ?heartbeat_period:float -> rep_id -> 'a t Lwt.t
 

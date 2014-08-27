@@ -3,6 +3,7 @@ open Lwt
 
 module String  = BatString
 module Hashtbl = BatHashtbl
+module Option  = BatOption
 
 type op =
     Get of string
@@ -25,8 +26,9 @@ struct
       match s.[0] with
           '?' -> Get (String.slice ~first:1 s)
         | '<' -> Wait (String.slice ~first:1 s)
-        | '!' -> let k, v = String.slice ~first:1 s |> String.split ~by:"=" in
-                   Set (k, v)
+        | '!' ->
+            let k, v = String.slice ~first:1 s |> String.split ~by:"=" in
+              Set (k, v)
         | _ -> failwith "bad op"
 
   let sockaddr s =
@@ -47,7 +49,14 @@ end
 module SERVER = RSM.Make_server(CONF)
 module CLIENT = RSM.Make_client(CONF)
 
-let run_server ~addr ?join ~id () =
+let make_tls_wrapper tls =
+  Option.map
+    (fun (client_config, server_config) ->
+       Oraft_lwt_tls.make_server_wrapper
+         ~client_config ~server_config ())
+    tls
+
+let run_server ?tls ~addr ?join ~id () =
   let h    = Hashtbl.create 13 in
   let cond = Lwt_condition.create () in
 
@@ -74,22 +83,27 @@ let run_server ~addr ?join ~id () =
         `Sync (return (`OK ""))
   in
 
-  lwt server = SERVER.make exec addr ?join id in
+  lwt server = SERVER.make ?conn_wrapper:(make_tls_wrapper tls) exec addr ?join id in
     SERVER.run server
 
-let client_op ~addr op =
-  let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
+let client_op ?tls ~addr op =
+  let c    = CLIENT.make
+               ?conn_wrapper:(make_tls_wrapper tls)
+               ~id:(string_of_int (Unix.getpid ())) () in
   let exec = match op with
                | Get _ | Wait _ -> CLIENT.execute_ro
                | Set _ -> CLIENT.execute
   in
     CLIENT.connect c ~addr >>
     match_lwt exec c op with
-        `OK s -> printf "+OK %s\n" s; return ()
+      | `OK s -> printf "+OK %s\n" s; return ()
       | `Error s -> printf "-ERR %s\n" s; return ()
 
-let ro_benchmark ?(iterations = 10_000) ~addr () =
-  let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
+let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
+  let c    = CLIENT.make
+               ?conn_wrapper:(make_tls_wrapper tls)
+               ~id:(string_of_int (Unix.getpid ())) ()
+  in
     CLIENT.connect c ~addr >>
     CLIENT.execute c (Set ("bm", "0")) >>
     let t0 = Unix.gettimeofday () in
@@ -101,8 +115,11 @@ let ro_benchmark ?(iterations = 10_000) ~addr () =
         printf "%.0f RO ops/s\n" (float iterations /. dt);
         return ()
 
-let wr_benchmark ?(iterations = 10_000) ~addr () =
-  let c    = CLIENT.make ~id:(string_of_int (Unix.getpid ())) () in
+let wr_benchmark ?tls ?(iterations = 10_000) ~addr () =
+  let c    = CLIENT.make
+               ?conn_wrapper:(make_tls_wrapper tls)
+               ~id:(string_of_int (Unix.getpid ())) ()
+  in
     CLIENT.connect c ~addr >>
     let t0 = Unix.gettimeofday () in
       for_lwt i = 1 to iterations do
@@ -119,18 +136,21 @@ let k            = ref None
 let v            = ref None
 let ro_bm_iters  = ref 0
 let wr_bm_iters  = ref 0
+let tls          = ref None
 
 let specs =
   Arg.align
     [
+      "-tls", Arg.String (fun dirname -> tls := Some dirname),
+      "dirname Directory containing PEM files";
       "-master", Arg.String (fun n -> mode := `Master n),
-        "ADDR Launch master at given address";
+      "ADDR Launch master at given address";
       "-join", Arg.String (fun p -> cluster_addr := Some p),
-        "ADDR Join cluster at given address";
+      "ADDR Join cluster at given address";
       "-client", Arg.String (fun addr -> mode := `Client addr), "ADDR Client mode";
       "-key", Arg.String (fun s -> k := Some s), "STRING Wait for key/set it";
       "-value", Arg.String (fun s -> v := Some s),
-        "STRING Set key given in -key to STRING";
+      "STRING Set key given in -key to STRING";
       "-ro_bm", Arg.Set_int ro_bm_iters, "N Run RO benchmark (N iterations)";
       "-wr_bm", Arg.Set_int wr_bm_iters, "N Run WR benchmark (N iterations)";
     ]
@@ -139,26 +159,46 @@ let usage () =
   print_endline (Arg.usage_string specs "Usage:");
   exit 1
 
+let x509_cert dirname = dirname ^ "/server.crt"
+let x509_pk dirname   = dirname ^ "/server.key"
+
+let tls_create dirname =
+  lwt ()          = Tls_lwt.rng_init () in
+  let x509_cert   = x509_cert dirname in
+  let x509_pk     = x509_pk dirname in
+  lwt certificate =
+    X509_lwt.private_of_pems ~cert:x509_cert ~priv_key:x509_pk in
+    return (Some Tls.Config.(client (), server ~certificate ()))
+
 let () =
   ignore (Sys.set_signal Sys.sigpipe Sys.Signal_ignore);
   Arg.parse specs ignore "Usage:";
-  match !mode with
-      `Help -> usage ()
-    | `Master addr ->
-        Lwt_unix.run (run_server ~addr ?join:!cluster_addr ~id:addr ())
-    | `Client addr ->
-        printf "Launching client %d\n" (Unix.getpid ());
-        if !ro_bm_iters > 0 then
-          Lwt_unix.run (ro_benchmark ~iterations:!ro_bm_iters ~addr ());
-        if !wr_bm_iters > 0 then
-          Lwt_unix.run (wr_benchmark ~iterations:!wr_bm_iters ~addr ());
+  let tls = match !tls with
+    | None -> Lwt.return None
+    | Some dirname -> tls_create dirname
+  in
+    match !mode with
+      | `Help -> usage ()
+      | `Master addr ->
+          Lwt_main.run (tls >>= fun tls ->
+                        run_server ?tls ~addr ?join:!cluster_addr ~id:addr ())
+      | `Client addr ->
+          printf "Launching client %d\n" (Unix.getpid ());
+          if !ro_bm_iters > 0 then
+            Lwt_main.run (tls >>= fun tls ->
+                          ro_benchmark ?tls ~iterations:!ro_bm_iters ~addr ());
+          if !wr_bm_iters > 0 then
+            Lwt_main.run (tls >>= fun tls ->
+                          wr_benchmark ?tls ~iterations:!wr_bm_iters ~addr ());
 
-        if !ro_bm_iters > 0 || !wr_bm_iters > 0 then exit 0;
+          if !ro_bm_iters > 0 || !wr_bm_iters > 0 then exit 0;
 
-        match !k, !v with
-            None, None | None, _ -> usage ()
-          | Some k, Some v ->
-              Lwt_unix.run (client_op ~addr (Set (k, v)))
-          | Some k, None ->
-              Lwt_unix.run (client_op ~addr (Wait k))
+          match !k, !v with
+            | None, None | None, _ -> usage ()
+            | Some k, Some v ->
+                Lwt_main.run (tls >>= fun tls ->
+                              client_op ?tls ~addr (Set (k, v)))
+            | Some k, None ->
+                Lwt_main.run (tls >>= fun tls ->
+                              client_op ?tls ~addr (Wait k))
 

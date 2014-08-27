@@ -732,32 +732,64 @@ sig
   val string_of_address : address -> string
 end
 
-(* taken from lwt_io.ml *)
-let open_connection ?buffer_size sockaddr =
-  let fd = Lwt_unix.socket (Unix.domain_of_sockaddr sockaddr) Unix.SOCK_STREAM 0 in
-  let close = lazy begin
+type 'a conn_wrapper =
+    {
+      wrap_incoming_conn :
+        Lwt_unix.file_descr -> (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t;
+      wrap_outgoing_conn :
+        Lwt_unix.file_descr ->
+        (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t;
+    }
+
+type simple_wrapper =
+  Lwt_unix.file_descr -> (Lwt_io.input_channel * Lwt_io.output_channel) Lwt.t
+
+let make_client_conn_wrapper f =
+  { wrap_incoming_conn =
+      (fun fd -> try_lwt failwith "Incoming conn wrapper invoked in client");
+    wrap_outgoing_conn = f;
+  }
+
+let make_server_conn_wrapper ~incoming ~outgoing =
+  { wrap_incoming_conn = incoming; wrap_outgoing_conn = outgoing }
+
+let trivial_wrap_outgoing_conn ?buffer_size fd =
+  let close =
+    lazy begin
+      try_lwt
+        Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
+        return_unit
+      with Unix.Unix_error(Unix.ENOTCONN, _, _) ->
+        (* This may happen if the server closed the connection before us *)
+        return_unit
+      finally
+        Lwt_unix.close fd
+    end
+  in
     try_lwt
-      Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
-      return_unit
-    with Unix.Unix_error(Unix.ENOTCONN, _, _) ->
-      (* This may happen if the server closed the connection before us *)
-      return_unit
-    finally
-      Lwt_unix.close fd
-  end in
-  try_lwt
-    lwt () = Lwt_unix.connect fd sockaddr in
-    (try Lwt_unix.set_close_on_exec fd with Invalid_argument _ -> ());
-    return (fd,
-            Lwt_io.make ?buffer_size
-              ~close:(fun _ -> Lazy.force close)
-              ~mode:Lwt_io.input (Lwt_bytes.read fd),
-            Lwt_io.make ?buffer_size
-              ~close:(fun _ -> Lazy.force close)
-              ~mode:Lwt_io.output (Lwt_bytes.write fd))
-  with exn ->
-    lwt () = Lwt_unix.close fd in
-    raise_lwt exn
+      (try Lwt_unix.set_close_on_exec fd with Invalid_argument _ -> ());
+      return (Lwt_io.make ?buffer_size
+                ~close:(fun _ -> Lazy.force close)
+                ~mode:Lwt_io.input (Lwt_bytes.read fd),
+              Lwt_io.make ?buffer_size
+                ~close:(fun _ -> Lazy.force close)
+                ~mode:Lwt_io.output (Lwt_bytes.write fd))
+    with exn ->
+      lwt () = Lwt_unix.close fd in
+      raise_lwt exn
+
+let trivial_wrap_incoming_conn ?buffer_size fd =
+  return
+    (Lwt_io.of_fd ?buffer_size ~mode:Lwt_io.input fd,
+     Lwt_io.of_fd ?buffer_size ~mode:Lwt_io.output fd)
+
+let trivial_conn_wrapper ?buffer_size () =
+  { wrap_incoming_conn = trivial_wrap_incoming_conn ?buffer_size;
+    wrap_outgoing_conn = trivial_wrap_outgoing_conn ?buffer_size;
+  }
+
+let wrap_outgoing_conn w fd = w.wrap_outgoing_conn fd
+let wrap_incoming_conn w fd = w.wrap_incoming_conn fd
 
 module Simple_IO(C : SERVER_CONF) =
 struct
@@ -776,6 +808,7 @@ struct
         sock          : Lwt_unix.file_descr;
         mutable conns : connection M.t;
         conn_signal   : unit Lwt_condition.t;
+        conn_wrapper  : [`Incoming | `Outgoing] conn_wrapper;
       }
 
   and connection =
@@ -790,46 +823,43 @@ struct
       mutable noutgoing : int;
     }
 
-
-  let make ~id addr =
+  let make ?(conn_wrapper = trivial_conn_wrapper ()) ~id addr =
     let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr addr) Unix.SOCK_STREAM 0) in
       Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
       Lwt_unix.bind sock addr;
       Lwt_unix.listen sock 256;
-      Lwt_log.ign_info_f ~section "Running node server at %s"
-        (match addr with
-         | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
-         | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s);
-
 
       let rec accept_loop t =
         lwt (fd, addr) = Lwt_unix.accept sock in
           ignore begin try_lwt
-            (* the following are not supported for ADDR_UNIX sockets, so catch
-             * possible exceptions *)
-            (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
-            (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-            let ich = Lwt_io.of_fd Lwt_io.input fd in
-            let och = Lwt_io.of_fd Lwt_io.output fd in
-            lwt id  = Lwt_io.read_line ich in
-            let c   = { id; mgr = t; ich; och; closed = false;
-                        in_buf = ""; out_buf = MB.create ();
-                        noutgoing = 0;
-                      }
-            in
-              t.conns <- M.add id c t.conns;
-              Lwt_condition.broadcast t.conn_signal ();
-              Lwt_log.info_f ~section "Incoming connection from peer %S" id
-          with _ ->
-            Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
-            Lwt_unix.close fd
+              (* the following are not supported for ADDR_UNIX sockets, so catch
+               * possible exceptions *)
+              (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+              (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
+              lwt ich, och = conn_wrapper.wrap_incoming_conn fd in
+              lwt id       = Lwt_io.read_line ich in
+              let c        = { id; mgr = t; ich; och; closed = false;
+                               in_buf = ""; out_buf = MB.create ();
+                               noutgoing = 0;
+                             }
+              in
+                t.conns <- M.add id c t.conns;
+                Lwt_condition.broadcast t.conn_signal ();
+                Lwt_log.info_f ~section "Incoming connection from peer %S" id
+            with _ ->
+              Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
+              Lwt_unix.close fd
           end;
-          accept_loop t in
-
+          accept_loop t
+      in
       let conn_signal = Lwt_condition.create () in
-      let t           = { id; sock; conn_signal; conns = M.empty; } in
+      let t           = { id; sock; conn_signal; conns = M.empty; conn_wrapper; } in
         ignore begin
           try_lwt
+            Lwt_log.info_f ~section "Running node server at %s"
+              (match addr with
+                | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
+                | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s) >>
             accept_loop t
           with
             | Exit -> return ()
@@ -851,8 +881,12 @@ struct
             await_conn ()
       | None -> (* we must connect ourselves *)
           try_lwt
-            Lwt_log.info_f ~section "Connecting to %S" addr >>
-            lwt fd, ich, och = open_connection (C.node_sockaddr addr) in
+            Lwt_log.info_f ~section "Connecting to %S" (C.string_of_address addr) >>
+            let saddr    = C.node_sockaddr addr in
+            let fd       = Lwt_unix.socket (Unix.domain_of_sockaddr saddr)
+                             Unix.SOCK_STREAM 0 in
+            lwt ()       = Lwt_unix.connect fd saddr in
+            lwt ich, och = t.conn_wrapper.wrap_outgoing_conn fd in
               try_lwt
                 (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
                 (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
