@@ -1,3 +1,35 @@
+
+(* Trivial distributed key-value service.
+ *
+ * Usage:
+ *
+ * (1) Launch of 1st node (will be master with quorum = 1 at first):
+ *
+ *     ./dict -master  n1a,n1b
+ *         (uses UNIX domain sockets  n1a for Raft communication,
+ *          n1b as address for app server -- use   ip1:port1,ip2:port2
+ *          to listen at ip1:port1 for Raft, ip1:port2 for app)
+ *
+ *
+ * (2) Launch extra nodes. They will join the cluster and the quorum will be
+ *     updated.
+ *
+ *     ./dict -master n2a,n2b -join n1a,n1b
+ *
+ *     ./dict -master n3a,n3b -join n1a,n1b
+ *
+ *     ...
+ *
+ * (3) perform client reqs
+ *
+ *     ./dict -client n1a,n1b -key foo             # retrieve value assoc'ed
+ *                                                 # to key "foo", block until
+ *                                                 # available
+ *
+ *     ./dict -client n1a,n1b -key foo -value bar  # associate 'bar' to 'foo'
+ *
+ * *)
+
 open Printf
 open Lwt
 
