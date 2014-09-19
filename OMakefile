@@ -58,7 +58,11 @@ META: META.in
 
 install: $(LIBS) META
 	ocamlfind remove oraft
-	ocamlfind install oraft META $(ls *.cmi *.cmxa *.cma *.a *.mli)
+	ocamlfind install oraft META \
+                          oraft.{a,cma,cmxa,mli,cmi,cmt,cmti} \
+                          oraft_lwt.{mli,cmi,cmt,cmti} \
+                          oraft_lwt_tls.{cmi,cmt} \
+                          RSM.{mli,cmi,cmt,cmti}
 
 uninstall:
 	ocamlfind remove oraft
