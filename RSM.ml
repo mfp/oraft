@@ -40,7 +40,7 @@ let read_msg read conn =
     (fun ich ->
        lwt len = Lwt_io.LE.read_int ich in
        let buf = conn.in_buf in
-         if String.length !buf < len then buf := String.create len;
+         if String.length !buf < len then buf := Bytes.create len;
          Lwt_io.read_into_exactly ich !buf 0 len >>
          return (Extprot.Conv.deserialize read !buf))
     conn.ich
