@@ -997,7 +997,8 @@ struct
         Lwt_io.atomic
           (fun ich ->
              lwt len = Lwt_io.LE.read_int ich in
-               if String.length c.in_buf < len then c.in_buf <- String.create len;
+               if String.length c.in_buf < len
+               then c.in_buf <- Bytes.create len;
                lwt ()  = Lwt_io.read_into_exactly ich c.in_buf 0 len in
                let msg = EC.deserialize Raft_message.read c.in_buf in
                  Lwt_log.debug_f ~section
