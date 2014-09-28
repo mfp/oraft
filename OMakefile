@@ -15,7 +15,6 @@ OCAMLPACKS[] =
    lwt.syntax
    lwt.syntax.log
    extprot
-   tls.lwt
 
 if $(not $(OCAMLFIND_EXISTS))
    eprintln(This project requires ocamlfind, but is was not found.)
@@ -25,7 +24,6 @@ if $(not $(OCAMLFIND_EXISTS))
 OBJECTS[] =
     oraft
     oraft_lwt
-    oraft_lwt_tls
     oraft_proto
     oraft_util
     RSM

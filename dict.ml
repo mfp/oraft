@@ -81,13 +81,6 @@ end
 module SERVER = RSM.Make_server(CONF)
 module CLIENT = RSM.Make_client(CONF)
 
-let make_tls_wrapper tls =
-  Option.map
-    (fun (client_config, server_config) ->
-       Oraft_lwt_tls.make_server_wrapper
-         ~client_config ~server_config ())
-    tls
-
 let run_server ?tls ~addr ?join ~id () =
   let h    = Hashtbl.create 13 in
   let cond = Lwt_condition.create () in
@@ -115,12 +108,11 @@ let run_server ?tls ~addr ?join ~id () =
         `Sync (return (`OK ""))
   in
 
-  lwt server = SERVER.make ?conn_wrapper:(make_tls_wrapper tls) exec addr ?join id in
+  lwt server = SERVER.make exec addr ?join id in
     SERVER.run server
 
 let client_op ?tls ~addr op =
   let c    = CLIENT.make
-               ?conn_wrapper:(make_tls_wrapper tls)
                ~id:(string_of_int (Unix.getpid ())) () in
   let exec = match op with
                | Get _ | Wait _ -> CLIENT.execute_ro
@@ -133,7 +125,6 @@ let client_op ?tls ~addr op =
 
 let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
   let c    = CLIENT.make
-               ?conn_wrapper:(make_tls_wrapper tls)
                ~id:(string_of_int (Unix.getpid ())) ()
   in
     CLIENT.connect c ~addr >>
@@ -149,7 +140,6 @@ let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
 
 let wr_benchmark ?tls ?(iterations = 10_000) ~addr () =
   let c    = CLIENT.make
-               ?conn_wrapper:(make_tls_wrapper tls)
                ~id:(string_of_int (Unix.getpid ())) ()
   in
     CLIENT.connect c ~addr >>
@@ -194,20 +184,12 @@ let usage () =
 let x509_cert dirname = dirname ^ "/server.crt"
 let x509_pk dirname   = dirname ^ "/server.key"
 
-let tls_create dirname =
-  lwt ()          = Tls_lwt.rng_init () in
-  let x509_cert   = x509_cert dirname in
-  let x509_pk     = x509_pk dirname in
-  lwt certificate =
-    X509_lwt.private_of_pems ~cert:x509_cert ~priv_key:x509_pk in
-    return (Some Tls.Config.(client (), server ~certificate ()))
-
 let () =
   ignore (Sys.set_signal Sys.sigpipe Sys.Signal_ignore);
   Arg.parse specs ignore "Usage:";
   let tls = match !tls with
     | None -> Lwt.return None
-    | Some dirname -> tls_create dirname
+    | Some dirname -> Lwt.return None
   in
     match !mode with
       | `Help -> usage ()
