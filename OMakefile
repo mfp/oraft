@@ -4,7 +4,7 @@ NATIVE_ENABLED = true
 
 OCAMLFINDFLAGS = -syntax camlp4o -ppopt -lwt-debug
 
-OCAMLFLAGS = -g -w +a-4-6-9-27..29-30-32..99 -warn-error +a-4-6-9-18-27-28-29..99 -bin-annot
+OCAMLFLAGS = -g -w +a-4-6-9-27..29-30-32..99 -warn-error -a -bin-annot
 OCAMLOPTFLAGS = -inline 1000
 
 VERSION = 0.1
