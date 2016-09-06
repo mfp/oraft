@@ -764,14 +764,15 @@ let trivial_wrap_outgoing_conn ?buffer_size fd =
         return_unit
       finally
         Lwt_unix.close fd
-    end
-  in
+    end in
+  let buf1 = BatOption.map Lwt_bytes.create buffer_size in
+  let buf2 = BatOption.map Lwt_bytes.create buffer_size in
     try_lwt
       (try Lwt_unix.set_close_on_exec fd with Invalid_argument _ -> ());
-      return (Lwt_io.make ?buffer_size
+      return (Lwt_io.make ?buffer:buf1
                 ~close:(fun _ -> Lazy.force close)
                 ~mode:Lwt_io.input (Lwt_bytes.read fd),
-              Lwt_io.make ?buffer_size
+              Lwt_io.make ?buffer:buf2
                 ~close:(fun _ -> Lazy.force close)
                 ~mode:Lwt_io.output (Lwt_bytes.write fd))
     with exn ->
@@ -779,9 +780,11 @@ let trivial_wrap_outgoing_conn ?buffer_size fd =
       raise_lwt exn
 
 let trivial_wrap_incoming_conn ?buffer_size fd =
-  return
-    (Lwt_io.of_fd ?buffer_size ~mode:Lwt_io.input fd,
-     Lwt_io.of_fd ?buffer_size ~mode:Lwt_io.output fd)
+  let buf1 = BatOption.map Lwt_bytes.create buffer_size in
+  let buf2 = BatOption.map Lwt_bytes.create buffer_size in
+    return
+      (Lwt_io.of_fd ?buffer:buf1 ~mode:Lwt_io.input fd,
+       Lwt_io.of_fd ?buffer:buf2 ~mode:Lwt_io.output fd)
 
 let trivial_conn_wrapper ?buffer_size () =
   { wrap_incoming_conn = trivial_wrap_incoming_conn ?buffer_size;
