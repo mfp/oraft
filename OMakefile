@@ -39,7 +39,7 @@ LIBS     = $(OCamlLibrary oraft, $(OBJECTS))
 
 section
     OCAML_LIBS = oraft
-    PROGRAMS = $(OCamlProgram test_DES, oraft test_DES) \
+    PROGRAMS = $(OCamlProgram test_DES, test_DES) \
                $(OCamlProgram dict, dict)
     .DEFAULT: $(PROGRAMS)
 
