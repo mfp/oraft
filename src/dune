@@ -1,0 +1,39 @@
+(rule
+ (targets oraft_proto.ml)
+ (deps    oraft_proto.proto)
+ (action  (run extprotc %{deps})))
+
+(library
+ (name        oraft)
+ (public_name oraft)
+ (libraries  batteries lwt)
+ (modules oraft)
+ (flags -w -30)
+ (synopsis ""))
+
+(library
+ (name        oraft_lwt)
+ (public_name oraft-lwt)
+ (preprocess (pps lwt_ppx))
+ (libraries  extprot lwt.unix lwt_log oraft)
+ (wrapped false)
+ (modules oraft_proto oraft_lwt)
+ (flags -w -30)
+ (synopsis ""))
+
+(library
+ (name        oraft_lwt_tls)
+ (public_name oraft-lwt-tls)
+ (preprocess (pps lwt_ppx))
+ (libraries  tls.lwt oraft_lwt)
+ (modules oraft_lwt_tls)
+(synopsis ""))
+
+(library
+ (name        oraft_rsm)
+ (public_name oraft-rsm)
+ (preprocess (pps lwt_ppx))
+ (libraries  extprot lwt_log lwt_ppx oraft_lwt)
+ (flags -w -32)
+ (modules oraft_rsm)
+ (synopsis ""))

@@ -1,5 +1,5 @@
 open Printf
-open Lwt
+open Lwt.Infix
 
 module Map    = BatMap
 module List   = BatList

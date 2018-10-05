@@ -1,7 +1,0 @@
-version= "VERSION"
-name="oraft"
-description="Raft consensus algorithm"
-requires="batteries extprot tls.lwt"
-archive(byte)="oraft.cma"
-archive(byte, plugin)="oraft.cma"
-archive(native)="oraft.cmxa"
