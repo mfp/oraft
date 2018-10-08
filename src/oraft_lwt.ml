@@ -25,7 +25,16 @@ module List   = BatList
 module Option = BatOption
 module Queue  = BatQueue
 
-let section = Lwt_log.Section.make "oraft_lwt"
+let src = Logs.Src.create "oraft_lwt"
+
+let pp_exn ppf exn =
+  Format.pp_print_string ppf (Printexc.to_string exn)
+
+let pp_saddr ppf = function
+  | Unix.ADDR_INET (a, p) ->
+      Format.fprintf ppf "%s/%d" (Unix.string_of_inet_addr a) p
+  | Unix.ADDR_UNIX s ->
+      Format.fprintf ppf "unix://%s" s
 
 module REPID = struct type t = rep_id let compare = String.compare end
 module RM = Map.Make(REPID)
@@ -338,7 +347,9 @@ struct
           in
             apply_loop ()
         with exn ->
-          Lwt_log.error_f ~exn ~section "Error in Oraft_lwt apply loop."
+          Logs_lwt.err ~src begin fun m ->
+            m "Error in Oraft_lwt apply loop: %a" pp_exn exn
+          end
       end;
       t
 
@@ -450,23 +461,26 @@ struct
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         t.heartbeat <- fst (Lwt.wait ());
-        Lwt_log.info_f ~section "Becoming %s"
-          (match ev with
-             | Become_candidate -> "candidate"
-             | _ -> "follower (unknown leader)")>>= fun () ->
+        Logs_lwt.info ~src begin fun m ->
+          m "Becoming %s"
+            (match ev with
+              | Become_candidate -> "candidate"
+              | _ -> "follower (unknown leader)")
+        end >>= fun () ->
         exec_action t Reset_election_timeout
     | Become_follower (Some id) ->
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         Lwt_condition.broadcast t.leader_signal ();
         t.heartbeat <- fst (Lwt.wait ());
-        Lwt_log.info_f ~section "Becoming follower leader:%S" id>>= fun () ->
+        Logs_lwt.info ~src
+          (fun m -> m "Becoming follower leader:%S" id) >>= fun () ->
         exec_action t Reset_election_timeout
     | Become_leader ->
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         Lwt_condition.broadcast t.leader_signal ();
-        Lwt_log.info_f ~section "Becoming leader">>= fun () ->
+        Logs_lwt.info ~src (fun m -> m "Becoming leader") >>= fun () ->
         exec_action t Reset_election_timeout>>= fun () ->
         exec_action t Reset_heartbeat
     | Changed_config ->
@@ -819,7 +833,7 @@ struct
   module M  = Map.Make(String)
   module MB = Extprot.Msg_buffer
 
-  let section = Lwt_log.Section.make "oraft_lwt.io"
+  let src = Logs.Src.create "oraft_lwt.io"
 
   type conn_manager =
       {
@@ -864,7 +878,7 @@ struct
                 in
                   t.conns <- M.add id c t.conns;
                   Lwt_condition.broadcast t.conn_signal ();
-                  Lwt_log.info_f ~section "Incoming connection from peer %S" id
+                  Logs_lwt.info ~src (fun m -> m "Incoming connection from peer %S" id)
               with _ ->
                 Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
                 Lwt_unix.close fd
@@ -876,15 +890,14 @@ struct
       let t           = { id; sock; conn_signal; conns = M.empty; conn_wrapper; } in
         ignore begin
           try%lwt
-            Lwt_log.info_f ~section "Running node server at %s"
-              (match addr with
-                | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
-                | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s)>>= fun () ->
+            Logs_lwt.info ~src
+              (fun m -> m "Running node server at %a" pp_saddr addr) >>= fun () ->
             accept_loop t
           with
             | Exit -> Lwt.return ()
-            | exn -> Lwt_log.error_f ~exn ~section
-                       "Error in connection manager accept loop"
+            | exn -> Logs_lwt.err ~src begin fun m ->
+                m "Error in connection manager accept loop: %a" pp_exn exn
+              end
         end;
         Lwt.return t
 
@@ -901,7 +914,9 @@ struct
             await_conn ()
       | None -> (* we must connect ourselves *)
           try%lwt
-            Lwt_log.info_f ~section "Connecting to %S" (C.string_of_address addr)>>= fun () ->
+            Logs_lwt.info ~src begin fun m ->
+              m "Connecting to %S" (C.string_of_address addr)
+            end >>= fun () ->
             let saddr    = C.node_sockaddr addr in
             let fd       = Lwt_unix.socket (Unix.domain_of_sockaddr saddr)
                              Unix.SOCK_STREAM 0 in
@@ -1031,11 +1046,11 @@ struct
                  Lwt.return (Some (unwrap_msg msg)))
           c.ich
       with exn ->
-        let%lwt () = Lwt_log.info_f ~section ~exn
-                   "Error on receive from %S, closing connection" c.id
-        in
-          abort c >>= fun () ->
-          Lwt.return None
+        Logs_lwt.info ~src begin fun m ->
+          m "Error on receive from %S, closing connection. %a" c.id pp_exn exn
+        end >>= fun () ->
+        abort c >>= fun () ->
+        Lwt.return None
 
   type snapshot_transfer = unit
 

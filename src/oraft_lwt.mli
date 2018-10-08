@@ -1,6 +1,9 @@
 val string_of_config :
   (Oraft.Types.address -> string) -> Oraft.Types.config -> string
 
+val pp_exn : Format.formatter -> exn -> unit
+val pp_saddr : Format.formatter -> Unix.sockaddr -> unit
+
 module type LWTIO_TYPES =
 sig
   type op

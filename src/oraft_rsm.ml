@@ -3,7 +3,7 @@ open Lwt.Infix
 
 open Oraft.Types
 
-let section = Lwt_log.Section.make "RSM"
+let src = Logs.Src.create "oraft_rsm"
 
 module Map     = BatMap
 module Hashtbl = BatHashtbl
@@ -287,11 +287,13 @@ struct
                      app_sockaddr; serv; exec; conn_wrapper; }
       | Some peer_addr ->
           let c = CC.make ~conn_wrapper ~id () in
-            Lwt_log.info_f ~section "Connecting to %S" (peer_addr |> C.string_of_address) >>= fun () ->
+            Logs_lwt.info ~src begin fun m ->
+              m "Connecting to %S" (peer_addr |> C.string_of_address)
+            end >>= fun () ->
             CC.connect c ~addr:peer_addr >>= fun () ->
             let%lwt config        = CC.get_config c >>= raise_if_error in
-            let%lwt ()            = Lwt_log.info_f ~section "Got initial configuration %s"
-                                  (Oraft_lwt.string_of_config C.string_of_address config) in
+            let%lwt ()            = Logs_lwt.info ~src (fun m -> m "Got initial configuration %s"
+                                                                   (Oraft_lwt.string_of_config C.string_of_address config)) in
             let state         = Oraft.Core.make
                                   ~id ~current_term:0L ~voted_for:None
                                   ~log:[] ~config () in
@@ -377,7 +379,8 @@ struct
                       in
                         send_msg conn { id; response = map_op_result resp }
                     with exn ->
-                      Lwt_log.debug ~section ~exn "Caught exn"
+                      Logs_lwt.debug ~src
+                        (fun m -> m "Caught exn: %a" Oraft_lwt.pp_exn exn)
                     end;
                     Lwt.return_unit
       end
@@ -418,8 +421,10 @@ struct
     if is_in_config t config then
       Lwt.return_unit
     else begin
-      Lwt_log.info_f ~section "Adding failover id:%S addr:%S"
-        t.id (C.string_of_address t.addr)>>= fun () ->
+      Logs_lwt.info ~src begin fun m ->
+        m "Adding failover id:%S addr:%S"
+          t.id (C.string_of_address t.addr)
+      end >>= fun () ->
       CC.change_config c (Add_failover (t.id, t.addr)) >>= check_config_err
     end
 
@@ -427,7 +432,7 @@ struct
     if is_active t config then
       Lwt.return_unit
     else begin
-      Lwt_log.info_f ~section "Promoting failover id:%S" t.id>>= fun () ->
+      Logs_lwt.info ~src (fun m -> m "Promoting failover id:%S" t.id) >>= fun () ->
       CC.change_config c (Promote t.id) >>= check_config_err
     end
 
@@ -441,8 +446,10 @@ struct
       add_as_failover_if_needed t c config>>= fun () ->
       promote_if_needed t c config>>= fun () ->
       let%lwt config = CC.get_config c >>= raise_if_error in
-        Lwt_log.info_f ~section "Final config: %s"
-          (Oraft_lwt.string_of_config C.string_of_address config)
+        Logs_lwt.info ~src begin fun m ->
+          m "Final config: %s"
+            (Oraft_lwt.string_of_config C.string_of_address config)
+        end
 
   let handle_conn t fd addr =
     (* the following are not supported for ADDR_UNIX sockets, so catch *)
@@ -454,8 +461,9 @@ struct
       let conn     = { addr; ich; och; in_buf = ref Bytes.empty; out_buf = MB.create () } in
         (match%lwt read_msg conn with
             | { id; op = Connect client_id; _ } ->
-                Lwt_log.info_f ~section
-                  "Incoming client connection from %S" client_id>>= fun () ->
+                Logs_lwt.info ~src begin fun m ->
+                  m "Incoming client connection from %S" client_id
+                end >>= fun () ->
                 send_msg conn { id; response = OK "" }>>= fun () ->
                 request_loop t client_id conn
             | { id; _ } ->
@@ -466,7 +474,8 @@ struct
       | End_of_file
       | Unix.Unix_error (Unix.ECONNRESET, _, _) -> Lwt.return_unit
       | exn ->
-          Lwt_log.error_f ~section ~exn "Error in dispatch")
+          Logs_lwt.err ~src
+            (fun m -> m "Error in dispatch: %a" Oraft_lwt.pp_exn exn))
       [%finally
         try%lwt Lwt_unix.close fd with _ -> Lwt.return_unit]
 
@@ -486,20 +495,21 @@ struct
           accept_loop t
       in
         ignore begin try%lwt
-            Lwt_log.info_f ~section "Running app server at %s"
-              (match t.app_sockaddr with
-                | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
-                | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s)>>= fun () ->
+            Logs_lwt.info ~src begin fun m ->
+              m "Running app server at %a" Oraft_lwt.pp_saddr t.app_sockaddr
+            end >>= fun () ->
             SS.run t.serv
           with exn ->
-            Lwt_log.error_f ~section ~exn "Error in Oraft_lwt server run()"
+            Logs_lwt.err ~src begin fun m ->
+              m "Error in Oraft_lwt server run(): %a" Oraft_lwt.pp_exn exn
+            end
         end;
         (try%lwt
           match t.c with
             | None -> accept_loop t
             | Some c -> join_cluster t c >>= fun () -> accept_loop t
         with exn ->
-          Lwt_log.fatal ~section ~exn "Exn raised")
+          Logs_lwt.err ~src (fun m -> m "Exn raised: %a" Oraft_lwt.pp_exn exn))
           [%finally
              (* FIXME: t.c client shutdown *)
             try%lwt Lwt_unix.close sock with _ -> Lwt.return_unit]
