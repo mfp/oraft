@@ -1,3 +1,8 @@
+val string_of_config :
+  (Oraft.Types.address -> string) -> Oraft.Types.config -> string
+
+val pp_exn : Format.formatter -> exn -> unit
+val pp_saddr : Format.formatter -> Unix.sockaddr -> unit
 
 module type LWTIO_TYPES =
 sig
@@ -127,5 +132,5 @@ sig
 
   val make_conn_manager :
     ?conn_wrapper:[`Incoming | `Outgoing] conn_wrapper ->
-    id:string -> Unix.sockaddr -> conn_manager
+    id:string -> Unix.sockaddr -> conn_manager Lwt.t
 end

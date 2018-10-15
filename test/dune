@@ -1,0 +1,14 @@
+(executable
+ (name        dict)
+ (public_name oraft-dict)
+ (preprocess (pps lwt_ppx))
+ (modules    Dict)
+ (package    oraft-rsm)
+ (libraries  cmdliner fmt.tty fmt.cli logs.fmt logs.cli logs.lwt x509 oraft_lwt_tls oraft_rsm))
+
+(executable
+ (name        test_DES)
+ (public_name oraft-test-des)
+ (modules    Test_DES)
+ (package    oraft)
+ (libraries  oraft))

@@ -71,7 +71,7 @@ sig
                `State of 'app_state]) ->
     take_snapshot:(('op, 'app_state) node -> index * 'snapshot * term) ->
     install_snapshot:(('op, 'app_state) node -> 'snapshot -> unit) ->
-     ?steps:int -> ('op, 'app_state, 'snapshot) t -> int
+    ('op, 'app_state, 'snapshot) t -> int
 end =
 struct
   open Oraft.Types
@@ -132,7 +132,6 @@ struct
       try Some (M.find k t.m) with Not_found -> None
 
     let iter f t  = M.iter f t.m
-    let min_elt t = M.min_binding t.m |> snd
 
     let random t rng = M.find t.ids.(RND.int rng (Array.length t.ids)) t.m
 
@@ -203,7 +202,7 @@ struct
         NODES.random t.nodes t.rng
       with M.N n -> n
 
-  let get_leader_conf (type op) (type app_state) t =
+  let get_leader_conf t =
     C.committed_config (get_leader t).state
 
   let make
@@ -300,7 +299,7 @@ struct
     | Message (rep_id, msg) ->
         sprintf "Message (%S, %s)" rep_id (string_of_msg string_of_cmd msg)
     | Func _ -> "Func _"
-    | Install_snapshot (src, _, term, index, config) ->
+    | Install_snapshot (src, _, term, index, _config) ->
         sprintf "Install_snapshot (%S, _, %Ld, %Ld, _)" src term index
     | Snapshot_sent (dst, idx) -> sprintf "Snapshot_sent %S last_index:%Ld" dst idx
     | Snapshot_send_failed dst -> sprintf "Snapshot_send_failed %S" dst
@@ -317,10 +316,10 @@ struct
     in
       node.next_heartbeat <- Some t1
 
-  let unschedule_election t node =
+  let unschedule_election _t node =
     node.next_election <- None
 
-  let unschedule_heartbeat t node =
+  let unschedule_heartbeat _t node =
     node.next_heartbeat <- None
 
   let send_cmd t ?(dt=200L) node_id cmd =
@@ -359,8 +358,6 @@ struct
 
     let make ?(verbose=false) ~period des =
       { verbose; ticks = 0; period; des = DES des; }
-
-    let get_active_node des id = NODES.find des.nodes id
 
     let add_or_promote_failover t des =
 
@@ -454,7 +451,7 @@ struct
 
   let simulate
         ?(verbose = false) ?string_of_cmd ~msg_loss_rate
-        ~on_apply ~take_snapshot ~install_snapshot ?(steps = max_int) t =
+        ~on_apply ~take_snapshot ~install_snapshot t =
 
     let send_cmd ?(dst = random_node_id t) ?dt cmd =
       send_cmd ?dt t dst cmd in
@@ -603,7 +600,7 @@ struct
             if verbose then printf " Reset_heartbeat\n";
             unschedule_heartbeat t node;
             schedule_heartbeat t node
-        | Send (rep_id, addr, msg) ->
+        | Send (rep_id, _addr, msg) ->
             let dropped = FAILURE_SIMULATOR.is_msg_lost fail_sim
                             ~src:node.id ~dst:rep_id
             in
@@ -618,7 +615,7 @@ struct
                   ignore (Event_queue.schedule t.ev_queue dt rep_id
                             (Message (node.id, msg)))
               end
-        | Send_snapshot (dst, addr, idx, config) ->
+        | Send_snapshot (dst, _addr, idx, config) ->
             if verbose then
               printf " Send_snapshot (%S, %Ld)\n" dst idx;
             let dropped = FAILURE_SIMULATOR.is_msg_lost fail_sim

@@ -1,15 +1,40 @@
-open Printf
-open Lwt
+open Lwt.Infix
 open Oraft
 open Oraft.Types
-open Oraft_util
+
+let s_of_simple_config string_of_address l =
+  List.map
+    (fun (id, addr) -> Printf.sprintf "%S:%S" id (string_of_address addr)) l |>
+  String.concat "; "
+
+let string_of_config string_of_address c =
+  match c with
+      Simple_config (c, passive) ->
+        Printf.sprintf "Simple ([%s], [%s])"
+          (s_of_simple_config string_of_address c)
+          (s_of_simple_config string_of_address passive)
+    | Joint_config (c1, c2, passive) ->
+        Printf.sprintf "Joint ([%s], [%s], [%s])"
+          (s_of_simple_config string_of_address c1)
+          (s_of_simple_config string_of_address c2)
+          (s_of_simple_config string_of_address passive)
+
 
 module Map    = BatMap
 module List   = BatList
 module Option = BatOption
 module Queue  = BatQueue
 
-let section = Lwt_log.Section.make "oraft_lwt"
+let src = Logs.Src.create "oraft_lwt"
+
+let pp_exn ppf exn =
+  Format.pp_print_string ppf (Printexc.to_string exn)
+
+let pp_saddr ppf = function
+  | Unix.ADDR_INET (a, p) ->
+      Format.fprintf ppf "%s/%d" (Unix.string_of_inet_addr a) p
+  | Unix.ADDR_UNIX s ->
+      Format.fprintf ppf "unix://%s" s
 
 module REPID = struct type t = rep_id let compare = String.compare end
 module RM = Map.Make(REPID)
@@ -186,32 +211,32 @@ struct
   type ro_op_result = [ gen_result | `OK ]
 
   let get_sent_snapshots t =
-    match_lwt Lwt_stream.get t.sent_snapshots with
+    match%lwt Lwt_stream.get t.sent_snapshots with
         None -> fst (Lwt.wait ())
       | Some (peer, last_index) ->
           let l = Lwt_stream.get_available t.sent_snapshots in
-            Lwt_stream.njunk (List.length l) t.sent_snapshots >>
-            return (Snapshots_sent ((peer, last_index) :: l))
+            Lwt_stream.njunk (List.length l) t.sent_snapshots>>= fun () ->
+            Lwt.return (Snapshots_sent ((peer, last_index) :: l))
 
   let get_failed_snapshot t =
-    match_lwt Lwt_stream.get t.failed_snapshots with
+    match%lwt Lwt_stream.get t.failed_snapshots with
         None -> fst (Lwt.wait ())
-      | Some rep_id -> return (Snapshot_send_failed rep_id)
+      | Some rep_id -> Lwt.return (Snapshot_send_failed rep_id)
 
   let get_msg t =
-    match_lwt Lwt_stream.get t.msg_stream with
+    match%lwt Lwt_stream.get t.msg_stream with
       | None -> fst (Lwt.wait ())
-      | Some (rep_id, msg) -> return (Message (rep_id, msg))
+      | Some (rep_id, msg) -> Lwt.return (Message (rep_id, msg))
 
   let get_cmd t =
-    match_lwt Lwt_stream.get t.cmd_stream with
+    match%lwt Lwt_stream.get t.cmd_stream with
       | None -> fst (Lwt.wait ())
-      | Some (req_id, op) -> return (Client_command (req_id, op))
+      | Some (req_id, op) -> Lwt.return (Client_command (req_id, op))
 
   let get_ro_op t =
-    match_lwt Lwt_stream.get t.ro_op_stream with
+    match%lwt Lwt_stream.get t.ro_op_stream with
       | None -> fst (Lwt.wait ())
-      | Some x -> return (Readonly_op x)
+      | Some x -> Lwt.return (Readonly_op x)
 
   let sleep_randomized period =
     Lwt_unix.sleep (period *. 0.75 +. Random.float (period *. 0.5))
@@ -228,14 +253,14 @@ struct
     let push_ro_op x      = p (Some x) in
     let election_timeout  = match Core.status state with
                               | Follower | Candidate ->
-                                  sleep_randomized election_period >>
-                                  return Election_timeout
+                                  sleep_randomized election_period>>= fun () ->
+                                  Lwt.return Election_timeout
                               | Leader -> fst (Lwt.wait ()) in
     let heartbeat         = match Core.status state with
                               | Follower | Candidate -> fst (Lwt.wait ())
                               | Leader ->
-                                  Lwt_unix.sleep heartbeat_period >>
-                                  return Heartbeat_timeout in
+                                  Lwt_unix.sleep heartbeat_period>>= fun () ->
+                                  Lwt.return Heartbeat_timeout in
     let sent_snapshots, p = Lwt_stream.create () in
     let snapshot_sent x   = p (Some x) in
     let sent_snapshots_th = fst (Lwt.wait ()) in
@@ -291,38 +316,40 @@ struct
       t.get_ro_op           <- get_ro_op t;
 
       ignore begin
-        try_lwt
+        try%lwt
           let rec apply_loop () =
-            match_lwt Lwt_stream.get t.apply_stream with
-                None -> return ()
+            match%lwt Lwt_stream.get t.apply_stream with
+                None -> Lwt.return_unit
               | Some (req_id, op) ->
                   let return_result resp =
-                    try_lwt
+                    try%lwt
                       let (_, u), pending = CMDM.extract req_id t.pending_cmds in
                         t.pending_cmds <- pending;
                         Lwt.wakeup_later u (Executed resp);
-                        return ()
-                    with _ -> return ()
+                        Lwt.return_unit
+                    with _ -> Lwt.return_unit
                   in
                     match
                       try (t.execute t op :> [`Sync of _ | `Async of _ | `Error of _])
                       with exn -> `Error exn
                     with
                         `Sync resp ->
-                          (try_lwt resp with exn -> return (`Error exn)) >>=
-                          return_result >>
+                          (try%lwt resp with exn -> Lwt.return (`Error exn)) >>=
+                          return_result>>= fun () ->
                           apply_loop ()
                       | `Async resp ->
                           ignore begin
-                            (try_lwt resp with exn -> return (`Error exn)) >>=
+                            (try%lwt resp with exn -> Lwt.return (`Error exn)) >>=
                              return_result
                           end;
                           apply_loop ()
-                      | `Error _ as x -> return_result x >> apply_loop ()
+                      | `Error _ as x -> return_result x >>= fun () ->apply_loop ()
           in
             apply_loop ()
         with exn ->
-          Lwt_log.error_f ~exn ~section "Error in Oraft_lwt apply loop."
+          Logs_lwt.err ~src begin fun m ->
+            m "Error in Oraft_lwt apply loop: %a" pp_exn exn
+          end
       end;
       t
 
@@ -330,7 +357,7 @@ struct
 
   let abort t =
     if not t.running then
-      return ()
+      Lwt.return ()
     else begin
       t.running <- false;
       begin try (Lwt.wakeup (snd t.abort) Abort) with _ -> () end;
@@ -339,24 +366,24 @@ struct
 
   let connect_and_get_msgs t (peer, addr) =
     let rec make_thread = function
-        0 -> Lwt_unix.sleep 5. >> make_thread 5
+        0 -> Lwt_unix.sleep 5. >>= fun () ->make_thread 5
       | n ->
           if RM.mem peer t.conns || RS.mem peer t.connecting ||
              not (List.mem_assoc peer (Core.peers t.state)) then
-            return ()
+            Lwt.return ()
           else begin
             t.connecting <- RS.add peer t.connecting;
-            match_lwt IO.connect t.conn_manager peer addr with
+            match%lwt IO.connect t.conn_manager peer addr with
               | None ->
                   t.connecting <- RS.remove peer t.connecting;
-                  Lwt_unix.sleep 0.1 >> make_thread (n - 1)
+                  Lwt_unix.sleep 0.1 >>= fun () ->make_thread (n - 1)
               | Some conn ->
                   t.connecting <- RS.remove peer t.connecting;
                   t.conns      <- RM.add peer conn t.conns;
                   let rec loop_receive () =
-                    match_lwt IO.receive conn with
+                    match%lwt IO.receive conn with
                         None ->
-                          lwt () = Lwt_unix.sleep 0.1 in
+                          let%lwt () = Lwt_unix.sleep 0.1 in
                             t.conns <- RM.remove peer t.conns;
                             make_thread 5
                       | Some msg ->
@@ -422,87 +449,90 @@ struct
 
   let rec exec_action t : _ action -> unit Lwt.t = function
     | Reset_election_timeout ->
-        t.election_timeout <- (sleep_randomized t.election_period >>
-                               return Election_timeout);
-        return ()
+        t.election_timeout <- (sleep_randomized t.election_period>>= fun () ->
+                               Lwt.return Election_timeout);
+        Lwt.return ()
     | Reset_heartbeat ->
-        t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period >>
-                        return Heartbeat_timeout);
-        return ()
+        t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period>>= fun () ->
+                        Lwt.return Heartbeat_timeout);
+        Lwt.return ()
     | Become_candidate
     | Become_follower None as ev ->
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         t.heartbeat <- fst (Lwt.wait ());
-        Lwt_log.info_f ~section "Becoming %s"
-          (match ev with
-             | Become_candidate -> "candidate"
-             | _ -> "follower (unknown leader)") >>
+        Logs_lwt.info ~src begin fun m ->
+          m "Becoming %s"
+            (match ev with
+              | Become_candidate -> "candidate"
+              | _ -> "follower (unknown leader)")
+        end >>= fun () ->
         exec_action t Reset_election_timeout
     | Become_follower (Some id) ->
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         Lwt_condition.broadcast t.leader_signal ();
         t.heartbeat <- fst (Lwt.wait ());
-        Lwt_log.info_f ~section "Becoming follower leader:%S" id >>
+        Logs_lwt.info ~src
+          (fun m -> m "Becoming follower leader:%S" id) >>= fun () ->
         exec_action t Reset_election_timeout
     | Become_leader ->
         clear_pending_ro_ops t;
         abort_ongoing_config_change t;
         Lwt_condition.broadcast t.leader_signal ();
-        Lwt_log.info_f ~section "Becoming leader" >>
-        exec_action t Reset_election_timeout >>
+        Logs_lwt.info ~src (fun m -> m "Becoming leader") >>= fun () ->
+        exec_action t Reset_election_timeout>>= fun () ->
         exec_action t Reset_heartbeat
     | Changed_config ->
         check_config_change_completion t;
-        return_unit
+        Lwt.return_unit
     | Apply l ->
         List.iter (fun (index, (req_id, op), term) -> t.push_apply (req_id, op)) l;
-        return_unit
+        Lwt.return_unit
     | Redirect (rep_id, (req_id, _)) -> begin
-        try_lwt
+        try%lwt
           let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
             t.pending_cmds <- pending_cmds;
             Lwt.wakeup_later u (Redirect rep_id);
-            return ()
-        with _ -> return ()
+            Lwt.return ()
+        with _ -> Lwt.return ()
       end
     | Send (rep_id, addr, msg) ->
         (* we allow to run this in parallel with rest RAFT algorithm.
          * It's OK to reorder sends. *)
         (* TODO: limit the number of msgs in outboung queue.
          * Drop after the nth? *)
-        ignore begin try_lwt
+        ignore begin try%lwt
           let c = RM.find rep_id t.conns in
-            if IO.is_saturated c then return_unit
+            if IO.is_saturated c then Lwt.return_unit
             else IO.send c msg
         with _ ->
           (* cannot send -- partition *)
-          return ()
+          Lwt.return ()
         end;
-        return ()
+        Lwt.return ()
     | Send_snapshot (rep_id, addr, idx, config) ->
         ignore begin
-          match_lwt IO.prepare_snapshot (RM.find rep_id t.conns) idx config with
-            | None -> return ()
+          match%lwt IO.prepare_snapshot (RM.find rep_id t.conns) idx config with
+            | None -> Lwt.return ()
             | Some transfer ->
-                try_lwt
-                  match_lwt IO.send_snapshot transfer with
+                try%lwt
+                  match%lwt IO.send_snapshot transfer with
                       true -> t.snapshot_sent (rep_id, idx);
-                              return ()
+                              Lwt.return ()
                     | false -> failwith "error"
                 with _ ->
                   t.snapshot_failed rep_id;
-                  return ()
+                  Lwt.return ()
         end;
-        return ()
-    | Stop -> raise_lwt Stop_node
+        Lwt.return ()
+    | Stop -> Lwt.fail Stop_node
     | Exec_readonly n ->
         (* can execute all RO ops whose ID is >= n *)
         let rec notify_ok () =
           match Queue.Exceptionless.peek t.pending_ro_ops with
-              None -> return_unit
-            | Some (m, _) when m > n -> return_unit
+              None -> Lwt.return_unit
+            | Some (m, _) when m > n -> Lwt.return_unit
             | Some (_, u) ->
                 ignore (Queue.Exceptionless.take t.pending_ro_ops);
                 Lwt.wakeup_later u OK;
@@ -513,13 +543,13 @@ struct
   let exec_actions t l = Lwt_list.iter_s (exec_action t) l
 
   let rec run t =
-    if not t.running then return ()
+    if not t.running then Lwt.return ()
     else begin
       (* Launch new connections as needed.
        * connect_and_get_msgs will ignore peers for which a connection already
        * exists or is being established. *)
       ignore (List.map (connect_and_get_msgs t) (Core.peers t.state));
-      match_lwt
+      match%lwt
         Lwt.choose
           [ t.election_timeout;
             fst t.abort;
@@ -530,39 +560,39 @@ struct
             t.sent_snapshots_th;
           ]
       with
-        | Abort -> t.running <- false; return ()
+        | Abort -> t.running <- false; Lwt.return ()
         | Readonly_op u -> begin
             t.get_ro_op <- get_ro_op t;
             match Core.readonly_operation t.state with
                 (s, None) -> Lwt.wakeup_later u Retry;
-                             return_unit
+                             Lwt.return_unit
               | (s, Some (id, actions)) ->
                   Queue.push (id, u) t.pending_ro_ops;
                   t.state <- s;
-                  exec_actions t actions >>
+                  exec_actions t actions>>= fun () ->
                   run t
           end
         | Client_command (req_id, op) ->
             let state, actions = Core.client_command (req_id, op) t.state in
               t.get_cmd <- get_cmd t;
               t.state   <- state;
-              exec_actions t actions >>
+              exec_actions t actions>>= fun () ->
               run t
         | Message (rep_id, msg) ->
             let state, actions = Core.receive_msg t.state rep_id msg in
               t.get_msg <- get_msg t;
               t.state <- state;
-              exec_actions t actions >>
+              exec_actions t actions>>= fun () ->
               run t
         | Election_timeout ->
             let state, actions = Core.election_timeout t.state in
               t.state <- state;
-              exec_actions t actions >>
+              exec_actions t actions>>= fun () ->
               run t
         | Heartbeat_timeout ->
             let state, actions = Core.heartbeat_timeout t.state in
               t.state <- state;
-              exec_actions t actions >>
+              exec_actions t actions>>= fun () ->
               run t
         | Snapshots_sent data ->
             let state, actions =
@@ -575,20 +605,20 @@ struct
             in
               t.sent_snapshots_th <- get_sent_snapshots t;
               t.state <- state;
-              exec_actions t actions >>
+              exec_actions t actions>>= fun () ->
               run t
         | Snapshot_send_failed rep_id ->
             let state, actions = Core.snapshot_send_failed rep_id t.state in
               t.failed_snapshot_th <- get_failed_snapshot t;
               t.state <- state;
-              exec_actions t actions >>
+              exec_actions t actions>>= fun () ->
               run t
     end
 
   let run t =
-    try_lwt
+    try%lwt
       run t
-    with Stop_node -> t.running <- false; return ()
+    with Stop_node -> t.running <- false; Lwt.return ()
 
   let gen_req_id t =
     let id = t.next_req_id in
@@ -599,24 +629,24 @@ struct
     match Core.status t.state, Core.leader_id t.state with
       | Follower, Some leader_id -> begin
           match List.Exceptionless.assoc leader_id (Core.peers t.state) with
-              Some address -> return (`Redirect (leader_id, address))
+              Some address -> Lwt.return (`Redirect (leader_id, address))
             | None ->
                 (* redirect to a random server, hoping it knows better *)
-                try_lwt
+                try%lwt
                   let leader_id, address =
                     Core.peers t.state |>
                     Array.of_list |>
                     (fun x -> if x = [||] then failwith "empty"; x) |>
                     (fun a -> a.(Random.int (Array.length a)))
                   in
-                    return (`Redirect (leader_id, address))
+                    Lwt.return (`Redirect (leader_id, address))
                 with _ ->
-                  Lwt_unix.sleep retry_delay >>
-                  return `Retry
+                  Lwt_unix.sleep retry_delay>>= fun () ->
+                  Lwt.return `Retry
         end
       | Candidate, _ | Follower, _ ->
           (* await leader, retry *)
-          Lwt_condition.wait t.leader_signal >>
+          Lwt_condition.wait t.leader_signal>>= fun () ->
           exec_aux t f
       | Leader, _ ->
           f t
@@ -628,20 +658,20 @@ struct
           let task   = Lwt.task () in
             t.pending_cmds <- CMDM.add req_id task t.pending_cmds;
             t.push_cmd (req_id, cmd);
-            match_lwt fst task with
-                Executed res -> return (res :> _ cmd_result)
+            match%lwt fst task with
+                Executed res -> Lwt.return (res :> _ cmd_result)
               | Redirect _ -> execute t cmd)
 
   let rec readonly_operation t =
     if Core.is_single_node_cluster t.state then
-      return `OK
+      Lwt.return `OK
     else
       exec_aux t
         (fun t ->
            let th, u = Lwt.task () in
              t.push_ro_op u;
-             match_lwt th with
-                 OK -> return `OK
+             match%lwt th with
+                 OK -> Lwt.return `OK
                | Retry -> readonly_operation t)
 
   let compact_log t index =
@@ -664,25 +694,25 @@ struct
       match t.config_change with
           New_failover _ | Remove_failover _ | Decommission _
         | Promote _ | Demote _ | Replace _ ->
-            Lwt_unix.sleep retry_delay >>
+            Lwt_unix.sleep retry_delay>>= fun () ->
             perform_change t perform mk_change
         | No_change ->
             match perform t.state with
-                `Already_changed -> return `OK
-              | `Cannot_change | `Unsafe_change _ as x -> return x
-              | `Redirect (Some x) -> return (`Redirect x)
-              | `Redirect None -> return `Retry
+                `Already_changed -> Lwt.return `OK
+              | `Cannot_change | `Unsafe_change _ as x -> Lwt.return x
+              | `Redirect (Some x) -> Lwt.return (`Redirect x)
+              | `Redirect None -> Lwt.return `Retry
               | `Change_in_process ->
-                  Lwt_unix.sleep retry_delay >>
+                  Lwt_unix.sleep retry_delay>>= fun () ->
                   perform_change t perform mk_change
               | `Start_change state ->
                   t.state <- state;
                   let th, u = Lwt.task () in
                     t.config_change <- mk_change u;
-                    match_lwt th with
-                        OK -> return `OK
+                    match%lwt th with
+                        OK -> Lwt.return `OK
                       | Retry ->
-                          Lwt_unix.sleep retry_delay >>
+                          Lwt_unix.sleep retry_delay>>= fun () ->
                           perform_change t perform mk_change
 
     let rec add_failover t rep_id addr =
@@ -746,7 +776,7 @@ type simple_wrapper =
 
 let make_client_conn_wrapper f =
   { wrap_incoming_conn =
-      (fun fd -> try_lwt failwith "Incoming conn wrapper invoked in client");
+      (fun fd -> Lwt.fail_with "Incoming conn wrapper invoked in client");
     wrap_outgoing_conn = f;
   }
 
@@ -756,33 +786,33 @@ let make_server_conn_wrapper ~incoming ~outgoing =
 let trivial_wrap_outgoing_conn ?buffer_size fd =
   let close =
     lazy begin
-      try_lwt
+      (try%lwt
         Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
-        return_unit
+        Lwt.return_unit
       with Unix.Unix_error(Unix.ENOTCONN, _, _) ->
         (* This may happen if the server closed the connection before us *)
-        return_unit
-      finally
-        Lwt_unix.close fd
+        Lwt.return_unit)
+        [%finally
+          Lwt_unix.close fd]
     end in
   let buf1 = BatOption.map Lwt_bytes.create buffer_size in
   let buf2 = BatOption.map Lwt_bytes.create buffer_size in
-    try_lwt
+    try%lwt
       (try Lwt_unix.set_close_on_exec fd with Invalid_argument _ -> ());
-      return (Lwt_io.make ?buffer:buf1
+      Lwt.return (Lwt_io.make ?buffer:buf1
                 ~close:(fun _ -> Lazy.force close)
                 ~mode:Lwt_io.input (Lwt_bytes.read fd),
               Lwt_io.make ?buffer:buf2
                 ~close:(fun _ -> Lazy.force close)
                 ~mode:Lwt_io.output (Lwt_bytes.write fd))
     with exn ->
-      lwt () = Lwt_unix.close fd in
-      raise_lwt exn
+      let%lwt () = Lwt_unix.close fd in
+      Lwt.fail exn
 
 let trivial_wrap_incoming_conn ?buffer_size fd =
   let buf1 = BatOption.map Lwt_bytes.create buffer_size in
   let buf2 = BatOption.map Lwt_bytes.create buffer_size in
-    return
+    Lwt.return
       (Lwt_io.of_fd ?buffer:buf1 ~mode:Lwt_io.input fd,
        Lwt_io.of_fd ?buffer:buf2 ~mode:Lwt_io.output fd)
 
@@ -803,7 +833,7 @@ struct
   module M  = Map.Make(String)
   module MB = Extprot.Msg_buffer
 
-  let section = Lwt_log.Section.make "oraft_lwt.io"
+  let src = Logs.Src.create "oraft_lwt.io"
 
   type conn_manager =
       {
@@ -821,7 +851,7 @@ struct
       ich            : Lwt_io.input_channel;
       och            : Lwt_io.output_channel;
       mutable closed : bool;
-      mutable in_buf : string;
+      mutable in_buf : Bytes.t;
       out_buf        : MB.t;
       mutable noutgoing : int;
     }
@@ -829,79 +859,81 @@ struct
   let make ?(conn_wrapper = trivial_conn_wrapper ()) ~id addr =
     let sock = Lwt_unix.(socket (Unix.domain_of_sockaddr addr) Unix.SOCK_STREAM 0) in
       Lwt_unix.setsockopt sock Unix.SO_REUSEADDR true;
-      Lwt_unix.bind sock addr;
+      Lwt_unix.bind sock addr >>= fun () ->
       Lwt_unix.listen sock 256;
 
       let rec accept_loop t =
-        lwt (fd, addr) = Lwt_unix.accept sock in
-          ignore begin try_lwt
-              (* the following are not supported for ADDR_UNIX sockets, so catch
-               * possible exceptions *)
-              (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
-              (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-              lwt ich, och = conn_wrapper.wrap_incoming_conn fd in
-              lwt id       = Lwt_io.read_line ich in
-              let c        = { id; mgr = t; ich; och; closed = false;
-                               in_buf = ""; out_buf = MB.create ();
-                               noutgoing = 0;
-                             }
-              in
-                t.conns <- M.add id c t.conns;
-                Lwt_condition.broadcast t.conn_signal ();
-                Lwt_log.info_f ~section "Incoming connection from peer %S" id
-            with _ ->
-              Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
-              Lwt_unix.close fd
+        let%lwt (fd, addr) = Lwt_unix.accept sock in
+          Lwt.async begin fun () -> begin try%lwt
+                (* the following are not supported for ADDR_UNIX sockets, so catch
+                 * possible exceptions *)
+                (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
+                (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
+                let%lwt ich, och = conn_wrapper.wrap_incoming_conn fd in
+                let%lwt id       = Lwt_io.read_line ich in
+                let c        = { id; mgr = t; ich; och; closed = false;
+                                 in_buf = Bytes.empty; out_buf = MB.create ();
+                                 noutgoing = 0;
+                               }
+                in
+                  t.conns <- M.add id c t.conns;
+                  Lwt_condition.broadcast t.conn_signal ();
+                  Logs_lwt.info ~src (fun m -> m "Incoming connection from peer %S" id)
+              with _ ->
+                Lwt_unix.shutdown fd Unix.SHUTDOWN_ALL;
+                Lwt_unix.close fd
+            end
           end;
           accept_loop t
       in
       let conn_signal = Lwt_condition.create () in
       let t           = { id; sock; conn_signal; conns = M.empty; conn_wrapper; } in
         ignore begin
-          try_lwt
-            Lwt_log.info_f ~section "Running node server at %s"
-              (match addr with
-                | Unix.ADDR_INET (a, p) -> Printf.sprintf "%s/%d" (Unix.string_of_inet_addr a) p
-                | Unix.ADDR_UNIX s -> Printf.sprintf "unix://%s" s) >>
+          try%lwt
+            Logs_lwt.info ~src
+              (fun m -> m "Running node server at %a" pp_saddr addr) >>= fun () ->
             accept_loop t
           with
-            | Exit -> return ()
-            | exn -> Lwt_log.error_f ~exn ~section
-                       "Error in connection manager accept loop"
+            | Exit -> Lwt.return ()
+            | exn -> Logs_lwt.err ~src begin fun m ->
+                m "Error in connection manager accept loop: %a" pp_exn exn
+              end
         end;
-        t
+        Lwt.return t
 
   let connect t dst_id addr =
     match M.Exceptionless.find dst_id t.conns with
-        Some _ as x -> return x
+        Some _ as x -> Lwt.return x
       | None when dst_id < t.id -> (* wait for other end to connect *)
           let rec await_conn () =
             match M.Exceptionless.find dst_id t.conns with
-                Some _ as x -> return x
-              | None -> Lwt_condition.wait t.conn_signal >>
+                Some _ as x -> Lwt.return x
+              | None -> Lwt_condition.wait t.conn_signal>>= fun () ->
                        await_conn ()
           in
             await_conn ()
       | None -> (* we must connect ourselves *)
-          try_lwt
-            Lwt_log.info_f ~section "Connecting to %S" (C.string_of_address addr) >>
+          try%lwt
+            Logs_lwt.info ~src begin fun m ->
+              m "Connecting to %S" (C.string_of_address addr)
+            end >>= fun () ->
             let saddr    = C.node_sockaddr addr in
             let fd       = Lwt_unix.socket (Unix.domain_of_sockaddr saddr)
                              Unix.SOCK_STREAM 0 in
-            lwt ()       = Lwt_unix.connect fd saddr in
-            lwt ich, och = t.conn_wrapper.wrap_outgoing_conn fd in
-              try_lwt
+            let%lwt ()       = Lwt_unix.connect fd saddr in
+            let%lwt ich, och = t.conn_wrapper.wrap_outgoing_conn fd in
+              try%lwt
                 (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
                 (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-                Lwt_io.write och (t.id ^ "\n") >>
-                Lwt_io.flush och >>
-                return (Some { id = dst_id; mgr = t; ich; och; closed = false;
-                               in_buf = ""; out_buf = MB.create ();
+                Lwt_io.write och (t.id ^ "\n")>>= fun () ->
+                Lwt_io.flush och>>= fun () ->
+                Lwt.return (Some { id = dst_id; mgr = t; ich; och; closed = false;
+                               in_buf = Bytes.empty; out_buf = MB.create ();
                                noutgoing = 0; })
               with exn ->
-                Lwt_unix.close fd >>
-                raise_lwt exn
-          with _ -> return_none
+                Lwt_unix.close fd>>= fun () ->
+                Lwt.fail exn
+          with _ -> Lwt.return_none
 
   let is_saturated conn = conn.noutgoing > 10
 
@@ -958,7 +990,7 @@ struct
             }
 
   let abort c =
-    if c.closed then return ()
+    if c.closed then Lwt.return ()
     else begin
       c.mgr.conns <- M.remove c.id c.mgr.conns;
       c.closed    <- true;
@@ -966,59 +998,64 @@ struct
     end
 
   let send c msg =
-    if c.closed then return ()
+    if c.closed then Lwt.return ()
     else begin
       let wrapped = wrap_msg msg in
-        Lwt_log.debug_f ~section
-          "Sending\n%s" (Extprot.Pretty_print.pp pp_raft_message wrapped) >>
-        try_lwt
+        Logs_lwt.debug ~src begin fun m ->
+          m "Sending@ %s" (Extprot.Pretty_print.pp pp_raft_message wrapped)
+        end >>= fun () ->
+        (try%lwt
           c.noutgoing <- c.noutgoing + 1;
           Lwt_io.atomic
             (fun och ->
                MB.clear c.out_buf;
                Raft_message.write c.out_buf wrapped;
-               Lwt_io.LE.write_int och (MB.length c.out_buf) >>
+               Lwt_io.LE.write_int och (MB.length c.out_buf)>>= fun () ->
                Lwt_io.write_from_exactly
-                 och (MB.unsafe_contents c.out_buf) 0 (MB.length c.out_buf) >>
+                 och (MB.unsafe_contents c.out_buf) 0 (MB.length c.out_buf)>>= fun () ->
                Lwt_io.flush och)
             c.och
         with exn ->
-          lwt () = Lwt_log.info_f ~section ~exn
-                     "Error on send to %s, closing connection" c.id
+          let%lwt () = Logs_lwt.info ~src begin fun m ->
+              m "Error on send to %s, closing connection@ %s"
+                c.id (Printexc.to_string exn)
+            end
           in
-            abort c
-        finally
-          c.noutgoing <- c.noutgoing - 1;
-          return_unit
+            abort c)
+          [%finally
+            c.noutgoing <- c.noutgoing - 1;
+            Lwt.return_unit]
     end
 
   let receive c =
     if c.closed then
-      return None
+      Lwt.return None
     else
-      try_lwt
+      try%lwt
         Lwt_io.atomic
           (fun ich ->
-             lwt len = Lwt_io.LE.read_int ich in
-               if String.length c.in_buf < len
+             let%lwt len = Lwt_io.LE.read_int ich in
+               if Bytes.length c.in_buf < len
                then c.in_buf <- Bytes.create len;
-               lwt ()  = Lwt_io.read_into_exactly ich c.in_buf 0 len in
-               let msg = EC.deserialize Raft_message.read c.in_buf in
-                 Lwt_log.debug_f ~section
-                   "Received\n%s" (Extprot.Pretty_print.pp pp_raft_message msg) >>
-                 return (Some (unwrap_msg msg)))
+               let%lwt ()  = Lwt_io.read_into_exactly ich c.in_buf 0 len in
+               let msg = EC.deserialize Raft_message.read (Bytes.unsafe_to_string c.in_buf) in
+                 Logs_lwt.debug ~src begin fun m ->
+                   m "Received@ %s"
+                     (Extprot.Pretty_print.pp pp_raft_message msg)
+                 end >>= fun () ->
+                 Lwt.return (Some (unwrap_msg msg)))
           c.ich
       with exn ->
-        lwt () = Lwt_log.info_f ~section ~exn
-                   "Error on receive from %S, closing connection" c.id
-        in
-          abort c >>
-          return None
+        Logs_lwt.info ~src begin fun m ->
+          m "Error on receive from %S, closing connection. %a" c.id pp_exn exn
+        end >>= fun () ->
+        abort c >>= fun () ->
+        Lwt.return None
 
   type snapshot_transfer = unit
 
-  let prepare_snapshot conn index config = return None
-  let send_snapshot () = return false
+  let prepare_snapshot conn index config = Lwt.return None
+  let send_snapshot () = Lwt.return false
 end
 
 module Simple_server(C : SERVER_CONF) =
