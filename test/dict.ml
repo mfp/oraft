@@ -14,9 +14,9 @@
  * (2) Launch extra nodes. They will join the cluster and the quorum will be
  *     updated.
  *
- *     ./dict -master n2a,n2b --join n1a,n1b
+ *     ./dict master n2a,n2b --join n1a,n1b
  *
- *     ./dict -master n3a,n3b --join n1a,n1b
+ *     ./dict master n3a,n3b --join n1a,n1b
  *
  *     ...
  *
@@ -44,8 +44,7 @@ type op =
 
 module CONF =
 struct
-  type op_ = op
-  type op = op_
+  type nonrec op = op
 
   let string_of_op = function
       Get v -> "?" ^ v
