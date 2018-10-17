@@ -6,7 +6,7 @@
 (library
  (name        oraft)
  (public_name oraft)
- (libraries  batteries lwt)
+ (libraries  batteries)
  (modules oraft)
  (flags -w -30)
  (synopsis ""))
