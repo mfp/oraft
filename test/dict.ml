@@ -84,7 +84,7 @@ let make_tls_wrapper tls =
   Option.map
     (fun (client_config, server_config) ->
        Oraft_lwt_tls.make_server_wrapper
-         ~client_config ~server_config ())
+         ~client_config ~server_config)
     tls
 
 let run_server ?tls ~addr ?join ~id () =
