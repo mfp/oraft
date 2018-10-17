@@ -25,7 +25,7 @@
  (name        oraft_lwt_tls)
  (public_name oraft-lwt-tls)
  (preprocess (pps lwt_ppx))
- (libraries  tls.lwt oraft_lwt)
+ (libraries  tls.lwt oraft-lwt)
  (modules oraft_lwt_tls)
 (synopsis ""))
 
@@ -33,7 +33,7 @@
  (name        oraft_rsm)
  (public_name oraft-rsm)
  (preprocess (pps lwt_ppx))
- (libraries  extprot logs oraft_lwt)
+ (libraries  extprot logs oraft-lwt)
  (flags -w -32)
  (modules oraft_rsm)
  (synopsis ""))
