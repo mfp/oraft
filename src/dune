@@ -33,7 +33,7 @@
  (name        oraft_rsm)
  (public_name oraft-rsm)
  (preprocess (pps lwt_ppx))
- (libraries  extprot logs lwt_ppx oraft_lwt)
+ (libraries  extprot logs oraft_lwt)
  (flags -w -32)
  (modules oraft_rsm)
  (synopsis ""))
