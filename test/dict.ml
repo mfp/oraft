@@ -77,8 +77,8 @@ struct
   let string_of_address s = s
 end
 
-module SERVER = Oraft_rsm.Make_server(CONF)
-module CLIENT = Oraft_rsm.Make_client(CONF)
+module Server = Oraft_rsm.Server.Make(CONF)
+module Client = Oraft_rsm.Client.Make(CONF)
 
 let make_tls_wrapper tls =
   Option.map
@@ -114,32 +114,32 @@ let run_server ?tls ~addr ?join ~id () =
         `Sync (Lwt.return (`OK ""))
   in
 
-  let%lwt server = SERVER.make ?conn_wrapper:(make_tls_wrapper tls) exec addr ?join id in
-    SERVER.run server
+  let%lwt server = Server.make ?conn_wrapper:(make_tls_wrapper tls) exec addr ?join id in
+    Server.run server
 
 let client_op ?tls ~addr op =
-  let c    = CLIENT.make
+  let c    = Client.make
                ?conn_wrapper:(make_tls_wrapper tls)
                ~id:(string_of_int (Unix.getpid ())) () in
   let exec = match op with
-               | Get _ | Wait _ -> CLIENT.execute_ro
-               | Set _ -> CLIENT.execute
+               | Get _ | Wait _ -> Client.execute_ro
+               | Set _ -> Client.execute
   in
-    CLIENT.connect c ~addr >>= fun () ->
+    Client.connect c ~addr >>= fun () ->
     match%lwt exec c op with
       | `OK s -> Printf.printf "+OK %s\n" s; Lwt.return_unit
       | `Error s -> Printf.printf "-ERR %s\n" s; Lwt.return_unit
 
 let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
-  let c    = CLIENT.make
+  let c    = Client.make
                ?conn_wrapper:(make_tls_wrapper tls)
                ~id:(string_of_int (Unix.getpid ())) ()
   in
-    CLIENT.connect c ~addr >>= fun () ->
-    CLIENT.execute c (Set ("bm", "0")) >>= fun _ ->
+    Client.connect c ~addr >>= fun () ->
+    Client.execute c (Set ("bm", "0")) >>= fun _ ->
     let t0 = Unix.gettimeofday () in
       for%lwt i = 1 to iterations do
-        let%lwt _ = CLIENT.execute_ro c (Get "bm") in
+        let%lwt _ = Client.execute_ro c (Get "bm") in
           Lwt.return_unit
       done >>= fun () ->
       let dt = Unix.gettimeofday () -. t0 in
@@ -147,14 +147,14 @@ let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
         Lwt.return_unit
 
 let wr_benchmark ?tls ?(iterations = 10_000) ~addr () =
-  let c    = CLIENT.make
+  let c    = Client.make
                ?conn_wrapper:(make_tls_wrapper tls)
                ~id:(string_of_int (Unix.getpid ())) ()
   in
-    CLIENT.connect c ~addr >>= fun () ->
+    Client.connect c ~addr >>= fun () ->
     let t0 = Unix.gettimeofday () in
       for%lwt i = 1 to iterations do
-        let%lwt _ = CLIENT.execute c (Set ("bm", "")) in
+        let%lwt _ = Client.execute c (Set ("bm", "")) in
           Lwt.return_unit
       done >>= fun () ->
       let dt = Unix.gettimeofday () -. t0 in
