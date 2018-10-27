@@ -16,6 +16,7 @@ depends: [
   "lwt_ppx" {build & >= "1.2.1"}
 
   "oraft-lwt" {= "0.1"}
+  "oraft-lwt-tls" {= "0.1"}
 ]
 synopsis: "Replicated State Machine built atop `oraft-lwt`"
 description: """
