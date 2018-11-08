@@ -55,7 +55,7 @@ type config_change =
   | Replace of rep_id * rep_id
 
 module type CONF = sig
-  include Oraft_lwt.SERVER_CONF
+  include Oraft_lwt_s.SERVER_CONF
   val app_sockaddr : address -> Unix.sockaddr
 end
 
@@ -261,7 +261,7 @@ module Server = struct
     type op
     type 'a t
 
-    module Core : Oraft_lwt.SERVER_GENERIC with type op = op
+    module Core : Oraft_lwt_s.SERVER_GENERIC with type op = op
 
     type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
     type 'a apply     = 'a Core.server -> op -> [`OK of 'a | `Error of exn] execution

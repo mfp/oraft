@@ -17,7 +17,7 @@
  (preprocess (pps lwt_ppx))
  (libraries  extprot lwt.unix logs logs.lwt oraft)
  (wrapped false)
- (modules oraft_proto oraft_lwt)
+ (modules oraft_proto oraft_lwt_s oraft_lwt)
  (flags -w -30)
  (synopsis ""))
 
