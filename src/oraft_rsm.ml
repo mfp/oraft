@@ -1,4 +1,3 @@
-open Printf
 open Lwt.Infix
 
 open Oraft.Types
