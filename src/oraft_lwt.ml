@@ -278,7 +278,7 @@ struct
 
   let abort t =
     if not t.running then
-      Lwt.return ()
+      Lwt.return_unit
     else begin
       t.running <- false;
       begin try (Lwt.wakeup (snd t.abort) Abort) with _ -> () end;
@@ -291,7 +291,7 @@ struct
       | n ->
           if RM.mem peer t.conns || RS.mem peer t.connecting ||
              not (List.mem_assoc peer (Core.peers t.state)) then
-            Lwt.return ()
+            Lwt.return_unit
           else begin
             t.connecting <- RS.add peer t.connecting;
             match%lwt IO.connect t.conn_manager peer addr with
@@ -372,11 +372,11 @@ struct
     | Reset_election_timeout ->
         t.election_timeout <- (sleep_randomized t.election_period>>= fun () ->
                                Lwt.return Election_timeout);
-        Lwt.return ()
+        Lwt.return_unit
     | Reset_heartbeat ->
         t.heartbeat <- (Lwt_unix.sleep t.heartbeat_period>>= fun () ->
                         Lwt.return Heartbeat_timeout);
-        Lwt.return ()
+        Lwt.return_unit
     | Become_candidate
     | Become_follower None as ev ->
         clear_pending_ro_ops t;
@@ -415,8 +415,8 @@ struct
           let (_, u), pending_cmds = CMDM.extract req_id t.pending_cmds in
             t.pending_cmds <- pending_cmds;
             Lwt.wakeup_later u (Redirect rep_id);
-            Lwt.return ()
-        with _ -> Lwt.return ()
+            Lwt.return_unit
+        with _ -> Lwt.return_unit
       end
     | Send (rep_id, addr, msg) ->
         (* we allow to run this in parallel with rest RAFT algorithm.
@@ -429,24 +429,24 @@ struct
             else IO.send c msg
         with _ ->
           (* cannot send -- partition *)
-          Lwt.return ()
+          Lwt.return_unit
         end;
-        Lwt.return ()
+        Lwt.return_unit
     | Send_snapshot (rep_id, addr, idx, config) ->
         ignore begin
           match%lwt IO.prepare_snapshot (RM.find rep_id t.conns) idx config with
-            | None -> Lwt.return ()
+            | None -> Lwt.return_unit
             | Some transfer ->
                 try%lwt
                   match%lwt IO.send_snapshot transfer with
                       true -> t.snapshot_sent (rep_id, idx);
-                              Lwt.return ()
+                              Lwt.return_unit
                     | false -> failwith "error"
                 with _ ->
                   t.snapshot_failed rep_id;
-                  Lwt.return ()
+                  Lwt.return_unit
         end;
-        Lwt.return ()
+        Lwt.return_unit
     | Stop -> Lwt.fail Stop_node
     | Exec_readonly n ->
         (* can execute all RO ops whose ID is >= n *)
@@ -464,7 +464,7 @@ struct
   let exec_actions t l = Lwt_list.iter_s (exec_action t) l
 
   let rec run t =
-    if not t.running then Lwt.return ()
+    if not t.running then Lwt.return_unit
     else begin
       (* Launch new connections as needed.
        * connect_and_get_msgs will ignore peers for which a connection already
@@ -481,7 +481,7 @@ struct
             t.sent_snapshots_th;
           ]
       with
-        | Abort -> t.running <- false; Lwt.return ()
+        | Abort -> t.running <- false; Lwt.return_unit
         | Readonly_op u -> begin
             t.get_ro_op <- get_ro_op t;
             match Core.readonly_operation t.state with
@@ -539,7 +539,7 @@ struct
   let run t =
     try%lwt
       run t
-    with Stop_node -> t.running <- false; Lwt.return ()
+    with Stop_node -> t.running <- false; Lwt.return_unit
 
   let gen_req_id t =
     let id = t.next_req_id in
@@ -800,7 +800,7 @@ struct
               (fun m -> m "Running node server at %a" pp_saddr addr) >>= fun () ->
             accept_loop t
           with
-            | Exit -> Lwt.return ()
+            | Exit -> Lwt.return_unit
             | exn -> Logs_lwt.err ~src begin fun m ->
                 m "Error in connection manager accept loop: %a" pp_exn exn
               end
@@ -903,7 +903,7 @@ struct
             }
 
   let abort c =
-    if c.closed then Lwt.return ()
+    if c.closed then Lwt.return_unit
     else begin
       c.mgr.conns <- M.remove c.id c.mgr.conns;
       c.closed    <- true;
@@ -911,7 +911,7 @@ struct
     end
 
   let send c msg =
-    if c.closed then Lwt.return ()
+    if c.closed then Lwt.return_unit
     else begin
       let wrapped = wrap_msg msg in
         Logs_lwt.debug ~src begin fun m ->
