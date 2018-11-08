@@ -90,9 +90,7 @@ module Conf = struct
         }
 
   let node_sockaddr s = String.split ~by:"," s |> fst |> sockaddr
-  let app_sockaddr  s =
-    Printf.printf "Connecting to %s\n%!" s;
-    String.split ~by:"," s |> snd |> sockaddr
+  let app_sockaddr  s = String.split ~by:"," s |> snd |> sockaddr
 
   let string_of_address s = s
 end
