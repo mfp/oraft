@@ -4,8 +4,6 @@ open Lwt.Infix
 open Oraft.Types
 open Oraft_rsm_s
 
-let src = Logs.Src.create "oraft_rsm"
-
 module Map     = BatMap
 module Hashtbl = BatHashtbl
 
@@ -75,6 +73,8 @@ module Make_client(C : CONF) = struct
     }
 
   and address = string
+
+  let src = Logs.Src.create "oraft_rsm.client"
 
   let trivial_wrapper () =
     (Oraft_lwt_conn_wrapper.trivial_conn_wrapper () :>
@@ -246,6 +246,8 @@ module Make_server(C : CONF) = struct
       exec          : 'a SS.apply;
       conn_wrapper  : [`Incoming | `Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper;
     }
+
+  let src = Logs.Src.create "oraft_rsm.server"
 
   let raise_if_error = function
       `OK x -> Lwt.return x
