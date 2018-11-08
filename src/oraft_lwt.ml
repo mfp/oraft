@@ -315,43 +315,42 @@ struct
       t.get_cmd             <- get_cmd t;
       t.get_ro_op           <- get_ro_op t;
 
-      ignore begin
-        try%lwt
-          let rec apply_loop () =
-            match%lwt Lwt_stream.get t.apply_stream with
-                None -> Lwt.return_unit
-              | Some (req_id, op) ->
-                  let return_result resp =
-                    try%lwt
-                      let (_, u), pending = CMDM.extract req_id t.pending_cmds in
-                        t.pending_cmds <- pending;
-                        Lwt.wakeup_later u (Executed resp);
-                        Lwt.return_unit
-                    with _ -> Lwt.return_unit
-                  in
-                    match
-                      try (t.execute t op :> [`Sync of _ | `Async of _ | `Error of _])
-                      with exn -> `Error exn
-                    with
-                        `Sync resp ->
-                          (try%lwt resp with exn -> Lwt.return (`Error exn)) >>=
-                          return_result>>= fun () ->
-                          apply_loop ()
-                      | `Async resp ->
-                          ignore begin
-                            (try%lwt resp with exn -> Lwt.return (`Error exn)) >>=
-                             return_result
-                          end;
-                          apply_loop ()
-                      | `Error _ as x -> return_result x >>= fun () ->apply_loop ()
-          in
-            apply_loop ()
-        with exn ->
-          Logs_lwt.err ~src begin fun m ->
-            m "Error in Oraft_lwt apply loop: %a" pp_exn exn
-          end
-      end;
-      t
+      let rec apply_loop () =
+        match%lwt Lwt_stream.get t.apply_stream with
+            None -> Lwt.return_unit
+          | Some (req_id, op) ->
+              let return_result resp =
+                try%lwt
+                  let (_, u), pending = CMDM.extract req_id t.pending_cmds in
+                    t.pending_cmds <- pending;
+                    Lwt.wakeup_later u (Executed resp);
+                    Lwt.return_unit
+                with _ -> Lwt.return_unit
+              in
+                match
+                  try (t.execute t op :> [`Sync of _ | `Async of _ | `Error of _])
+                  with exn -> `Error exn
+                with
+                    `Sync resp ->
+                      (try%lwt resp with exn -> Lwt.return (`Error exn)) >>=
+                      return_result>>= fun () ->
+                      apply_loop ()
+                  | `Async resp ->
+                      ignore begin
+                        (try%lwt resp with exn -> Lwt.return (`Error exn)) >>=
+                        return_result
+                      end;
+                      apply_loop ()
+                  | `Error _ as x -> return_result x >>= fun () ->
+                      apply_loop ()
+      in
+        Lwt.async begin fun () ->
+          try%lwt apply_loop () with exn ->
+            Logs_lwt.err ~src begin fun m ->
+              m "Error in Oraft_lwt apply loop: %a" pp_exn exn
+            end
+        end;
+        t
 
   let config t = Core.config t.state
 
