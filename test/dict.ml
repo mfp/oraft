@@ -42,8 +42,7 @@ type op =
   | Wait of string
   | Set of string * string
 
-module CONF =
-struct
+module Conf = struct
   type nonrec op = op
 
   let string_of_op = function
@@ -62,12 +61,33 @@ struct
               Set (k, v)
         | _ -> failwith "bad op"
 
+  type addr = {
+    node: Unix.sockaddr ;
+    app: Unix.sockaddr ;
+  }
+
+  let fn_of_addr { node ; app } =
+    match node, app with
+      | Unix.ADDR_UNIX a, Unix.ADDR_UNIX b ->
+          [a; b]
+      | Unix.ADDR_UNIX a, _ -> [a]
+      | _, Unix.ADDR_UNIX b -> [b]
+      | _ -> []
+
   let sockaddr s =
     try
       let host, port = String.split ~by:":" s in
         Unix.ADDR_INET (Unix.inet_addr_of_string host, int_of_string port)
     with Not_found ->
       Unix.ADDR_UNIX s
+
+  let parse_sockaddr s =
+    match String.split ~by:"," s with
+      | exception _ -> None
+      | a, b -> Some {
+          node = sockaddr a ;
+          app = sockaddr b ;
+        }
 
   let node_sockaddr s = String.split ~by:"," s |> fst |> sockaddr
   let app_sockaddr  s =
@@ -77,8 +97,8 @@ struct
   let string_of_address s = s
 end
 
-module Server = Oraft_rsm.Server.Make(CONF)
-module Client = Oraft_rsm.Client.Make(CONF)
+module Server = Oraft_rsm.Server.Make(Conf)
+module Client = Oraft_rsm.Client.Make(Conf)
 
 let make_tls_wrapper tls =
   Option.map
@@ -208,6 +228,15 @@ let tls_create (cert, priv_key) =
     | _ -> tls_create cert priv_key >>= Lwt.return_some
 
 let master tls addr join () =
+  List.iter begin fun s ->
+    Sys.set_signal s begin Sys.Signal_handle begin fun _ ->
+        Option.may (fun a ->
+            List.iter Sys.remove (Conf.fn_of_addr a))
+          (Conf.parse_sockaddr addr) ;
+        exit 0
+      end
+    end
+  end Sys.[sigint ; sigterm];
   tls_create tls >>= fun tls ->
   run_server ?tls ~addr ?join ~id:addr ()
 
