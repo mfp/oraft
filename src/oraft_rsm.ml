@@ -71,19 +71,20 @@ module Make_client(C : CONF) = struct
       mutable conns  : address conn M.t;
       mutable req_id : Int64.t;
       pending_reqs   : response Lwt.u H.t;
-      conn_wrapper   : [`Outgoing] Oraft_lwt.conn_wrapper;
+      conn_wrapper   : [`Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper;
     }
 
   and address = string
 
   let trivial_wrapper () =
-    (Oraft_lwt.trivial_conn_wrapper () :> [`Outgoing] Oraft_lwt.conn_wrapper)
+    (Oraft_lwt_conn_wrapper.trivial_conn_wrapper () :>
+       [`Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper)
 
   let make ?conn_wrapper ~id () =
     { id; dst = None; conns = M.empty; req_id = 0L;
       pending_reqs = H.create 13;
       conn_wrapper = Option.map_default
-                       (fun w -> (w :> [`Outgoing] Oraft_lwt.conn_wrapper))
+                       (fun w -> (w :> [`Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper))
                        (trivial_wrapper ())
                        conn_wrapper;
     }
@@ -100,7 +101,7 @@ module Make_client(C : CONF) = struct
       let saddr = C.app_sockaddr addr in
       let fd = Lwt_unix.socket (Unix.domain_of_sockaddr saddr) Unix.SOCK_STREAM 0 in
       let%lwt () = Lwt_unix.connect fd saddr in
-      let%lwt ich, och     = Oraft_lwt.wrap_outgoing_conn t.conn_wrapper fd in
+      let%lwt ich, och     = Oraft_lwt_conn_wrapper.wrap_outgoing_conn t.conn_wrapper fd in
       let out_buf      = MB.create () in
       let in_buf       = ref Bytes.empty in
       let conn         = { addr; ich; och; in_buf; out_buf } in
@@ -217,7 +218,8 @@ module Make_client(C : CONF) = struct
 end
 
 module Make_server(C : CONF) = struct
-  module SS   = Oraft_lwt.Simple_server(C)
+  module IO = Oraft_lwt_simple_io.Make(C)
+  module SS   = Oraft_lwt.Make_server(IO)
   module SSC  = SS.Config
   module CC   = Make_client(C)
 
@@ -242,7 +244,7 @@ module Make_server(C : CONF) = struct
       app_sockaddr  : Unix.sockaddr;
       serv          : 'a SS.server;
       exec          : 'a SS.apply;
-      conn_wrapper  : [`Incoming | `Outgoing] Oraft_lwt.conn_wrapper;
+      conn_wrapper  : [`Incoming | `Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper;
     }
 
   let raise_if_error = function
@@ -256,7 +258,7 @@ module Make_server(C : CONF) = struct
     | `Unsafe_change _ -> Lwt.fail_with "Unsafe config change"
 
   let make exec addr
-        ?(conn_wrapper = Oraft_lwt.trivial_conn_wrapper ())
+        ?(conn_wrapper = Oraft_lwt_conn_wrapper.trivial_conn_wrapper ())
         ?join ?election_period ?heartbeat_period id =
     match join with
       | None ->
@@ -266,7 +268,7 @@ module Make_server(C : CONF) = struct
                                 ~log:[] ~config () in
           let node_sockaddr = C.node_sockaddr addr in
           let app_sockaddr  = C.app_sockaddr addr in
-          let%lwt conn_mgr  = SS.make_conn_manager ~id node_sockaddr in
+          let%lwt conn_mgr  = IO.make_conn_manager ~id node_sockaddr in
           let serv          = SS.make exec ?election_period ?heartbeat_period
                                 state conn_mgr
           in
@@ -286,7 +288,7 @@ module Make_server(C : CONF) = struct
                                   ~log:[] ~config () in
             let node_sockaddr = C.node_sockaddr addr in
             let app_sockaddr  = C.app_sockaddr addr in
-            let%lwt conn_mgr  = SS.make_conn_manager ~id node_sockaddr in
+            let%lwt conn_mgr  = IO.make_conn_manager ~id node_sockaddr in
             let serv          = SS.make exec ?election_period
                                   ?heartbeat_period state conn_mgr
             in
@@ -444,7 +446,7 @@ module Make_server(C : CONF) = struct
     (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
     (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
     (try%lwt
-       let%lwt ich, och = Oraft_lwt.wrap_incoming_conn t.conn_wrapper fd in
+       let%lwt ich, och = Oraft_lwt_conn_wrapper.wrap_incoming_conn t.conn_wrapper fd in
        let conn     = { addr; ich; och; in_buf = ref Bytes.empty; out_buf = MB.create () } in
          (match%lwt read_msg conn with
            | { id; op = Connect client_id; _ } ->

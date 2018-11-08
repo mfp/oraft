@@ -21,7 +21,7 @@ module type CLIENT = sig
   type t
 
   val make :
-    ?conn_wrapper:[> `Outgoing] Oraft_lwt.conn_wrapper -> id:string -> unit -> t
+    ?conn_wrapper:[> `Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper -> id:string -> unit -> t
 
   val connect : t -> addr:address -> unit Lwt.t
 
@@ -49,7 +49,7 @@ module type SERVER = sig
 
   val make :
     'a apply -> address ->
-    ?conn_wrapper:[`Outgoing | `Incoming] Oraft_lwt.conn_wrapper ->
+    ?conn_wrapper:[`Outgoing | `Incoming] Oraft_lwt_conn_wrapper.conn_wrapper ->
     ?join:address ->
     ?election_period:float ->
     ?heartbeat_period:float -> rep_id -> 'a t Lwt.t

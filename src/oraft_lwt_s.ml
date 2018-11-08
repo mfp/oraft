@@ -9,6 +9,10 @@ module type LWTIO = sig
 
   include LWTIO_TYPES
 
+  val make_conn_manager :
+    ?conn_wrapper:[ `Incoming | `Outgoing ] Oraft_lwt_conn_wrapper.conn_wrapper ->
+    id:address -> Unix.sockaddr -> conn_manager Lwt.t
+
   val connect : conn_manager -> rep_id -> address -> connection option Lwt.t
   val send    : connection -> (req_id * op) message -> unit Lwt.t
   val receive : connection -> (req_id * op) message option Lwt.t
