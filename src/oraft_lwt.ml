@@ -925,15 +925,22 @@ struct
               try%lwt
                 (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
                 (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
-                Lwt_io.write och (t.id ^ "\n")>>= fun () ->
-                Lwt_io.flush och>>= fun () ->
+                Lwt_io.write_line och t.id >>= fun () ->
+                Lwt_io.flush och >>= fun () ->
                 Lwt.return (Some { id = dst_id; mgr = t; ich; och; closed = false;
-                               in_buf = Bytes.empty; out_buf = MB.create ();
-                               noutgoing = 0; })
+                                   in_buf = Bytes.empty; out_buf = MB.create ();
+                                   noutgoing = 0; })
               with exn ->
-                Lwt_unix.close fd>>= fun () ->
+                Logs_lwt.err ~src begin fun m ->
+                  m "Failed to write (%s)" (Printexc.to_string exn)
+                end >>= fun () ->
+                Lwt_unix.close fd >>= fun () ->
                 Lwt.fail exn
-          with _ -> Lwt.return_none
+          with exn ->
+            Logs_lwt.err ~src begin fun m ->
+              m "Failed to connect (%s)" (Printexc.to_string exn)
+            end >>= fun () ->
+            Lwt.return_none
 
   let is_saturated conn = conn.noutgoing > 10
 

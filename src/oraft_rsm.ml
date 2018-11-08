@@ -171,7 +171,10 @@ module Client = struct
                   end;
                   Lwt.return_unit
               | _ -> failwith "conn refused"
-          with _ ->
+          with exn ->
+            Logs_lwt.err ~src begin fun m ->
+              m "Error while connecting (%s)" (Printexc.to_string exn)
+            end >>= fun () ->
             t.conns <- M.remove peer_id t.conns;
             Lwt_io.abort och
       in
