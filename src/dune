@@ -35,5 +35,5 @@
  (preprocess (pps lwt_ppx))
  (libraries  extprot logs oraft-lwt)
  (flags -w -32)
- (modules oraft_rsm)
+ (modules  oraft_rsm_s oraft_rsm)
  (synopsis ""))

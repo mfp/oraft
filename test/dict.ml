@@ -97,8 +97,8 @@ module Conf = struct
   let string_of_address s = s
 end
 
-module Server = Oraft_rsm.Server.Make(Conf)
-module Client = Oraft_rsm.Client.Make(Conf)
+module Server = Oraft_rsm.Make_server(Conf)
+module Client = Oraft_rsm.Make_client(Conf)
 
 let make_tls_wrapper tls =
   Option.map
