@@ -110,12 +110,16 @@ let run_server ?tls ~addr ?join ~id () =
   let cond = Lwt_condition.create () in
 
   let exec _ op = match op with
-      Get s -> `Sync (Lwt.return (try `OK (Hashtbl.find h s) with Not_found -> `OK ""))
+      Get s -> Server.Core.Sync begin
+        match Hashtbl.find_option h s with
+          | None -> Lwt.return_error Not_found
+          | Some v -> Lwt.return_ok v
+      end
     | Wait k ->
-        `Async begin
+        Async begin
           let rec attempt () =
             match Hashtbl.Exceptionless.find h k with
-                Some v -> Lwt.return (`OK v)
+                Some v -> Lwt.return_ok v
               | None ->
                   Lwt_condition.wait cond >>= fun () ->
                   attempt ()
@@ -129,10 +133,11 @@ let run_server ?tls ~addr ?join ~id () =
           Hashtbl.add h k v;
           Lwt_condition.broadcast cond ();
         end;
-        `Sync (Lwt.return (`OK ""))
+        Sync (Lwt.return_ok "")
   in
 
-  let%lwt server = Server.make ?conn_wrapper:(make_tls_wrapper tls) exec addr ?join id in
+  let%lwt server =
+    Server.make ?conn_wrapper:(make_tls_wrapper tls) exec addr ?join id in
     Server.run server
 
 let client_op ?tls ~addr op =
@@ -145,8 +150,8 @@ let client_op ?tls ~addr op =
   in
     Client.connect c ~addr >>= fun () ->
     match%lwt exec c op with
-      | `OK s -> Printf.printf "+OK %s\n" s; Lwt.return_unit
-      | `Error s -> Printf.printf "-ERR %s\n" s; Lwt.return_unit
+      | Ok s -> Printf.printf "+OK %s\n" s; Lwt.return_unit
+      | Error s -> Printf.printf "-ERR %s\n" s; Lwt.return_unit
 
 let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
   let c    = Client.make

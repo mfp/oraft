@@ -167,8 +167,8 @@ module Make_client(C : CONF) = struct
   let rec do_execute t op =
     send_and_await_response t op
       (fun dst resp -> match resp with
-           OK s -> Lwt.return (`OK s)
-         | Error s -> Lwt.return (`Error s)
+           OK s -> Lwt.return_ok s
+         | Error s -> Lwt.return_error s
          | Redirect (peer_id, address) when peer_id <> dst ->
              connect t peer_id address >>= fun () ->
              do_execute t op
@@ -187,8 +187,8 @@ module Make_client(C : CONF) = struct
   let rec get_config t =
     send_and_await_response t Get_config
       (fun dst resp -> match resp with
-           Config c -> Lwt.return (`OK c)
-         | Error x -> Lwt.return (`Error x)
+           Config c -> Lwt.return_ok c
+         | Error x -> Lwt.return_error x
          | Redirect (peer_id, address) when peer_id <> dst ->
              connect t peer_id address >>= fun () ->
              get_config t
@@ -198,19 +198,24 @@ module Make_client(C : CONF) = struct
          | OK _ | Cannot_change | Unsafe_change _ ->
              Lwt.fail Bad_response)
 
+  type change_config_error =
+    | Cannot_change
+    | Error of string
+    | Unsafe_change of simple_config * passive_peers
+
   let rec change_config t op =
     send_and_await_response t (Change_config op)
       (fun dst resp -> match resp with
-           OK _ -> Lwt.return `OK
-         | Error x -> Lwt.return (`Error x)
+           OK _ -> Lwt.return_ok ()
+         | Error x -> Lwt.return_error (Error x)
          | Redirect (peer_id, address) when peer_id <> dst ->
              connect t peer_id address >>= fun () ->
              change_config t op
          | Redirect _ | Retry ->
              Lwt_unix.sleep 0.050 >>= fun () ->
              change_config t op
-         | Cannot_change -> Lwt.return (`Cannot_change)
-         | Unsafe_change (c, p) -> Lwt.return (`Unsafe_change (c, p))
+         | Cannot_change -> Lwt.return_error Cannot_change
+         | Unsafe_change (c, p) -> Lwt.return_error (Unsafe_change (c, p))
          | Config _ -> Lwt.fail Bad_response)
 
   let connect t ~addr = connect t "" addr
@@ -231,8 +236,8 @@ module Make_server(C : CONF) = struct
   open Response
   open Config_change
 
-  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
-  type 'a apply     = 'a Core.server -> C.op -> [`OK of 'a | `Error of exn] execution
+  type 'a apply =
+    'a Core.server -> C.op -> ('a, exn) result Core.execution
 
   type 'a t =
     {
@@ -242,21 +247,22 @@ module Make_server(C : CONF) = struct
       node_sockaddr : Unix.sockaddr;
       app_sockaddr  : Unix.sockaddr;
       serv          : 'a SS.server;
-      exec          : 'a SS.apply;
+      exec          : 'a apply;
       conn_wrapper  : [`Incoming | `Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper;
     }
 
   let src = Logs.Src.create "oraft_rsm.server"
 
   let raise_if_error = function
-      `OK x -> Lwt.return x
-    | `Error s -> Lwt.fail_with s
+    | Ok x -> Lwt.return x
+    | Error s -> Lwt.fail_with s
 
-  let check_config_err = function
-    | `OK -> Lwt.return_unit
-    | `Error s -> Lwt.fail_with s
-    | `Cannot_change -> Lwt.fail_with "Cannot perform config change"
-    | `Unsafe_change _ -> Lwt.fail_with "Unsafe config change"
+  let check_config_err :
+    (unit, CC.change_config_error) result -> unit Lwt.t = function
+    | Ok () -> Lwt.return_unit
+    | Error (Error s) -> Lwt.fail_with s
+    | Error Cannot_change -> Lwt.fail_with "Cannot perform config change"
+    | Error (Unsafe_change _) -> Lwt.fail_with "Unsafe config change"
 
   let make exec addr
         ?(conn_wrapper = Oraft_lwt_conn_wrapper.trivial_conn_wrapper ())
@@ -291,18 +297,23 @@ module Make_server(C : CONF) = struct
   let send_msg conn msg = send_msg Oraft_proto.Server_msg.write conn msg
   let read_msg conn     = read_msg Oraft_proto.Client_msg.read conn
 
-  let map_op_result = function
-    | `Redirect (peer_id, addr) -> Redirect (peer_id, addr)
-    | `Retry -> Retry
-    | `Error exn -> Error (Printexc.to_string exn)
-    | `OK s -> OK s
+  let map_op_result : string Core.cmd_result -> response = function
+    | Error (Exn exn) -> Error (Printexc.to_string exn)
+    | Error (Redirect (peer_id, addr)) -> Redirect (peer_id, addr)
+    | Error Retry -> Retry
+    | Ok response -> OK response
+
+  let map_apply = function
+    | Result.Error exn -> Error (Printexc.to_string exn)
+    | Ok _ -> OK ""
 
   let perform_change t op =
     let map = function
-        `OK -> OK ""
-      | `Cannot_change -> Cannot_change
-      | `Unsafe_change (c, p) -> Unsafe_change (c, p)
-      | `Redirect _ | `Retry as x -> map_op_result x
+      | Ok () -> OK ""
+      | Error SSC.Cannot_change -> Cannot_change
+      | Error Unsafe_change (c, p) -> Unsafe_change (c, p)
+      | Error Redirect (peer_id, addr) -> Redirect (peer_id, addr)
+      | Error Retry -> Retry
     in
       try%lwt
         let%lwt ret =
@@ -346,20 +357,20 @@ module Make_server(C : CONF) = struct
           send_msg conn { id; response }
     | { id; op = Execute_RO op; } -> begin
         match%lwt SS.readonly_operation t.serv with
-          | `Redirect _ | `Retry | `Error _ as x ->
+          | Error (Redirect _) | Error Retry | Error _ as x ->
               let response = map_op_result x in
                 send_msg conn { id; response; }
-          | `OK ->
+          | Ok () ->
               match t.exec t.serv (C.op_of_string op) with
-                | `Sync resp ->
+                | Sync resp ->
                     let%lwt resp = resp in
-                      send_msg conn { id; response = map_op_result resp }
-                | `Async resp ->
+                      send_msg conn { id; response = map_apply resp }
+                | Async resp ->
                     ignore begin try%lwt
                         let%lwt resp = try%lwt resp
-                          with exn -> Lwt.return (`Error exn)
+                          with exn -> Lwt.return_error exn
                         in
-                          send_msg conn { id; response = map_op_result resp }
+                          send_msg conn { id; response = map_apply resp }
                       with exn ->
                         Logs_lwt.debug ~src
                           (fun m -> m "Caught exn: %a" Oraft_lwt.pp_exn exn)

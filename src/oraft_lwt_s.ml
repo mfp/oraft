@@ -35,16 +35,19 @@ module type SERVER_GENERIC = sig
 
   type 'a server
 
-  type gen_result =
-      [ `Error of exn
-      | `Redirect of rep_id * address
-      | `Retry ]
+  type cmd_error =
+    | Exn of exn
+    | Redirect of rep_id * address
+    | Retry
 
-  type 'a cmd_result   = [ gen_result | `OK of 'a ]
-  type ro_op_result = [ gen_result | `OK ]
+  type 'a cmd_result   = ('a, cmd_error) result
+  type ro_op_result = (unit, cmd_error) result
 
-  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
-  type 'a apply     = 'a server -> op -> [`OK of 'a | `Error of exn] execution
+  type 'a execution =
+    | Sync of 'a Lwt.t
+    | Async of 'a Lwt.t
+
+  type 'a apply     = 'a server -> op -> ('a, exn) result execution
 
   val make :
     'a apply -> ?election_period:float -> ?heartbeat_period:float ->
@@ -59,22 +62,19 @@ module type SERVER_GENERIC = sig
   val compact_log : _ server -> index -> unit
 
   module Config : sig
-    type result =
-      [
-      | `OK
-      | `Redirect of rep_id * address
-      | `Retry
-      | `Cannot_change
-      | `Unsafe_change of simple_config * passive_peers
-      ]
+    type error =
+      | Redirect of rep_id * address
+      | Retry
+      | Cannot_change
+      | Unsafe_change of simple_config * passive_peers
 
     val get             : _ server -> config
-    val add_failover    : _ server -> rep_id -> address -> result Lwt.t
-    val remove_failover : _ server -> rep_id -> result Lwt.t
-    val decommission    : _ server -> rep_id -> result Lwt.t
-    val demote          : _ server -> rep_id -> result Lwt.t
-    val promote         : _ server -> rep_id -> result Lwt.t
-    val replace         : _ server -> replacee:rep_id -> failover:rep_id -> result Lwt.t
+    val add_failover    : _ server -> rep_id -> address -> (unit, error) result Lwt.t
+    val remove_failover : _ server -> rep_id -> (unit, error) result Lwt.t
+    val decommission    : _ server -> rep_id -> (unit, error) result Lwt.t
+    val demote          : _ server -> rep_id -> (unit, error) result Lwt.t
+    val promote         : _ server -> rep_id -> (unit, error) result  Lwt.t
+    val replace         : _ server -> replacee:rep_id -> failover:rep_id -> (unit, error) result Lwt.t
   end
 end
 

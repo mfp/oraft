@@ -56,8 +56,11 @@ struct
   type connection   = IO.connection
   type conn_manager = IO.conn_manager
 
-  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
-  type 'a apply     = 'a server -> op -> [`OK of 'a | `Error of exn] execution
+  type 'a execution =
+    | Sync of 'a Lwt.t
+    | Async of 'a Lwt.t
+
+  type 'a apply = 'a server -> op -> ('a, exn) result execution
 
   and 'a server =
       {
@@ -120,17 +123,17 @@ struct
 
   and 'a cmd_res =
       Redirect of rep_id option
-    | Executed of [`OK of 'a | `Error of exn]
+    | Executed of ('a, exn) result
 
   and ro_op_res = OK | Retry
 
-  type gen_result =
-      [ `Error of exn
-      | `Redirect of rep_id * address
-      | `Retry ]
+  type cmd_error =
+      Exn of exn
+    | Redirect of rep_id * address
+    | Retry
 
-  type 'a cmd_result   = [ gen_result | `OK of 'a ]
-  type ro_op_result = [ gen_result | `OK ]
+  type 'a cmd_result = ('a, cmd_error) result
+  type ro_op_result  = (unit, cmd_error) result
 
   let get_sent_snapshots t =
     match%lwt Lwt_stream.get t.sent_snapshots with
@@ -249,21 +252,19 @@ struct
                     Lwt.return_unit
                 with _ -> Lwt.return_unit
               in
-                match
-                  try (t.execute t op :> [`Sync of _ | `Async of _ | `Error of _])
-                  with exn -> `Error exn
-                with
-                    `Sync resp ->
-                      (try%lwt resp with exn -> Lwt.return (`Error exn)) >>=
+                match t.execute t op with
+                  | exception exn ->
+                      return_result (Error exn) >>= fun () ->
+                      apply_loop ()
+                  | Sync resp ->
+                      (try%lwt resp with exn -> Lwt.return_error exn) >>=
                       return_result>>= fun () ->
                       apply_loop ()
-                  | `Async resp ->
+                  | Async resp ->
                       ignore begin
-                        (try%lwt resp with exn -> Lwt.return (`Error exn)) >>=
+                        (try%lwt resp with exn -> Lwt.return_error exn) >>=
                         return_result
                       end;
-                      apply_loop ()
-                  | `Error _ as x -> return_result x >>= fun () ->
                       apply_loop ()
       in
         Lwt.async begin fun () ->
@@ -341,7 +342,7 @@ struct
     notify_config_result t u (if List.mem_assoc rep_id l then OK else Retry)
 
   let notify_ok_if_not_mem t u rep_id l =
-    notify_config_result t u (if List.mem_assoc rep_id l then Retry else OK)
+    notify_config_result t u (if List.mem_assoc rep_id l then (Retry : change_result) else OK)
 
   let check_config_change_completion t =
     match Core.committed_config t.state with
@@ -550,7 +551,7 @@ struct
     match Core.status t.state, Core.leader_id t.state with
       | Follower, Some leader_id -> begin
           match List.Exceptionless.assoc leader_id (Core.peers t.state) with
-              Some address -> Lwt.return (`Redirect (leader_id, address))
+              Some address -> Lwt.return_error (Redirect (leader_id, address))
             | None ->
                 (* redirect to a random server, hoping it knows better *)
                 try%lwt
@@ -560,58 +561,55 @@ struct
                     (fun x -> if x = [||] then failwith "empty"; x) |>
                     (fun a -> a.(Random.int (Array.length a)))
                   in
-                    Lwt.return (`Redirect (leader_id, address))
+                    Lwt.return_error (Redirect (leader_id, address))
                 with _ ->
-                  Lwt_unix.sleep retry_delay>>= fun () ->
-                  Lwt.return `Retry
+                  Lwt_unix.sleep retry_delay >>= fun () ->
+                  Lwt.return_error Retry
         end
       | Candidate, _ | Follower, _ ->
           (* await leader, retry *)
-          Lwt_condition.wait t.leader_signal>>= fun () ->
+          Lwt_condition.wait t.leader_signal >>= fun () ->
           exec_aux t f
       | Leader, _ ->
           f t
 
   let rec execute t cmd =
-    exec_aux t
-      (fun t ->
-          let req_id = gen_req_id t in
-          let task   = Lwt.task () in
-            t.pending_cmds <- CMDM.add req_id task t.pending_cmds;
-            t.push_cmd (req_id, cmd);
-            match%lwt fst task with
-                Executed res -> Lwt.return (res :> _ cmd_result)
-              | Redirect _ -> execute t cmd)
+    exec_aux t begin fun t ->
+      let req_id = gen_req_id t in
+      let th, _ as task = Lwt.task () in
+        t.pending_cmds <- CMDM.add req_id task t.pending_cmds;
+        t.push_cmd (req_id, cmd);
+        match%lwt th with
+            Executed (Ok res) -> Lwt.return_ok res
+          | Executed (Error exn) -> Lwt.return_error (Exn exn)
+          | Redirect _ -> execute t cmd
+    end
 
   let rec readonly_operation t =
     if Core.is_single_node_cluster t.state then
-      Lwt.return `OK
+      Lwt.return_ok ()
     else
       exec_aux t
         (fun t ->
            let th, u = Lwt.task () in
              t.push_ro_op u;
              match%lwt th with
-                 OK -> Lwt.return `OK
+                 OK -> Lwt.return_ok ()
                | Retry -> readonly_operation t)
 
   let compact_log t index =
     t.state <- Core.compact_log index t.state
 
-  module Config =
-  struct
-    type result =
-      [
-      | `OK
-      | `Redirect of rep_id * address
-      | `Retry
-      | `Cannot_change
-      | `Unsafe_change of simple_config * passive_peers
-      ]
+  module Config = struct
+    type error =
+      | Redirect of rep_id * address
+      | Retry
+      | Cannot_change
+      | Unsafe_change of simple_config * passive_peers
 
     let get t = Core.config t.state
 
-    let rec perform_change t perform mk_change : result Lwt.t =
+    let rec perform_change t perform mk_change =
       match t.config_change with
           New_failover _ | Remove_failover _ | Decommission _
         | Promote _ | Demote _ | Replace _ ->
@@ -619,10 +617,11 @@ struct
             perform_change t perform mk_change
         | No_change ->
             match perform t.state with
-                `Already_changed -> Lwt.return `OK
-              | `Cannot_change | `Unsafe_change _ as x -> Lwt.return x
-              | `Redirect (Some x) -> Lwt.return (`Redirect x)
-              | `Redirect None -> Lwt.return `Retry
+                `Already_changed -> Lwt.return_ok ()
+              | `Cannot_change -> Lwt.return_error (Cannot_change)
+              | `Unsafe_change (c, p) -> Lwt.return_error (Unsafe_change (c, p))
+              | `Redirect (Some (rep_id, addr)) -> Lwt.return_error (Redirect (rep_id, addr))
+              | `Redirect None -> Lwt.return_error Retry
               | `Change_in_process ->
                   Lwt_unix.sleep retry_delay>>= fun () ->
                   perform_change t perform mk_change
@@ -631,7 +630,7 @@ struct
                   let th, u = Lwt.task () in
                     t.config_change <- mk_change u;
                     match%lwt th with
-                        OK -> Lwt.return `OK
+                        OK -> Lwt.return_ok ()
                       | Retry ->
                           Lwt_unix.sleep retry_delay>>= fun () ->
                           perform_change t perform mk_change

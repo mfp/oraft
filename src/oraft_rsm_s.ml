@@ -25,17 +25,17 @@ module type CLIENT = sig
 
   val connect : t -> addr:address -> unit Lwt.t
 
-  val execute    : t -> op -> [ `Error of string | `OK of string ] Lwt.t
-  val execute_ro : t -> op -> [ `Error of string | `OK of string ] Lwt.t
-  val get_config : t -> [`Error of string | `OK of config ] Lwt.t
+  val execute    : t -> op -> (string, string) result Lwt.t
+  val execute_ro : t -> op -> (string, string) result Lwt.t
+  val get_config : t -> (config, string) result Lwt.t
+
+  type change_config_error =
+    | Cannot_change
+    | Error of string
+    | Unsafe_change of simple_config * passive_peers
 
   val change_config :
-    t -> config_change ->
-    [ `Cannot_change
-    | `Error of string
-    | `OK
-    | `Unsafe_change of simple_config * passive_peers ]
-      Lwt.t
+    t -> config_change -> (unit, change_config_error) result Lwt.t
 end
 
 module type SERVER = sig
@@ -44,8 +44,7 @@ module type SERVER = sig
 
   module Core : Oraft_lwt_s.SERVER_GENERIC with type op = op
 
-  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
-  type 'a apply     = 'a Core.server -> op -> [`OK of 'a | `Error of exn] execution
+  type 'a apply = 'a Core.server -> op -> ('a, exn) result Core.execution
 
   val make :
     'a apply -> address ->
