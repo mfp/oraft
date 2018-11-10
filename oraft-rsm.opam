@@ -17,6 +17,7 @@ depends: [
 
   "oraft-lwt" {= "0.1"}
   "oraft-lwt-tls" {= "0.1"}
+  "oraft-lwt-extprot-io" {= "0.1"}
 ]
 synopsis: "Replicated State Machine built atop `oraft-lwt`"
 description: """

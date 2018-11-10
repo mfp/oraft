@@ -222,7 +222,7 @@ module Make_client(C : CONF) = struct
 end
 
 module Make_server(C : CONF) = struct
-  module IO = Oraft_lwt_simple_io.Make(C)
+  module IO = Oraft_lwt_extprot_io.Make(C)
   module SS   = Oraft_lwt.Make_server(IO)
   module SSC  = SS.Config
   module CC   = Make_client(C)

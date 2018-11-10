@@ -7,8 +7,6 @@ open Oraft_lwt_conn_wrapper
 module Map = BatMap
 
 module Make(C : SERVER_CONF) = struct
-  module EC = Extprot.Conv
-
   type op = C.op
 
   module M  = Map.Make(String)
@@ -226,7 +224,8 @@ module Make(C : SERVER_CONF) = struct
                if Bytes.length c.in_buf < len
                then c.in_buf <- Bytes.create len;
                let%lwt ()  = Lwt_io.read_into_exactly ich c.in_buf 0 len in
-               let msg = EC.deserialize Raft_message.read (Bytes.unsafe_to_string c.in_buf) in
+               let msg = Extprot.Conv.deserialize Raft_message.read
+                           (Bytes.unsafe_to_string c.in_buf) in
                  Logs_lwt.debug ~src begin fun m ->
                    m "Received@ %s"
                      (Extprot.Pretty_print.pp pp_raft_message msg)

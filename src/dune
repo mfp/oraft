@@ -24,12 +24,12 @@
  (synopsis ""))
 
 (library
- (name        oraft_lwt_simple_io)
- (public_name oraft-lwt-simple-io)
+ (name        oraft_lwt_extprot_io)
+ (public_name oraft-lwt-extprot-io)
  (preprocess (pps lwt_ppx))
  (libraries  extprot oraft-lwt)
  (wrapped false)
- (modules oraft_proto oraft_lwt_simple_io)
+ (modules oraft_proto oraft_lwt_extprot_io)
  (flags -w -30)
 (synopsis ""))
 
@@ -45,7 +45,7 @@
  (name        oraft_rsm)
  (public_name oraft-rsm)
  (preprocess (pps lwt_ppx))
- (libraries  extprot logs oraft-lwt-simple-io)
+ (libraries  extprot logs oraft-lwt-extprot-io)
  (flags -w -32)
  (modules  oraft_rsm_s oraft_rsm)
  (synopsis ""))

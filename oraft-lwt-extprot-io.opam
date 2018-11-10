@@ -1,5 +1,5 @@
 opam-version: "2.0"
-name: "oraft-lwt-simple-io"
+name: "oraft-lwt-extprot-io"
 version: "0.1"
 authors: [
   "Mauricio Fernandez <mfp@acm.org>"
