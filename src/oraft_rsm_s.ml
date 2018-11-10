@@ -1,6 +1,7 @@
 open Oraft.Types
 
-type config_change = Oraft_proto.Config_change.config_change =
+type config_change =
+  Oraft_proto_rsm.Config_change.config_change =
     Add_failover of rep_id * address
   | Remove_failover of rep_id
   | Decommission of rep_id

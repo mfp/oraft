@@ -46,7 +46,7 @@ let read_msg read conn =
 module Make_client(C : CONF) = struct
   module M = Map.Make(String)
 
-  open Oraft_proto
+  open Oraft_proto_rsm
   open Client_msg
   open Client_op
   open Server_msg
@@ -92,8 +92,8 @@ module Make_client(C : CONF) = struct
     t.req_id <- Int64.succ t.req_id;
     t.req_id
 
-  let send_msg conn msg = send_msg Oraft_proto.Client_msg.write conn msg
-  let read_msg conn     = read_msg Oraft_proto.Server_msg.read conn
+  let send_msg conn msg = send_msg Client_msg.write conn msg
+  let read_msg conn     = read_msg Server_msg.read conn
 
   let connect t peer_id addr =
     let do_connect () =
@@ -117,7 +117,7 @@ module Make_client(C : CONF) = struct
                     let%lwt msg = read_msg conn in
                       Logs_lwt.debug ~src begin fun m ->
                         m "Received from server@ %s"
-                          (Extprot.Pretty_print.pp Oraft_proto.Server_msg.pp msg)
+                          (Extprot.Pretty_print.pp Server_msg.pp msg)
                       end >>= fun () ->
                       match H.Exceptionless.find t.pending_reqs msg.id with
                           None -> loop_recv ()
@@ -158,7 +158,7 @@ module Make_client(C : CONF) = struct
             H.add t.pending_reqs id u;
             Logs_lwt.debug ~src begin fun m ->
               m "Sending to server@ %s"
-                (Extprot.Pretty_print.pp Oraft_proto.Client_msg.pp msg)
+                (Extprot.Pretty_print.pp Client_msg.pp msg)
             end >>= fun () ->
             send_msg c msg >>= fun () ->
             let%lwt x = th in
@@ -229,7 +229,7 @@ module Make_server(C : CONF) = struct
 
   module Core = SS
 
-  open Oraft_proto
+  open Oraft_proto_rsm
   open Client_msg
   open Client_op
   open Server_msg
@@ -294,8 +294,8 @@ module Make_server(C : CONF) = struct
       Lwt.return { id; addr; c ; node_sockaddr;
                    app_sockaddr; serv; exec; conn_wrapper; }
 
-  let send_msg conn msg = send_msg Oraft_proto.Server_msg.write conn msg
-  let read_msg conn     = read_msg Oraft_proto.Client_msg.read conn
+  let send_msg conn msg = send_msg Server_msg.write conn msg
+  let read_msg conn     = read_msg Client_msg.read conn
 
   let map_op_result : string Core.cmd_result -> response = function
     | Error (Exn exn) -> Error (Printexc.to_string exn)
@@ -389,7 +389,7 @@ module Make_server(C : CONF) = struct
         with exn ->
           Logs_lwt.debug ~src begin fun m ->
             m "Error while processing message@ %s: %s"
-              (Extprot.Pretty_print.pp Oraft_proto.Client_msg.pp msg)
+              (Extprot.Pretty_print.pp Client_msg.pp msg)
               (Printexc.to_string exn)
           end >>= fun () ->
           send_msg conn { id = msg.id; response = Error (Printexc.to_string exn) }
