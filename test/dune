@@ -4,7 +4,7 @@
  (preprocess (pps lwt_ppx))
  (modules    Dict)
  (package    oraft-rsm)
- (libraries  cmdliner fmt.tty fmt.cli logs.fmt logs.cli logs.lwt x509 oraft_lwt_tls oraft_rsm))
+ (libraries  cmdliner fmt.tty fmt.cli logs.fmt logs.cli logs.lwt x509 oraft-lwt-tls oraft-rsm))
 
 (executable
  (name        test_DES)

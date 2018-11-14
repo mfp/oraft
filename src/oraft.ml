@@ -1,6 +1,3 @@
-open Printf
-open Lwt.Infix
-
 module Map    = BatMap
 module List   = BatList
 module Option = BatOption

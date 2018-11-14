@@ -14,9 +14,9 @@
  * (2) Launch extra nodes. They will join the cluster and the quorum will be
  *     updated.
  *
- *     ./dict -master n2a,n2b --join n1a,n1b
+ *     ./dict master n2a,n2b --join n1a,n1b
  *
- *     ./dict -master n3a,n3b --join n1a,n1b
+ *     ./dict master n3a,n3b --join n1a,n1b
  *
  *     ...
  *
@@ -42,10 +42,8 @@ type op =
   | Wait of string
   | Set of string * string
 
-module CONF =
-struct
-  type op_ = op
-  type op = op_
+module Conf = struct
+  type nonrec op = op
 
   let string_of_op = function
       Get v -> "?" ^ v
@@ -63,6 +61,19 @@ struct
               Set (k, v)
         | _ -> failwith "bad op"
 
+  type addr = {
+    node: Unix.sockaddr ;
+    app: Unix.sockaddr ;
+  }
+
+  let fn_of_addr { node ; app } =
+    match node, app with
+      | Unix.ADDR_UNIX a, Unix.ADDR_UNIX b ->
+          [a; b]
+      | Unix.ADDR_UNIX a, _ -> [a]
+      | _, Unix.ADDR_UNIX b -> [b]
+      | _ -> []
+
   let sockaddr s =
     try
       let host, port = String.split ~by:":" s in
@@ -70,22 +81,28 @@ struct
     with Not_found ->
       Unix.ADDR_UNIX s
 
+  let parse_sockaddr s =
+    match String.split ~by:"," s with
+      | exception _ -> None
+      | a, b -> Some {
+          node = sockaddr a ;
+          app = sockaddr b ;
+        }
+
   let node_sockaddr s = String.split ~by:"," s |> fst |> sockaddr
-  let app_sockaddr  s =
-    Printf.printf "Connecting to %s\n%!" s;
-    String.split ~by:"," s |> snd |> sockaddr
+  let app_sockaddr  s = String.split ~by:"," s |> snd |> sockaddr
 
   let string_of_address s = s
 end
 
-module SERVER = Oraft_rsm.Make_server(CONF)
-module CLIENT = Oraft_rsm.Make_client(CONF)
+module Server = Oraft_rsm.Make_server(Conf)
+module Client = Oraft_rsm.Make_client(Conf)
 
 let make_tls_wrapper tls =
   Option.map
     (fun (client_config, server_config) ->
        Oraft_lwt_tls.make_server_wrapper
-         ~client_config ~server_config ())
+         ~client_config ~server_config)
     tls
 
 let run_server ?tls ~addr ?join ~id () =
@@ -93,12 +110,16 @@ let run_server ?tls ~addr ?join ~id () =
   let cond = Lwt_condition.create () in
 
   let exec _ op = match op with
-      Get s -> `Sync (Lwt.return (try `OK (Hashtbl.find h s) with Not_found -> `OK ""))
+      Get s -> Server.Core.Sync begin
+        match Hashtbl.find_option h s with
+          | None -> Lwt.return_error Not_found
+          | Some v -> Lwt.return_ok v
+      end
     | Wait k ->
-        `Async begin
+        Async begin
           let rec attempt () =
             match Hashtbl.Exceptionless.find h k with
-                Some v -> Lwt.return (`OK v)
+                Some v -> Lwt.return_ok v
               | None ->
                   Lwt_condition.wait cond >>= fun () ->
                   attempt ()
@@ -112,35 +133,36 @@ let run_server ?tls ~addr ?join ~id () =
           Hashtbl.add h k v;
           Lwt_condition.broadcast cond ();
         end;
-        `Sync (Lwt.return (`OK ""))
+        Sync (Lwt.return_ok "")
   in
 
-  let%lwt server = SERVER.make ?conn_wrapper:(make_tls_wrapper tls) exec addr ?join id in
-    SERVER.run server
+  let%lwt server =
+    Server.make ?conn_wrapper:(make_tls_wrapper tls) exec addr ?join id in
+    Server.run server
 
 let client_op ?tls ~addr op =
-  let c    = CLIENT.make
+  let c    = Client.make
                ?conn_wrapper:(make_tls_wrapper tls)
                ~id:(string_of_int (Unix.getpid ())) () in
   let exec = match op with
-               | Get _ | Wait _ -> CLIENT.execute_ro
-               | Set _ -> CLIENT.execute
+               | Get _ | Wait _ -> Client.execute_ro
+               | Set _ -> Client.execute
   in
-    CLIENT.connect c ~addr >>= fun () ->
+    Client.connect c ~addr >>= fun () ->
     match%lwt exec c op with
-      | `OK s -> Printf.printf "+OK %s\n" s; Lwt.return_unit
-      | `Error s -> Printf.printf "-ERR %s\n" s; Lwt.return_unit
+      | Ok s -> Printf.printf "+OK %s\n" s; Lwt.return_unit
+      | Error s -> Printf.printf "-ERR %s\n" s; Lwt.return_unit
 
 let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
-  let c    = CLIENT.make
+  let c    = Client.make
                ?conn_wrapper:(make_tls_wrapper tls)
                ~id:(string_of_int (Unix.getpid ())) ()
   in
-    CLIENT.connect c ~addr >>= fun () ->
-    CLIENT.execute c (Set ("bm", "0")) >>= fun _ ->
+    Client.connect c ~addr >>= fun () ->
+    Client.execute c (Set ("bm", "0")) >>= fun _ ->
     let t0 = Unix.gettimeofday () in
       for%lwt i = 1 to iterations do
-        let%lwt _ = CLIENT.execute_ro c (Get "bm") in
+        let%lwt _ = Client.execute_ro c (Get "bm") in
           Lwt.return_unit
       done >>= fun () ->
       let dt = Unix.gettimeofday () -. t0 in
@@ -148,14 +170,14 @@ let ro_benchmark ?tls ?(iterations = 10_000) ~addr () =
         Lwt.return_unit
 
 let wr_benchmark ?tls ?(iterations = 10_000) ~addr () =
-  let c    = CLIENT.make
+  let c    = Client.make
                ?conn_wrapper:(make_tls_wrapper tls)
                ~id:(string_of_int (Unix.getpid ())) ()
   in
-    CLIENT.connect c ~addr >>= fun () ->
+    Client.connect c ~addr >>= fun () ->
     let t0 = Unix.gettimeofday () in
       for%lwt i = 1 to iterations do
-        let%lwt _ = CLIENT.execute c (Set ("bm", "")) in
+        let%lwt _ = Client.execute c (Set ("bm", "")) in
           Lwt.return_unit
       done >>= fun () ->
       let dt = Unix.gettimeofday () -. t0 in
@@ -209,6 +231,15 @@ let tls_create (cert, priv_key) =
     | _ -> tls_create cert priv_key >>= Lwt.return_some
 
 let master tls addr join () =
+  List.iter begin fun s ->
+    Sys.set_signal s begin Sys.Signal_handle begin fun _ ->
+        Option.may (fun a ->
+            List.iter Sys.remove (Conf.fn_of_addr a))
+          (Conf.parse_sockaddr addr) ;
+        exit 0
+      end
+    end
+  end Sys.[sigint ; sigterm];
   tls_create tls >>= fun tls ->
   run_server ?tls ~addr ?join ~id:addr ()
 

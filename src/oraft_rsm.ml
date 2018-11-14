@@ -1,9 +1,7 @@
-open Printf
 open Lwt.Infix
 
 open Oraft.Types
-
-let src = Logs.Src.create "oraft_rsm"
+open Oraft_rsm_s
 
 module Map     = BatMap
 module Hashtbl = BatHashtbl
@@ -45,26 +43,10 @@ let read_msg read conn =
          Lwt.return (Extprot.Conv.deserialize read (Bytes.unsafe_to_string !buf)))
     conn.ich
 
-type config_change =
-  Oraft_proto.Config_change.config_change =
-    Add_failover of rep_id * address
-  | Remove_failover of rep_id
-  | Decommission of rep_id
-  | Demote of rep_id
-  | Promote of rep_id
-  | Replace of rep_id * rep_id
-
-module type CONF =
-sig
-  include Oraft_lwt.SERVER_CONF
-  val app_sockaddr : address -> Unix.sockaddr
-end
-
-module Make_client(C : CONF) =
-struct
+module Make_client(C : CONF) = struct
   module M = Map.Make(String)
 
-  open Oraft_proto
+  open Oraft_proto_rsm
   open Client_msg
   open Client_op
   open Server_msg
@@ -74,31 +56,34 @@ struct
   exception Bad_response
 
   module H = Hashtbl.Make(struct
-                            type t = Int64.t
-                            let hash          = Hashtbl.hash
-                            let equal i1 i2 = Int64.compare i1 i2 = 0
-                          end)
+      type t = Int64.t
+      let hash          = Hashtbl.hash
+      let equal i1 i2 = Int64.compare i1 i2 = 0
+    end)
 
   type t =
-      {
-        id             : string;
-        mutable dst    : address conn option;
-        mutable conns  : address conn M.t;
-        mutable req_id : Int64.t;
-        pending_reqs   : response Lwt.u H.t;
-        conn_wrapper   : [`Outgoing] Oraft_lwt.conn_wrapper;
-      }
+    {
+      id             : string;
+      mutable dst    : address conn option;
+      mutable conns  : address conn M.t;
+      mutable req_id : Int64.t;
+      pending_reqs   : response Lwt.u H.t;
+      conn_wrapper   : [`Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper;
+    }
 
   and address = string
 
+  let src = Logs.Src.create "oraft_rsm.client"
+
   let trivial_wrapper () =
-    (Oraft_lwt.trivial_conn_wrapper () :> [`Outgoing] Oraft_lwt.conn_wrapper)
+    (Oraft_lwt_conn_wrapper.trivial_conn_wrapper () :>
+       [`Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper)
 
   let make ?conn_wrapper ~id () =
     { id; dst = None; conns = M.empty; req_id = 0L;
       pending_reqs = H.create 13;
       conn_wrapper = Option.map_default
-                       (fun w -> (w :> [`Outgoing] Oraft_lwt.conn_wrapper))
+                       (fun w -> (w :> [`Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper))
                        (trivial_wrapper ())
                        conn_wrapper;
     }
@@ -107,15 +92,15 @@ struct
     t.req_id <- Int64.succ t.req_id;
     t.req_id
 
-  let send_msg conn msg = send_msg Oraft_proto.Client_msg.write conn msg
-  let read_msg conn     = read_msg Oraft_proto.Server_msg.read conn
+  let send_msg conn msg = send_msg Client_msg.write conn msg
+  let read_msg conn     = read_msg Server_msg.read conn
 
   let connect t peer_id addr =
     let do_connect () =
       let saddr = C.app_sockaddr addr in
       let fd = Lwt_unix.socket (Unix.domain_of_sockaddr saddr) Unix.SOCK_STREAM 0 in
       let%lwt () = Lwt_unix.connect fd saddr in
-      let%lwt ich, och     = Oraft_lwt.wrap_outgoing_conn t.conn_wrapper fd in
+      let%lwt ich, och     = Oraft_lwt_conn_wrapper.wrap_outgoing_conn t.conn_wrapper fd in
       let out_buf      = MB.create () in
       let in_buf       = ref Bytes.empty in
       let conn         = { addr; ich; och; in_buf; out_buf } in
@@ -132,7 +117,7 @@ struct
                     let%lwt msg = read_msg conn in
                       Logs_lwt.debug ~src begin fun m ->
                         m "Received from server@ %s"
-                          (Extprot.Pretty_print.pp Oraft_proto.Server_msg.pp msg)
+                          (Extprot.Pretty_print.pp Server_msg.pp msg)
                       end >>= fun () ->
                       match H.Exceptionless.find t.pending_reqs msg.id with
                           None -> loop_recv ()
@@ -147,7 +132,10 @@ struct
                 end;
                 Lwt.return_unit
             | _ -> failwith "conn refused"
-        with _ ->
+        with exn ->
+          Logs_lwt.err ~src begin fun m ->
+            m "Error while connecting (%s)" (Printexc.to_string exn)
+          end >>= fun () ->
           t.conns <- M.remove peer_id t.conns;
           Lwt_io.abort och
     in
@@ -170,7 +158,7 @@ struct
             H.add t.pending_reqs id u;
             Logs_lwt.debug ~src begin fun m ->
               m "Sending to server@ %s"
-                (Extprot.Pretty_print.pp Oraft_proto.Client_msg.pp msg)
+                (Extprot.Pretty_print.pp Client_msg.pp msg)
             end >>= fun () ->
             send_msg c msg >>= fun () ->
             let%lwt x = th in
@@ -179,8 +167,8 @@ struct
   let rec do_execute t op =
     send_and_await_response t op
       (fun dst resp -> match resp with
-           OK s -> Lwt.return (`OK s)
-         | Error s -> Lwt.return (`Error s)
+           OK s -> Lwt.return_ok s
+         | Error s -> Lwt.return_error s
          | Redirect (peer_id, address) when peer_id <> dst ->
              connect t peer_id address >>= fun () ->
              do_execute t op
@@ -199,8 +187,8 @@ struct
   let rec get_config t =
     send_and_await_response t Get_config
       (fun dst resp -> match resp with
-           Config c -> Lwt.return (`OK c)
-         | Error x -> Lwt.return (`Error x)
+           Config c -> Lwt.return_ok c
+         | Error x -> Lwt.return_error x
          | Redirect (peer_id, address) when peer_id <> dst ->
              connect t peer_id address >>= fun () ->
              get_config t
@@ -210,117 +198,122 @@ struct
          | OK _ | Cannot_change | Unsafe_change _ ->
              Lwt.fail Bad_response)
 
+  type change_config_error =
+    | Cannot_change
+    | Error of string
+    | Unsafe_change of simple_config * passive_peers
+
   let rec change_config t op =
     send_and_await_response t (Change_config op)
       (fun dst resp -> match resp with
-           OK _ -> Lwt.return `OK
-         | Error x -> Lwt.return (`Error x)
+           OK _ -> Lwt.return_ok ()
+         | Error x -> Lwt.return_error (Error x)
          | Redirect (peer_id, address) when peer_id <> dst ->
              connect t peer_id address >>= fun () ->
              change_config t op
          | Redirect _ | Retry ->
              Lwt_unix.sleep 0.050 >>= fun () ->
              change_config t op
-         | Cannot_change -> Lwt.return (`Cannot_change)
-         | Unsafe_change (c, p) -> Lwt.return (`Unsafe_change (c, p))
+         | Cannot_change -> Lwt.return_error Cannot_change
+         | Unsafe_change (c, p) -> Lwt.return_error (Unsafe_change (c, p))
          | Config _ -> Lwt.fail Bad_response)
 
   let connect t ~addr = connect t "" addr
 end
 
-module Make_server(C : CONF) =
-struct
-  module SS   = Oraft_lwt.Simple_server(C)
+module Make_server(C : CONF) = struct
+  module IO = Oraft_lwt_extprot_io.Make(C)
+  module SS   = Oraft_lwt.Make_server(IO)
   module SSC  = SS.Config
   module CC   = Make_client(C)
 
   module Core = SS
 
-  open Oraft_proto
+  open Oraft_proto_rsm
   open Client_msg
   open Client_op
   open Server_msg
   open Response
   open Config_change
 
-  type 'a execution = [`Sync of 'a Lwt.t | `Async of 'a Lwt.t]
-  type 'a apply     = 'a Core.server -> C.op -> [`OK of 'a | `Error of exn] execution
+  type 'a apply =
+    'a Core.server -> C.op -> ('a, exn) result Core.execution
 
   type 'a t =
-      {
-        id            : rep_id;
-        addr          : string;
-        c             : CC.t option;
-        node_sockaddr : Unix.sockaddr;
-        app_sockaddr  : Unix.sockaddr;
-        serv          : 'a SS.server;
-        exec          : 'a SS.apply;
-        conn_wrapper  : [`Incoming | `Outgoing] Oraft_lwt.conn_wrapper;
-      }
+    {
+      id            : rep_id;
+      addr          : string;
+      c             : CC.t option;
+      node_sockaddr : Unix.sockaddr;
+      app_sockaddr  : Unix.sockaddr;
+      serv          : 'a SS.server;
+      exec          : 'a apply;
+      conn_wrapper  : [`Incoming | `Outgoing] Oraft_lwt_conn_wrapper.conn_wrapper;
+    }
+
+  let src = Logs.Src.create "oraft_rsm.server"
 
   let raise_if_error = function
-      `OK x -> Lwt.return x
-    | `Error s -> Lwt.fail_with s
+    | Ok x -> Lwt.return x
+    | Error s -> Lwt.fail_with s
 
-  let check_config_err = function
-    | `OK -> Lwt.return_unit
-    | `Error s -> Lwt.fail_with s
-    | `Cannot_change -> Lwt.fail_with "Cannot perform config change"
-    | `Unsafe_change _ -> Lwt.fail_with "Unsafe config change"
+  let check_config_err :
+    (unit, CC.change_config_error) result -> unit Lwt.t = function
+    | Ok () -> Lwt.return_unit
+    | Error (Error s) -> Lwt.fail_with s
+    | Error Cannot_change -> Lwt.fail_with "Cannot perform config change"
+    | Error (Unsafe_change _) -> Lwt.fail_with "Unsafe config change"
 
   let make exec addr
-          ?(conn_wrapper = Oraft_lwt.trivial_conn_wrapper ())
-          ?join ?election_period ?heartbeat_period id =
-    match join with
+        ?(conn_wrapper = Oraft_lwt_conn_wrapper.trivial_conn_wrapper ())
+        ?join ?election_period ?heartbeat_period id =
+    begin match join with
       | None ->
-          let config        = Simple_config ([id, addr], []) in
-          let state         = Oraft.Core.make
-                                ~id ~current_term:0L ~voted_for:None
-                                ~log:[] ~config () in
-          let node_sockaddr = C.node_sockaddr addr in
-          let app_sockaddr  = C.app_sockaddr addr in
-          let%lwt conn_mgr  = SS.make_conn_manager ~id node_sockaddr in
-          let serv          = SS.make exec ?election_period ?heartbeat_period
-                                state conn_mgr
-          in
-            Lwt.return { id; addr; c = None; node_sockaddr;
-                     app_sockaddr; serv; exec; conn_wrapper; }
+          Lwt.return (Simple_config ([id, addr], []), None)
       | Some peer_addr ->
           let c = CC.make ~conn_wrapper ~id () in
             Logs_lwt.info ~src begin fun m ->
               m "Connecting to %S" (peer_addr |> C.string_of_address)
             end >>= fun () ->
             CC.connect c ~addr:peer_addr >>= fun () ->
-            let%lwt config        = CC.get_config c >>= raise_if_error in
-            let%lwt ()            = Logs_lwt.info ~src (fun m -> m "Got initial configuration %s"
-                                                                   (Oraft_lwt.string_of_config C.string_of_address config)) in
-            let state         = Oraft.Core.make
-                                  ~id ~current_term:0L ~voted_for:None
-                                  ~log:[] ~config () in
-            let node_sockaddr = C.node_sockaddr addr in
-            let app_sockaddr  = C.app_sockaddr addr in
-            let%lwt conn_mgr  = SS.make_conn_manager ~id node_sockaddr in
-            let serv          = SS.make exec ?election_period
-                                  ?heartbeat_period state conn_mgr
-            in
-              Lwt.return { id; addr; c = Some c;
-                           node_sockaddr; app_sockaddr; serv; exec; conn_wrapper }
+            CC.get_config c >>= raise_if_error >>= fun config ->
+            Logs_lwt.info ~src begin fun m ->
+              m "Got initial configuration %s"
+                (Oraft_lwt.string_of_config C.string_of_address config)
+            end >>= fun () ->
+            Lwt.return (config, Some c)
+    end >>= fun (config, c) ->
+    let state         = Oraft.Core.make
+                          ~id ~current_term:0L ~voted_for:None
+                          ~log:[] ~config () in
+    let node_sockaddr = C.node_sockaddr addr in
+    let app_sockaddr  = C.app_sockaddr addr in
+    let%lwt conn_mgr  = IO.make_conn_manager ~id node_sockaddr in
+    let serv          = SS.make exec ?election_period ?heartbeat_period
+                          state conn_mgr in
+      Lwt.return { id; addr; c ; node_sockaddr;
+                   app_sockaddr; serv; exec; conn_wrapper; }
 
-  let send_msg conn msg = send_msg Oraft_proto.Server_msg.write conn msg
-  let read_msg conn     = read_msg Oraft_proto.Client_msg.read conn
+  let send_msg conn msg = send_msg Server_msg.write conn msg
+  let read_msg conn     = read_msg Client_msg.read conn
 
-  let map_op_result = function
-    | `Redirect (peer_id, addr) -> Redirect (peer_id, addr)
-    | `Retry -> Retry
-    | `Error exn -> Error (Printexc.to_string exn)
-    | `OK s -> OK s
+  let map_op_result : string Core.cmd_result -> response = function
+    | Error (Exn exn) -> Error (Printexc.to_string exn)
+    | Error (Redirect (peer_id, addr)) -> Redirect (peer_id, addr)
+    | Error Retry -> Retry
+    | Ok response -> OK response
+
+  let map_apply = function
+    | Result.Error exn -> Error (Printexc.to_string exn)
+    | Ok _ -> OK ""
 
   let perform_change t op =
     let map = function
-          `OK -> OK ""
-        | `Cannot_change -> Cannot_change
-        | `Unsafe_change (c, p) -> Unsafe_change (c, p)
-        | `Redirect _ | `Retry as x -> map_op_result x
+      | Ok () -> OK ""
+      | Error SSC.Cannot_change -> Cannot_change
+      | Error Unsafe_change (c, p) -> Unsafe_change (c, p)
+      | Error Redirect (peer_id, addr) -> Redirect (peer_id, addr)
+      | Error Retry -> Retry
     in
       try%lwt
         let%lwt ret =
@@ -364,23 +357,23 @@ struct
           send_msg conn { id; response }
     | { id; op = Execute_RO op; } -> begin
         match%lwt SS.readonly_operation t.serv with
-          | `Redirect _ | `Retry | `Error _ as x ->
+          | Error (Redirect _) | Error Retry | Error _ as x ->
               let response = map_op_result x in
                 send_msg conn { id; response; }
-          | `OK ->
+          | Ok () ->
               match t.exec t.serv (C.op_of_string op) with
-                | `Sync resp ->
+                | Sync resp ->
                     let%lwt resp = resp in
-                      send_msg conn { id; response = map_op_result resp }
-                | `Async resp ->
+                      send_msg conn { id; response = map_apply resp }
+                | Async resp ->
                     ignore begin try%lwt
-                      let%lwt resp = try%lwt resp
-                                 with exn -> Lwt.return (`Error exn)
-                      in
-                        send_msg conn { id; response = map_op_result resp }
-                    with exn ->
-                      Logs_lwt.debug ~src
-                        (fun m -> m "Caught exn: %a" Oraft_lwt.pp_exn exn)
+                        let%lwt resp = try%lwt resp
+                          with exn -> Lwt.return_error exn
+                        in
+                          send_msg conn { id; response = map_apply resp }
+                      with exn ->
+                        Logs_lwt.debug ~src
+                          (fun m -> m "Caught exn: %a" Oraft_lwt.pp_exn exn)
                     end;
                     Lwt.return_unit
       end
@@ -396,7 +389,7 @@ struct
         with exn ->
           Logs_lwt.debug ~src begin fun m ->
             m "Error while processing message@ %s: %s"
-              (Extprot.Pretty_print.pp Oraft_proto.Client_msg.pp msg)
+              (Extprot.Pretty_print.pp Client_msg.pp msg)
               (Printexc.to_string exn)
           end >>= fun () ->
           send_msg conn { id = msg.id; response = Error (Printexc.to_string exn) }
@@ -457,25 +450,25 @@ struct
     (try Lwt_unix.setsockopt fd Unix.TCP_NODELAY true with _ -> ());
     (try Lwt_unix.setsockopt fd Unix.SO_KEEPALIVE true with _ -> ());
     (try%lwt
-      let%lwt ich, och = Oraft_lwt.wrap_incoming_conn t.conn_wrapper fd in
-      let conn     = { addr; ich; och; in_buf = ref Bytes.empty; out_buf = MB.create () } in
-        (match%lwt read_msg conn with
-            | { id; op = Connect client_id; _ } ->
-                Logs_lwt.info ~src begin fun m ->
-                  m "Incoming client connection from %S" client_id
-                end >>= fun () ->
-                send_msg conn { id; response = OK "" }>>= fun () ->
-                request_loop t client_id conn
-            | { id; _ } ->
-                send_msg conn { id; response = Error "Bad request" })
-     [%finally
-       try%lwt Lwt_io.close ich with _ -> Lwt.return_unit]
+       let%lwt ich, och = Oraft_lwt_conn_wrapper.wrap_incoming_conn t.conn_wrapper fd in
+       let conn     = { addr; ich; och; in_buf = ref Bytes.empty; out_buf = MB.create () } in
+         (match%lwt read_msg conn with
+           | { id; op = Connect client_id; _ } ->
+               Logs_lwt.info ~src begin fun m ->
+                 m "Incoming client connection from %S" client_id
+               end >>= fun () ->
+               send_msg conn { id; response = OK "" }>>= fun () ->
+               request_loop t client_id conn
+           | { id; _ } ->
+               send_msg conn { id; response = Error "Bad request" })
+           [%finally
+             try%lwt Lwt_io.close ich with _ -> Lwt.return_unit]
      with
-      | End_of_file
-      | Unix.Unix_error (Unix.ECONNRESET, _, _) -> Lwt.return_unit
-      | exn ->
-          Logs_lwt.err ~src
-            (fun m -> m "Error in dispatch: %a" Oraft_lwt.pp_exn exn))
+       | End_of_file
+       | Unix.Unix_error (Unix.ECONNRESET, _, _) -> Lwt.return_unit
+       | exn ->
+           Logs_lwt.err ~src
+             (fun m -> m "Error in dispatch: %a" Oraft_lwt.pp_exn exn))
       [%finally
         try%lwt Lwt_unix.close fd with _ -> Lwt.return_unit]
 
@@ -505,11 +498,11 @@ struct
             end
         end;
         (try%lwt
-          match t.c with
-            | None -> accept_loop t
-            | Some c -> join_cluster t c >>= fun () -> accept_loop t
-        with exn ->
-          Logs_lwt.err ~src (fun m -> m "Exn raised: %a" Oraft_lwt.pp_exn exn))
+           match t.c with
+             | None -> accept_loop t
+             | Some c -> join_cluster t c >>= fun () -> accept_loop t
+         with exn ->
+           Logs_lwt.err ~src (fun m -> m "Exn raised: %a" Oraft_lwt.pp_exn exn))
           [%finally
              (* FIXME: t.c client shutdown *)
             try%lwt Lwt_unix.close sock with _ -> Lwt.return_unit]

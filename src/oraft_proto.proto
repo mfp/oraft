@@ -1,19 +1,4 @@
-type rep_id    = string
-type client_id = string
-type address   = string
-
-type simple_config = [(rep_id * address)]
-type passive_peers = simple_config
-
-type term   = long
-type index  = long
-
-type req_id = (client_id * long)
-
-type config =
-    Simple_config simple_config passive_peers
-  | Joint_config simple_config simple_config passive_peers
-      options "ocaml.type_equals" = "Oraft.Types.config"
+include "oraft_proto_types.proto"
 
 type actual_append_result =
     Append_success index | Append_failure index
@@ -34,38 +19,5 @@ message raft_message =
   | Append_result { term : term; result : actual_append_result }
   | Ping ping_msg
   | Pong ping_msg
-
-type msg_id = long
-
-type config_change =
-    Add_failover rep_id address
-  | Remove_failover rep_id
-  | Decommission rep_id
-  | Demote rep_id
-  | Promote rep_id
-  | Replace rep_id rep_id
-
-type client_op =
-    Connect string
-  | Execute string
-  | Execute_RO string
-  | Change_config config_change
-  | Get_config
-
-message client_msg = { id : msg_id; op : client_op }
-
-type opt 'a = None | Some 'a
-  options "ocaml.type_equals" = "option"
-
-type response =
-    OK string
-  | Redirect rep_id address
-  | Retry
-  | Cannot_change
-  | Unsafe_change simple_config passive_peers
-  | Error string
-  | Config config
-
-message server_msg = { id : msg_id; response : response }
 
 (* vim: set ft=omlet: *)

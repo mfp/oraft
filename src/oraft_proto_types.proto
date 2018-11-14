@@ -1,0 +1,18 @@
+type rep_id    = string
+type client_id = string
+type address   = string
+
+type simple_config = [(rep_id * address)]
+type passive_peers = simple_config
+
+type term   = long
+type index  = long
+
+type req_id = (client_id * long)
+
+type config =
+    Simple_config simple_config passive_peers
+  | Joint_config simple_config simple_config passive_peers
+      options "ocaml.type_equals" = "Oraft.Types.config"
+
+(* vim: set ft=omlet: *)
